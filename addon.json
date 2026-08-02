@@ -1,0 +1,15 @@
+{
+  "title": "XRMOD - Private Server Build",
+  "type": "ServerContent",
+  "tags": [
+    "fun"
+  ],
+  "ignore": [
+    "vrmod-x64-exper2/*",
+    "Modules/*",
+    ".git/*",
+    "*.bat",
+    "README.md",
+    "autoexec.cfg"
+  ]
+}

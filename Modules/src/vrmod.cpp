@@ -118,7 +118,7 @@ int predictionScale = 0; // Percentage of original prediction amount to use
 // Three frames are live at once: frame M is being queued, M-1 is being written
 // by the render thread (which lags ~a frame), and M-2 is being copied out. So
 // GMod renders frame M into band M%3 of a 3x-tall shared texture while we copy
-// band (M-2)%3 — a frame the render thread finished a full frame ago. No fence,
+// band (M-2)%3 -- a frame the render thread finished a full frame ago. No fence,
 // no CPU stall (keeps the FPS), and the copied frame is provably complete (no
 // judder). Costs one extra frame of latency, countered by predicting the render
 // pose two display periods ahead so it matches the submit time.
@@ -1056,7 +1056,7 @@ LUA_FUNCTION(CreateActionSet) {
 			{
 				// Non-fatal: report and skip so one bad action (duplicated or
 				// invalid name) can't abort startup mid-iteration and leave
-				// the Lua stack unbalanced. Also names the culprit — the old
+				// the Lua stack unbalanced. Also names the culprit -- the old
 				// ThrowError never said WHICH action failed.
 				char str[MAX_STR_LEN];
 				snprintf(str, MAX_STR_LEN, "XRMod: Failed to create action '%s' (Error Code %d)", createInfo.actionName, (int) result);
@@ -2115,7 +2115,7 @@ bool CallInGameRenderFunc(XrPosef eyeLeft, XrPosef eyeRight, double bandY, Garry
 
 // Fences the GPU work behind the pixels currently in the shared texture,
 // copies them into an acquired swapchain image, and submits the composition
-// layer built from `views` — the poses those pixels were rendered from. srcY is
+// layer built from `views` -- the poses those pixels were rendered from. srcY is
 // the Y offset of the source band in the 3x-tall shared texture (0 in immediate
 // mode; the (M-2)%3 band in multicore).
 void SubmitFrame(XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lua::ILuaBase* LUA) {
@@ -2216,7 +2216,7 @@ LUA_FUNCTION(DoRenderLoop) {
 	}
 	g_FrameState = frameState;
 
-	// Submit time must be the runtime's predicted time — xrEndFrame rejects
+	// Submit time must be the runtime's predicted time -- xrEndFrame rejects
 	// anything else with XR_ERROR_TIME_INVALID. In multicore the pixels are
 	// submitted one frame late, so predict the *render* pose one display period
 	// ahead; next frame the stored pose lines up with that frame's submit time
@@ -2263,7 +2263,7 @@ LUA_FUNCTION(DoRenderLoop) {
 
 		// Submit the frame rendered two frames ago (band (M-2)%3). The render
 		// thread finished it a full frame back, so no fence and no stall are
-		// needed and the copy is never mid-write — this is what keeps both the
+		// needed and the copy is never mid-write -- this is what keeps both the
 		// FPS and correctness.
 		if(g_frameCounter >= 2)
 		{
@@ -2403,7 +2403,7 @@ LUA_FUNCTION(GetInteractionProfile) {
 // ============================================================================
 // Face Tracking OSC Receiver
 // Receives OSC float parameters from VRCFaceTracking over UDP.
-// Independent of VR state — works for desktop users too.
+// Independent of VR state -- works for desktop users too.
 // ============================================================================
 
 #define FT_MAX_PARAMS    256

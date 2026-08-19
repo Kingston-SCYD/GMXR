@@ -91,6 +91,14 @@ if SERVER then
         dropEnt:SetPos(guninhandpos + boneAng:Forward() * 10 + boneAng:Right() * 4)
         dropEnt:SetAngles(guninhandang)
         dropEnt:Spawn()
+        -- Carry the clip across: without this the spawned entity keeps the SWEP
+        -- default (-1 on anything never deployed), so picking your own gun back
+        -- up as a duplicate handed back no ammo at all.
+        if dropAsWeapon then dropEnt:SetClip1(wep:Clip1()) end
+        -- Block touch pickup on what we just threw. It spawns inside the
+        -- player's hull and PlayerCanPickupWeapon exempts anything younger than
+        -- a tick as a scripted give, so it was grabbed straight back.
+        dropEnt.vrmod_dropCooldown = CurTime() + 1
         local phys = dropEnt:GetPhysicsObject()
         if IsValid(phys) then
             phys:Wake()

@@ -693,7 +693,7 @@ hook.Add("Think", "vrmod_gripoffset_apply", function()
     end
     local c = gripCurrent
     if c.pos:LengthSqr() == 0 and c.ang.p == 0 and c.ang.y == 0 and c.ang.r == 0 then return end
-    vmi.offsetPos = c.pos; vmi.offsetAng = c.ang
+    vmi.offsetPos = Vector(c.pos); vmi.offsetAng = Angle(c.ang)
 end)
 
 hook.Add("VRMod_Input", "vrmod_gripoffset_grab", function(action, pressed)
@@ -702,12 +702,15 @@ hook.Add("VRMod_Input", "vrmod_gripoffset_grab", function(action, pressed)
     if not pressed then return true end
     local hp, ha = GetHandPose(); if not hp then return end
     local np, na = WorldToLocal(gripFrozenPos, gripFrozenAng, hp, ha)
-    gripCurrent.pos = np; gripCurrent.ang = na
+    -- Copy rather than share: gripCurrent, g_VR.currentvmi and gripSaved all
+    -- end up holding these, and anything that edits a Vector/Angle in place
+    -- would otherwise silently rewrite the others (and the saved JSON).
+    gripCurrent.pos = Vector(np); gripCurrent.ang = Angle(na)
     if gripIsLH then
-        vrmod_gripfix.lhLive = { pos = np, ang = na }
+        vrmod_gripfix.lhLive = { pos = Vector(np), ang = Angle(na) }
     else
         local vmi = GetVMI()
-        if vmi then vmi.offsetPos = np; vmi.offsetAng = na end
+        if vmi then vmi.offsetPos = Vector(np); vmi.offsetAng = Angle(na) end
     end
     gripRepos = false; gripFrozenPos = nil; gripFrozenAng = nil
     vrmod_gripfix.repos = nil; vrmod_gripfix.suppressDrop = true; timer.Simple(0.5, function() vrmod_gripfix.suppressDrop = false end)
@@ -734,7 +737,7 @@ hook.Add("Think", "vrmod_gripoffset_wepchange", function()
     end
     gripUnsaved = false
     local saved = gripSaved[class]
-    if saved then gripCurrent.pos = saved.pos; gripCurrent.ang = saved.ang
+    if saved then gripCurrent.pos = Vector(saved.pos); gripCurrent.ang = Angle(saved.ang)
     else gripCurrent.pos = Vector(); gripCurrent.ang = Angle() end
 end)
 
@@ -776,7 +779,7 @@ local function GripCancel()
         vrmod_gripfix.lhLive = nil
     else
         local vmi = GetVMI()
-        if vmi then vmi.offsetPos = gripCurrent.pos; vmi.offsetAng = gripCurrent.ang end
+        if vmi then vmi.offsetPos = Vector(gripCurrent.pos); vmi.offsetAng = Angle(gripCurrent.ang) end
     end
     gripIsLH = false
     GripStatus("Cancelled.")
@@ -981,9 +984,9 @@ local function BuildGripPanel(parent)
 
     local _, rebuildFn = WeaponList(parent, gripSaved,
         function(_, entry)
-            gripCurrent.pos = entry.pos; gripCurrent.ang = entry.ang
+            gripCurrent.pos = Vector(entry.pos); gripCurrent.ang = Angle(entry.ang)
             local vmi = GetVMI()
-            if vmi then vmi.offsetPos = entry.pos; vmi.offsetAng = entry.ang end
+            if vmi then vmi.offsetPos = Vector(entry.pos); vmi.offsetAng = Angle(entry.ang) end
             GripStatus("Loaded.")
         end,
         function(entry) return string_format("X:%.1f Y:%.1f Z:%.1f", entry.pos.x, entry.pos.y, entry.pos.z) end
@@ -994,8 +997,8 @@ local function BuildGripPanel(parent)
 
     local _, rebuildLHFn = WeaponList(parent, gripSavedLH,
         function(_, entry)
-            gripCurrent.pos = entry.pos; gripCurrent.ang = entry.ang
-            vrmod_gripfix.lhLive = { pos = entry.pos, ang = entry.ang }
+            gripCurrent.pos = Vector(entry.pos); gripCurrent.ang = Angle(entry.ang)
+            vrmod_gripfix.lhLive = { pos = Vector(entry.pos), ang = Angle(entry.ang) }
             GripStatus("Loaded (left hand).")
         end,
         function(entry) return string_format("X:%.1f Y:%.1f Z:%.1f", entry.pos.x, entry.pos.y, entry.pos.z) end
@@ -1179,6 +1182,7 @@ local function WMApplyNow()
     local class = wep:GetClass()
     if g_VR.wmWeapons[class] or g_VR.wmForced[class] or wep.IsWMBase then
         g_VR.wmActive = true
+        wep:SetNoDraw(false) -- see sh_network: nothing else un-hides it
         g_VR.viewModel = wep
         g_VR.currentvmi = nil
         if g_VR.zeroHandAngles then
@@ -1208,6 +1212,23 @@ end
 hook.Add("VRMod_Exit", "vrmod_wm_exit", function(ply)
     if ply ~= LocalPlayer() then return end
     g_VR.wmActive = false
+end)
+
+-- Re-resolve the worldmodel weapon whenever g_VR.viewModel has gone stale.
+-- A drop followed by an instant regrab Remove()s the world entity and hands
+-- back a fresh weapon without the server ever emitting a switchweapon -- from
+-- its point of view the active class never changed -- so g_VR.viewModel is left
+-- pointing at a dead entity and nothing draws or muzzles. One native per frame
+-- on the steady path, and the identity compare exits before any table lookup.
+hook.Add("VRMod_Tracking", "vrmod_wm_revalidate", function()
+    if not g_VR.wmActive then return end
+    local wep = LocalPlayer():GetActiveWeapon()
+    if g_VR.viewModel == wep or not IsValid(wep) then return end
+    local class = wep:GetClass()
+    if g_VR.wmWeapons[class] or g_VR.wmForced[class] or wep.IsWMBase then
+        wep:SetNoDraw(false)
+        g_VR.viewModel = wep
+    end
 end)
 
 local function BuildWorldModelPanel(parent)

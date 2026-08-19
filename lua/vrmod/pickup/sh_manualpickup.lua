@@ -123,6 +123,10 @@ local isDuplicate = ply:HasWeapon(wepClass)
 
 if isDuplicate then
     local ammoType = ent:GetPrimaryAmmoType()
+    if ammoType < 0 then
+        local p = ent.Primary
+        ammoType = p and p.Ammo and game.GetAmmoID(p.Ammo) or -1
+    end
 
     if avrState then
         -- Restore stasis directly to the existing weapon's ArcVR fields.
@@ -136,10 +140,16 @@ if isDuplicate then
             if existingWep.SendWeapon then existingWep:SendWeapon(true, true) end
         end
     elseif ammoType >= 0 then
+        -- Clip1() is -1 on a weapon entity that was never deployed -- spawnmenu
+        -- dupes and ents.Create both -- so the old `clip > 0` test silently gave
+        -- nothing on the two paths that actually matter. Fall back to whatever
+        -- the SWEP declares it ships with.
         local clip = ent:Clip1()
-        if clip > 0 then
-            ply:GiveAmmo(clip, ammoType, true)
+        if clip < 0 then
+            local p = ent.Primary
+            clip = p and (p.DefaultClip or p.ClipSize) or ent:GetMaxClip1()
         end
+        if clip and clip > 0 then ply:GiveAmmo(clip, ammoType, true) end
     end
 
     ply:SelectWeapon(wepClass)
@@ -224,7 +234,6 @@ end
 hook.Add("PlayerCanPickupItem", "ItemTouchPickupDisablerVR", function(ply, item)
 	local id = ply:EntIndex()
 	if vrmod_manualpickup:GetBool() and item:GetClass() ~= "item_suit" and PickupDisabled[id] and ply:GetNWBool("IsVR", false) then return false end
-	return true
 end)
 
 -- Disable touch-based weapon pickup.
@@ -249,10 +258,19 @@ hook.Add("PlayerLoadout", "VRModManualPickup_LoadoutFlag", FlagGive)
 
 hook.Add("PlayerCanPickupWeapon", "WeaponTouchPickupDisablerVR", function(ply, wep)
 	if not vrmod_manualpickup:GetBool() then return end
+	if not IsValid(wep) or wep:GetClass() == "weapon_vrmod_empty" then return end
+	-- Ahead of every exemption below. A weapon you just threw is both freshly
+	-- created (so the give-age test lets it through) and dropped inside the
+	-- VRMod_Drop window that clears PickupDisabledWeapons, so it was picked
+	-- straight back up off your own hand. Stamped by sh_dropweapon.
+	local cd = wep.vrmod_dropCooldown
+	if cd then
+		if cd > CurTime() then return false end
+		wep.vrmod_dropCooldown = nil
+	end
 	local id = ply:EntIndex()
 	if ScriptedGive[id] then return end
 	if not PickupDisabledWeapons[id] or not ply:GetNWBool("IsVR", false) then return end
-	if not IsValid(wep) or wep:GetClass() == "weapon_vrmod_empty" then return end
 	if CurTime() - wep:GetCreationTime() < 0.05 then return end
 	return false
 end)

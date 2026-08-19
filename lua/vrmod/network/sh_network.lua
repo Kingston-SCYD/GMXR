@@ -771,6 +771,11 @@ if CLIENT then
 		local lp = LocalPlayer()
 		if g_VR.net[lp:SteamID()] == nil then return end
 		if isMag then return end
+		-- The waitforwm timer below only removes ITSELF, and only on a class
+		-- match, so switching WM -> VM leaks a live 0-interval timer that can
+		-- later stomp g_VR.viewModel with a weapon entity while wmActive is
+		-- false. Every switch supersedes the last one; kill it here.
+		timer.Remove("vrutil_waitforwm")
  
 		if class == "" or vm == "" then
 			g_VR.viewModel = nil
@@ -806,6 +811,13 @@ if CLIENT then
 				local aw = lp:GetActiveWeapon()
 				if IsValid(aw) and aw:GetClass() == class then
 					timer.Remove("vrutil_waitforwm")
+					-- Both other branches SetNoDraw(true) the weapon entity and
+					-- nothing ever clears it. Dropping runs the vm == "" branch
+					-- against the STILL-ACTIVE real weapon (SelectWeapon is
+					-- deferred a tick), so any weapon that survived a drop
+					-- without being stripped -- holster copy, DW ghost -- comes
+					-- back hidden, and worldmodel mode has nothing left to draw.
+					aw:SetNoDraw(false)
 					g_VR.viewModel = aw
 				end
 			end)

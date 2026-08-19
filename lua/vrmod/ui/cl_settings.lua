@@ -43,11 +43,13 @@ local CLIENT_CVARS = {
 	"vrmod_deathcam_ragdoll", "vrmod_deathcam_ragdoll_view",
 	-- Melee (client)
 	"cl_vrmod_melee", "cl_vrmod_kick", "cl_vrmod_headbutt",
-	-- Driving
+	-- Vehicles
 	"vrmod_sens_pitch", "vrmod_sens_pitch_smooth", "vrmod_sens_yaw", "vrmod_sens_yaw_smooth",
 	"vrmod_sens_roll", "vrmod_sens_roll_smooth",
 	"vrmod_sens_steer_car", "vrmod_sens_steer_car_smooth", "vrmod_rot_range_car",
 	"vrmod_sens_steer_motorcycle", "vrmod_sens_steer_motorcycle_smooth", "vrmod_rot_range_motorcycle",
+	"vrmod_vehicle_gripenter", "vrmod_vehicle_gripamount", "vrmod_vehicle_gripdist",
+	"vrmod_vehicle_sitenter", "vrmod_vehicle_sitexit",
 	-- Climbing
 	"vrmod_brushclimb", "vrmod_brushclimb_requireboth", "vrmod_brushclimb_nofloor",
 	"vrmod_brushclimb_magnet", "vrmod_brushclimb_magnet_offset", "vrmod_brushclimb_ledgeonly",
@@ -1277,10 +1279,10 @@ function VRUtilOpenMenu()
 		form:CheckBox("Enable headbutting", "cl_vrmod_headbutt")
 	end
 
-	-- ─────────────── Client > Driving ───────────────
+	-- ─────────────── Client > Vehicles ───────────────
 	do
 		local t = vgui.Create("DScrollPanel", clientSheet)
-		clientSheet:AddSheet("Driving", t, "icon16/car.png")
+		clientSheet:AddSheet("Vehicles", t, "icon16/car.png")
 		local form = vgui.Create("DForm", t)
 		form:SetName("Motion Driving")
 		form:Dock(TOP)
@@ -1312,6 +1314,29 @@ function VRUtilOpenMenu()
 			RunConsoleCommand("vrmod_sens_steer_motorcycle", "0.30")
 			RunConsoleCommand("vrmod_sens_steer_motorcycle_smooth", "0.15")
 			RunConsoleCommand("vrmod_rot_range_motorcycle", "360")
+		end
+
+		local entry = vgui.Create("DForm", t)
+		entry:SetName("Getting In and Out")
+		entry:Dock(TOP)
+		entry:DockMargin(5, 5, 5, 0)
+		entry:SetExpanded(true)
+		entry:CheckBox("Grip a seat to get in", "vrmod_vehicle_gripenter")
+		entry:ControlHelp("Replaces aiming at a vehicle and pressing use. While this is on, a hand within reach of a seat can't physics-grab it.")
+		entry:NumSlider("Grip Amount", "vrmod_vehicle_gripamount", 5, 100, 0)
+		entry:ControlHelp("How far the grip has to close, in percent, before it seats you. Needs a controller that reports analog grip.")
+		entry:NumSlider("Grip Reach", "vrmod_vehicle_gripdist", 2, 60, 0)
+		entry:ControlHelp("How close the hand must be to the seat's surface, in units.")
+		entry:CheckBox("Sit down to get in", "vrmod_vehicle_sitenter")
+		entry:ControlHelp("Physically sitting while stood on top of a seat puts you in it. Uses the Sit Height set under Character, and is skipped entirely while seated offset is on.")
+		entry:CheckBox("Stand up to get out", "vrmod_vehicle_sitexit")
+		local entryReset = entry:Button("Reset Defaults")
+		function entryReset:DoClick()
+			RunConsoleCommand("vrmod_vehicle_gripenter", "1")
+			RunConsoleCommand("vrmod_vehicle_gripamount", "75")
+			RunConsoleCommand("vrmod_vehicle_gripdist", "20")
+			RunConsoleCommand("vrmod_vehicle_sitenter", "1")
+			RunConsoleCommand("vrmod_vehicle_sitexit", "1")
 		end
 	end
 

@@ -68,13 +68,14 @@ if CLIENT then
 	local cv_smooth = CreateClientConVar("vrmod_brushclimb_smooth", "0", true, false, "Climb position smoothing (0 = exact 1:1)", 0, 0.9)
 	local cv_nofloor = CreateClientConVar("vrmod_brushclimb_nofloor", "1", true, false, "Prevent grabbing walkable floors")
 	local cv_requireboth = CreateClientConVar("vrmod_brushclimb_requireboth", "0", true, false, "Require both grip and trigger held to grab walls")
+	local cv_anticlipgrace = CreateClientConVar("vrmod_brushclimb_anticlipgrace", "0.7", true, false, "Seconds after letting go of a wall before head anti-clip resumes", 0, 5)
 
 	-- Restore every climbing tuning convar to its built-in default in one shot (master enable is left alone).
 	concommand.Add("vrmod_brushclimb_reset", function()
 		local cvs = {
 			cv_requireboth, cv_nofloor, cv_magnet, cv_magnetoff, cv_reach, cv_smooth,
 			cv_ladderreach, cv_ledge, cv_marker, cv_ledgeonly, cv_ladderonly,
-			cv_ledgereach, cv_vaultreach, cv_vaultmin,
+			cv_ledgereach, cv_vaultreach, cv_vaultmin, cv_anticlipgrace,
 		}
 		for i = 1, #cvs do RunConsoleCommand(cvs[i]:GetName(), cvs[i]:GetDefault()) end
 		print("[VRMod] Climbing settings reset to defaults")
@@ -171,6 +172,8 @@ if CLIENT then
 	local lerpEndOrigin = nil
 	local lerpTime = 0
 	local lerpSpeed = LERP_SPEED
+	-- When the last hand let go, for the head anti-clip grace window below.
+	local releaseTime = -1
 
 	-- momentum tracking
 	local prevOriginX, prevOriginY, prevOriginZ = 0, 0, 0
@@ -449,6 +452,7 @@ if CLIENT then
 		net.SendToServer()
 
 		refHand = nil
+		releaseTime = SysTime()
 		for i = 1, 2 do
 			hands[i].grabPos = nil
 			hands[i].wallNormal = nil
@@ -732,6 +736,21 @@ if CLIENT then
 
 	local function EnableClimbing()
 		hook.Add("VRMod_Input", "brushclimb", OnInput)
+		-- The head anti-clip pushes g_VR.origin out of walls, which is the
+		-- opposite of what a climb wants: a gripped hand deliberately holds you
+		-- against a wall with your head inside the no-go zone, so the two argue
+		-- over the origin every frame. Suppressed through VRMod_AllowHeadAntiClip
+		-- rather than by touching vrmod_anticlip, so sh_hull zeroes its
+		-- accumulated correction on the way out instead of snapping the view
+		-- sideways when it resumes -- and the user's own toggle is left alone.
+		--
+		-- refHand is non-nil exactly while a hand is holding. The grace window
+		-- after that covers the vault/drop lerp in OnPreRender, which is still
+		-- driving the origin for a moment after the last hand lets go.
+		hook.Add("VRMod_AllowHeadAntiClip", "brushclimb", function()
+			if refHand then return false end
+			if releaseTime >= 0 and SysTime() - releaseTime < cv_anticlipgrace:GetFloat() then return false end
+		end)
 		hook.Add("VRMod_Tracking", "brushclimb_walldetect", function()
 			if not g_VR.tracking then return end
 			local lp = g_VR.tracking.pose_lefthand
@@ -755,6 +774,7 @@ if CLIENT then
 	local function DisableClimbing()
 		vrmod.StartLocomotion()
 		hook.Remove("VRMod_Input", "brushclimb")
+		hook.Remove("VRMod_AllowHeadAntiClip", "brushclimb")
 		hook.Remove("VRMod_Tracking", "brushclimb_walldetect")
 		hook.Remove("PreRender", "brushclimb")
 		hook.Remove("SetupMove", "vrmod_brushclimb_ladder")
@@ -771,6 +791,7 @@ if CLIENT then
 			net.SendToServer()
 		end
 		refHand = nil
+		releaseTime = -1
 		lerpOrigin = nil
 		lerpTarget = nil
 		lerpEndOrigin = nil

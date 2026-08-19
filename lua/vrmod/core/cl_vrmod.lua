@@ -514,8 +514,22 @@ local currentAng = v.ang
 	-- Reason the render loop must be replaced by a card, or nil. A plain pause
 	-- is NOT one of these: the world still renders normally, it just gets a
 	-- notice drawn over it (see DrawPausedBanner).
+	-- SteamVR's startup/status window takes and returns focus over a handful of
+	-- frames as it comes up. A single-frame HasFocus() false blanked the desktop
+	-- (render.Clear in DrawErrorOverlay) AND swapped the headset to the pause
+	-- card, then reverted -- that alternation IS the launch flicker between black
+	-- and the last held frame. Believe the loss only once it holds; believe the
+	-- recovery immediately, so a real alt-tab still parks well under a second.
+	local FOCUS_GRACE = 0.75
+	local _unfocusedAt
 	local function PauseReason()
-		if not system.HasFocus() then return "Game window is not focused" end
+		if system.HasFocus() then
+			_unfocusedAt = nil
+		elseif not _unfocusedAt then
+			_unfocusedAt = RealTime()
+		elseif RealTime() - _unfocusedAt >= FOCUS_GRACE then
+			return "Game window is not focused"
+		end
 		if #g_VR.errorText > 0 then return g_VR.errorText end
 	end
 
@@ -528,21 +542,49 @@ local currentAng = v.ang
 		return "Click the game window to resume"
 	end
 
+	-- DermaLarge is ~24px against an eye buffer that is commonly 1600-2000px
+	-- tall, so the card read as a smear of pixels from inside the headset.
+	-- Sized off the buffer instead, built once per resolution -- the equality
+	-- test makes this free on every frame after the first.
+	local _stallFontH = 0
+	local function EnsureStallFonts(h)
+		if _stallFontH == h then return end
+		_stallFontH = h
+		surface.CreateFont("vrmod_stall_title", {font = "Roboto", size = math.max(34, h * 0.075), weight = 800, antialias = true})
+		surface.CreateFont("vrmod_stall_body", {font = "Roboto", size = math.max(24, h * 0.042), weight = 500, antialias = true})
+	end
+
 	-- Paint the reason into both eyes. Without this the compositor keeps
 	-- reprojecting the last good frame, so from inside the headset a lost focus,
 	-- an open console and a hard crash all look exactly the same.
+	--
+	-- EVERY band, not just the one this frame owns. The shared RT holds 3 frames
+	-- for async submission, and a stalled render loop is exactly the state where
+	-- it is NOT pumped once per band -- so filling a single band left the
+	-- compositor cycling card / stale world frame / stale world frame, which is
+	-- the two-frame judder that made the text impossible to read. Writing all
+	-- three means whichever band it reaches for is already the card, so the
+	-- image is static no matter how erratically the loop runs.
+	--
+	-- One push per band rather than one per eye: the viewport spans the full
+	-- width anyway, so both eyes are drawn inside a single cam.Start2D and the
+	-- clear covers them together. Halves the render target churn.
 	local function DrawPauseCard(reason)
 		local w, h = rtEyeW, rtEyeH
 		if w == 0 or h == 0 or not g_VR.rt then return end
+		EnsureStallFonts(h)
 		local hint = PauseHint()
-		local cx = w * 0.5
-		for i = 0, 1 do
-			render.PushRenderTarget(g_VR.rt, i * w, _bandY, w, h)
-			render.Clear(16, 16, 20, 255, true, true)
+		local rtW = g_VR.rtWidth
+		for band = 0, 2 do
+			render.PushRenderTarget(g_VR.rt, 0, band * h, rtW, h)
+			render.Clear(0, 0, 0, 255, true, true) -- pure black: nothing behind the text to strobe against
 			cam.Start2D()
-			draw.DrawText("VRMod paused", "DermaLarge", cx, h * 0.42, COL_PAUSE_TITLE, TEXT_ALIGN_CENTER)
-			draw.DrawText(reason, "DermaLarge", cx, h * 0.50, color_white, TEXT_ALIGN_CENTER)
-			draw.DrawText(hint, "DermaLarge", cx, h * 0.58, COL_PAUSE_HINT, TEXT_ALIGN_CENTER)
+			for i = 0, 1 do
+				local cx = i * w + w * 0.5
+				draw.DrawText("VRMod paused", "vrmod_stall_title", cx, h * 0.38, COL_PAUSE_TITLE, TEXT_ALIGN_CENTER)
+				draw.DrawText(reason, "vrmod_stall_body", cx, h * 0.49, color_white, TEXT_ALIGN_CENTER)
+				draw.DrawText(hint, "vrmod_stall_body", cx, h * 0.55, COL_PAUSE_HINT, TEXT_ALIGN_CENTER)
+			end
 			cam.End2D()
 			render.PopRenderTarget()
 		end

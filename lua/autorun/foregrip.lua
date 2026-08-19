@@ -1,6 +1,13 @@
 --[[
 vrmod_foregrip.lua – Two-handed weapon grip for VRMod
-LookAt aiming (Halo CEVR / ArcVR style)
+LookAt aiming (Halo CEVR / ArcVR style) + tacvr grab gating
+
+The offhand pins exactly where the player grabbed -- the grip point gates
+whether a grab latches, it never relocates or re-orients the hand model.
+Zone resolution order:
+  * wep.VRGripPos -- weapon-defined grip point in dominant-hand-local space
+    (tacvr's LHandPos equivalent); zone is a 3.5u sphere around it
+  * otherwise the shared box/sphere zone in front of the dominant hand
 ]]
 
 if SERVER then return end
@@ -10,6 +17,8 @@ local GRIP_BACK    = 5   -- units behind weapon hand
 local GRIP_SIDE    = 9   -- left/right half-width
 local GRIP_VERT    = 9   -- up/down half-height
 local GRIP_RADIUS  = 12  -- sphere grab radius (scaled by cv_scale)
+local GRIP_POINT_RADIUS = 3.5  -- grab radius around a weapon-defined grip point
+local GRAB_GRACE   = 0.25 -- press-buffer window (tacvr inptime)
 local LERP_DURATION = 0.1
 
 local cv_sphere = CreateClientConVar("vrmod_foregrip_sphere", "0", true, false, "Foregrip grab zone shape: 1=sphere, 0=box")
@@ -32,6 +41,13 @@ local lerpStart = nil
 local gripOffset = Vector()
 local gripAngOffset = Angle()
 local gripBone = nil
+-- Which reference frame gripOffset was captured in, and whether the capture
+-- still has to happen. See ForegripRender for why both matter.
+local gripPending = false
+local gripWM = false
+
+local ohHeld = false     -- offhand pickup button currently held
+local pressT = 0         -- press time for the grace-window latch
 
 -- Hand lerp state
 local handStartPos, handStartAng
@@ -54,6 +70,7 @@ local math_exp = math.exp
 local math_atan2 = math.atan2
 local math_NormalizeAngle = math.NormalizeAngle
 local RealFrameTime = RealFrameTime
+local Vector = Vector
 local Angle = Angle
 
 -- Two-hand aim state (reset on grab)
@@ -118,8 +135,9 @@ end
 local function CalcGripOffsets(wepPos, wepAng, offPos, offAng)
 	-- Left-hand weapons skip bone path: VM may not be repositioned yet
 	-- due to PreRender hook ordering. Tracking fallback is always current.
+	gripWM = g_VR.wmActive or false
 	local vm = LocalPlayer():GetViewModel()
-	if not g_VR.wmActive and not false and IsValid(vm) then
+	if not g_VR.wmActive and IsValid(vm) then
 		gripBone = vm:LookupBone("ValveBiped.Bip01_R_Hand")
 		if not gripBone or gripBone < 0 then
 			gripBone = vm:LookupBone("weapon_root")
@@ -139,6 +157,43 @@ local function CalcGripOffsets(wepPos, wepAng, offPos, offAng)
 	local wPos = g_VR.viewModelPos or wepPos
 	local wAng = g_VR.viewModelAng or wepAng
 	gripOffset, gripAngOffset = WorldToLocal(offPos, offAng, wPos, wAng)
+end
+
+-- Grab attempt: zone-test the offhand against the dominant hand and, on a
+-- hit, fix the snap pose the hand will pin to. Returns true on latch.
+local function TryGrab(wh, oh)
+	local wep = LocalPlayer():GetActiveWeapon()
+	if not IsValidForegrip(wep) or not (g_VR.currentvmi or g_VR.wmActive) then return false end
+
+	local lp = WorldToLocal(oh.pos, angle_zero, wh.pos, wh.ang)
+	local gp = wep.VRGripPos
+	if gp then
+		-- Weapon-defined grip point: sphere around it (tacvr: dist < 3.5)
+		local r = GRIP_POINT_RADIUS * cv_scale:GetFloat()
+		if lp:DistToSqr(gp) > r * r then return false end
+	elseif cv_sphere:GetBool() then
+		local r = GRIP_RADIUS * cv_scale:GetFloat()
+		if lp:LengthSqr() >= r * r then return false end
+	elseif not (lp.x > -GRIP_BACK and lp.x < GRIP_FORWARD
+	        and lp.y > -GRIP_SIDE and lp.y < GRIP_SIDE
+	        and lp.z > -GRIP_VERT and lp.z < GRIP_VERT) then
+		return false
+	end
+
+	isGripping = true
+	isReleasing = false
+	lerpStart = SysTime()
+	smValid = false      -- fresh grab: drop stale smoothed aim
+	stockRamp = 0        -- and re-detect the shoulder from scratch
+	handStartPos = Vector(oh.pos)
+	handStartAng = Angle(oh.ang)
+	-- Capture deferred to ForegripRender. Measuring here reads the
+	-- viewmodel bones as they stood at input time -- before this
+	-- frame's VRMod_Tracking has moved the viewmodel -- while the
+	-- apply reads them after. Capturing at the same point in the
+	-- frame that the apply runs makes the two agree by construction.
+	gripPending = true
+	return true
 end
 
 -- Two-hand aim: gun-hand -> offhand direction becomes the weapon's forward
@@ -235,38 +290,32 @@ hook.Add("VRMod_Input", "Foregrip", function(action, pressed)
 	if not wh or not oh then return end
 
 	if pressed then
-		local lp = (WorldToLocal(oh.pos, angle_zero, wh.pos, wh.ang))
-		local inZone
-		if cv_sphere:GetBool() then
-			local r = GRIP_RADIUS * cv_scale:GetFloat()
-			inZone = lp:LengthSqr() < r * r
-		else
-			inZone = lp.x > -GRIP_BACK and lp.x < GRIP_FORWARD
-			   and lp.y > -GRIP_SIDE and lp.y < GRIP_SIDE
-			   and lp.z > -GRIP_VERT and lp.z < GRIP_VERT
-		end
-		if inZone
-		   and IsValidForegrip(LocalPlayer():GetActiveWeapon())
-		   and (g_VR.currentvmi or g_VR.wmActive) then
-			isGripping = true
-			isReleasing = false
+		ohHeld = true
+		-- A press that misses the zone still arms a short grace window
+		-- (tacvr's inptime buffer): sliding into the zone right after the
+		-- press latches from ForegripTracking.
+		if not TryGrab(wh, oh) then pressT = SysTime() end
+	else
+		ohHeld = false
+		if isGripping then
+			isReleasing = true
+			isGripping = false
+			gripPending = false
 			lerpStart = SysTime()
-			smValid = false      -- fresh grab: drop stale smoothed aim
-			stockRamp = 0        -- and re-detect the shoulder from scratch
-			handStartPos = Vector(oh.pos)
-			handStartAng = Angle(oh.ang)
-			CalcGripOffsets(wh.pos, wh.ang, oh.pos, oh.ang)
 		end
-	elseif isGripping then
-		isReleasing = true
-		isGripping = false
-		lerpStart = SysTime()
 	end
 end)
 
 hook.Add("VRMod_Tracking", "ForegripTracking", function()
 	if not g_VR.currentvmi and not g_VR.wmActive then return end
-	if not isGripping and not isReleasing then return end
+	if not isGripping and not isReleasing then
+		-- Press-buffer latch: recent press, button still held, hand slid in
+		if not (ohHeld and SysTime() - pressT < GRAB_GRACE) then return end
+		local wepLeft = ArcticVR and ArcticVR.GunInLeftHand or false
+		local wh = wepLeft and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
+		local oh = wepLeft and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
+		if not wh or not oh or not TryGrab(wh, oh) then return end
+	end
 
 	local wep = LocalPlayer():GetActiveWeapon()
 	if not IsValid(wep) or NO_ROTATE_HOLD[wep:GetHoldType()] then return end
@@ -334,18 +383,38 @@ hook.Add("VRMod_PreRender", "ForegripRender", function()
 		return
 	end
 
-	local aPos, aAng
-	if not g_VR.wmActive then
-		local vm = LocalPlayer():GetViewModel()
-		if IsValid(vm) and gripBone then
-			local mtx = vm:GetBoneMatrix(gripBone)
-			if mtx then
-				aPos, aAng = LocalToWorld(gripOffset, gripAngOffset, mtx:GetTranslation(), mtx:GetAngles())
-			end
-		end
+	-- Capture on the first gripping frame, and re-capture if worldmodel mode
+	-- flipped underneath us (the two modes resolve against different frames).
+	if gripPending or gripWM ~= (g_VR.wmActive or false) then
+		gripPending = false
+		-- Capture the pose the hand was actually grabbed at. Snapping it to a
+		-- rail point instead would visibly teleport and re-orient the hand
+		-- model on grab -- the grip point gates the grab, it does not move it.
+		CalcGripOffsets(wh.pos, wh.ang, handStartPos or oh.pos, handStartAng or oh.ang)
 	end
 
-	if not aPos then
+	-- gripBone records WHICH frame gripOffset was measured in: a bone index
+	-- means the viewmodel's hand bone, nil means the g_VR.viewModelPos origin.
+	-- The apply has to use the same one. The old code fell through to the
+	-- origin frame whenever the bone matrix came back nil, reinterpreting a
+	-- bone-relative offset as origin-relative -- and the gap between those two
+	-- frames is the grip offset itself, so the hand only visibly broke once
+	-- the weapon fixer had moved the gun off the bone. Bail instead: holding
+	-- last frame's hand for one frame is invisible, landing it a grip offset
+	-- away is not.
+	local aPos, aAng
+	if gripBone and not g_VR.wmActive then
+		local vm = LocalPlayer():GetViewModel()
+		if not IsValid(vm) then return end
+		-- RefreshViewModelMuzzle invalidates this cache on every call and, on
+		-- the default rigid path, returns without rebuilding -- so without
+		-- SetupBones the matrix here is still the previous frame's viewmodel
+		-- position, and the offhand trails the gun while you move.
+		vm:SetupBones()
+		local mtx = vm:GetBoneMatrix(gripBone)
+		if not mtx then return end
+		aPos, aAng = LocalToWorld(gripOffset, gripAngOffset, mtx:GetTranslation(), mtx:GetAngles())
+	else
 		local wPos = g_VR.viewModelPos or wh.pos
 		local wAng = g_VR.viewModelAng or wh.ang
 		aPos, aAng = LocalToWorld(gripOffset, gripAngOffset, wPos, wAng)
@@ -398,6 +467,8 @@ hook.Add("VRMod_Exit", "ForegripExit", function(ply)
 	isReleasing = false
 	lerpStart = nil
 	gripBone = nil
+	gripPending = false
+	ohHeld = false
 	if vrmod_wmrecoil then vrmod_wmrecoil.gripping = false end
 end)
 
@@ -414,6 +485,7 @@ concommand.Add("vrmod_foregrip_test", function()
 	print("  Valid:", IsValidForegrip(wep),
 	      " Rotation:", IsValid(wep) and not NO_ROTATE_HOLD[wep:GetHoldType() or ""] or false,
 	      " VisualOnly:", IsValid(wep) and visualOnlyWeapons[wep:GetClass()] or false)
+	print("  GripZone:", IsValid(wep) and wep.VRGripPos and tostring(wep.VRGripPos) or "default zone")
 	local lh = g_VR.tracking.pose_lefthand
 	local rh = g_VR.tracking.pose_righthand
 	if lh and rh then
@@ -421,7 +493,10 @@ concommand.Add("vrmod_foregrip_test", function()
 		local wh = wepLeft and lh or rh
 		local oh = wepLeft and rh or lh
 		local lp = (WorldToLocal(oh.pos, angle_zero, wh.pos, wh.ang))
-		if cv_sphere:GetBool() then
+		if IsValid(wep) and wep.VRGripPos then
+			print(string.format("  LocalOff: X:%.1f Y:%.1f Z:%.1f  point dist:%.1f  (r:%.1f)",
+				lp.x, lp.y, lp.z, lp:Distance(wep.VRGripPos), GRIP_POINT_RADIUS * cv_scale:GetFloat()))
+		elseif cv_sphere:GetBool() then
 			print(string.format("  LocalOff: X:%.1f Y:%.1f Z:%.1f  dist:%.1f  (sphere r:%.1f)",
 				lp.x, lp.y, lp.z, lp:Length(), GRIP_RADIUS * cv_scale:GetFloat()))
 		else

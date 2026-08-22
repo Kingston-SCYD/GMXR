@@ -438,9 +438,8 @@ function VRUtilOpenMenu()
 
 	frame = vgui.Create("DFrame")
 	frame:SetSize(460, 560)
-	local startupErr = vrmod.GetStartupError and vrmod.GetStartupError()
-	local noHMD = startupErr and startupErr ~= "Already running"
-	frame:SetTitle(noHMD and "VRMod Menu (no headset detected)" or "VRMod Menu")
+	local startupErr, errCode = vrmod.GetStartupError and vrmod.GetStartupError()
+	frame:SetTitle(startupErr and ("VRMod Menu (" .. startupErr:match("^[^\n.]+") .. ")") or "VRMod Menu")
 	frame:MakePopup()
 	frame:Center()
 
@@ -459,27 +458,27 @@ function VRUtilOpenMenu()
 	exitBtn:DockMargin(0, 5, 0, 0)
 	exitBtn:SetWide(96)
 	exitBtn:SetEnabled(g_VR.active)
-	function exitBtn:DoClick() frame:Remove() VRUtilClientExit() end
-	local hmdMissing = noHMD and VRMOD_IsHMDPresent
+	function exitBtn:DoClick() frame:Remove() RunConsoleCommand("vrmod_exit") end
 	local startBtn = vgui.Create("DButton", bottomPanel)
-	startBtn:SetText(g_VR.active and "Restart" or hmdMissing and "Recheck" or "Start")
+	startBtn:SetText(g_VR.active and "Restart" or "Start")
 	startBtn:Dock(RIGHT)
 	startBtn:DockMargin(0, 5, 5, 0)
 	startBtn:SetWide(96)
+	startBtn:SetEnabled(not errCode)
+	-- Cold start goes through vrmod_start, which waits for the cursor to go away
+	-- before anything touches render targets. Starting with this popup still up
+	-- lets the module's one-shot D3D9 CreateTexture hook latch onto a VGUI
+	-- texture instead of the VR RT -- and leaves the vtable patched if the start
+	-- then aborts. Restart keeps the direct call: VR menus can hold the cursor
+	-- visible, which would stall the concommand's poll forever.
 	function startBtn:DoClick()
-		if hmdMissing then
-			VRUtilClientStart()
-			if g_VR.active then
-				frame:Remove()
-			else
-				self:SetText("Not found")
-				timer.Create("vrmod_recheck", 1, 1, function() if IsValid(self) then self:SetText("Recheck") end end)
-			end
-			return
-		end
 		frame:Remove()
-		if g_VR.active then VRUtilClientExit() timer.Simple(1, function() VRUtilClientStart() end)
-		else VRUtilClientStart() end
+		if g_VR.active then
+			VRUtilClientExit()
+			timer.Simple(1, VRUtilClientStart)
+		else
+			RunConsoleCommand("vrmod_start")
+		end
 	end
 
 	surface.CreateFont("BoldSliderFont", { font = "Tahoma", size = 13, weight = 1000 })

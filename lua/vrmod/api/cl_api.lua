@@ -41,35 +41,23 @@ if CLIENT then
         end
     end
 
-    function vrmod.GetStartupError()
-        local error = nil
-        local moduleFile = nil
-        local requiredVersion, latestVersion
-        if system.IsLinux() then
-            requiredVersion = 1
-            latestVersion = 1
-            moduleFile = "lua/bin/gmcl_vrmod_linux64.dll"
-        else
-            requiredVersion = 1
-            latestVersion = 1
-            moduleFile = "lua/bin/gmcl_vrmod_win64.dll"
+    local moduleFile = system.IsLinux() and "lua/bin/gmcl_vrmod_linux64.dll" or "lua/bin/gmcl_vrmod_win64.dll"
+    -- Returns error, code. code: "nomodule" | "loadfail" | "outdated" | "nohmd".
+    -- probeHMD is opt-in: VRMOD_IsHMDPresent creates AND tears down a real XR
+    -- instance, and that instance creation is what wakes the runtime -- so the
+    -- first call reports false while the runtime is still coming up. Only probe
+    -- when the answer is actually acted on, never just to label a menu.
+    function vrmod.GetStartupError(probeHMD)
+        local ver = g_VR.moduleVersion or 0
+        if ver == 0 then
+            if not file.Exists(moduleFile, "GAME") then return "Module not installed.\nPlease follow the workshop instructions to install the module.", "nomodule" end
+            return "Failed to load module.\nModule file exists but could not be loaded. Check antivirus or permissions.", "loadfail"
+        elseif ver < requiredModuleVersion then
+            return "Module update required.\nRun the installer or re-download from the workshop.\n\nInstalled: v" .. ver .. "\nRequired: v" .. requiredModuleVersion, "outdated"
+        elseif ver > latestModuleVersion then
+            print("[VRMOD] Warning: Module version is newer than tested. Installed: v" .. ver .. " | Required: v" .. requiredModuleVersion .. " | Addon version: " .. vrmod.GetVersion() .. " | Most features should work, but some bugs may exist.")
         end
-
-        g_VR.moduleVersion = g_VR.moduleVersion or 0
-        if g_VR.moduleVersion == 0 then
-            if not file.Exists(moduleFile, "GAME") then
-                error = "Module not installed.\nPlease follow the workshop instructions to install the module."
-            else
-                error = "Failed to load module.\nModule file exists but could not be loaded. Check antivirus or permissions."
-            end
-        elseif g_VR.moduleVersion < requiredVersion then
-            error = "Module update required.\nRun the installer or re-download from the workshop.\n\nInstalled: v" .. g_VR.moduleVersion .. "\nRequired: v" .. requiredVersion
-        elseif g_VR.moduleVersion > latestVersion then
-            print("[VRMOD] Warning: Module version is newer than tested. Installed: v" .. g_VR.moduleVersion .. " | Required: v" .. requiredVersion .. " | Addon version: " .. vrmod.GetVersion() .. " | Most features should work, but some bugs may exist.")
-        elseif VRMOD_IsHMDPresent and not VRMOD_IsHMDPresent() then
-            error = "VR headset not detected."
-        end
-        return error
+        if probeHMD and VRMOD_IsHMDPresent and not VRMOD_IsHMDPresent() then return "VR headset not detected.", "nohmd" end
     end
 
     function vrmod.GetModuleVersion()

@@ -14,6 +14,22 @@ if CLIENT then
     CreateClientConVar("vrmod_holster_ragdolls",         1,                      true, FCVAR_ARCHIVE, "Allow holstering ragdolls", 0, 1)
     CreateClientConVar("vrmod_holster_ragdoll_models",   1,                      true, FCVAR_ARCHIVE, "Show ragdoll models on holster slots", 0, 1)
     CreateClientConVar("vrmod_holster_persist",         1,                      true, FCVAR_ARCHIVE, "Persist holstered weapons across map changes", 0, 1)
+    -- The pouch itself, drawn at each grip centre. Default is the CS:S holster,
+    -- which ships with GMod's mounted CS:S content. The on/off switch is kept
+    -- separate from the path so turning it off does not make you retype the model.
+    CreateClientConVar("vrmod_holster_model_enabled", "1", true, false, "Draw a model at each holster grip point", 0, 1)
+    CreateClientConVar("vrmod_holster_model", "models/weapons/w_eq_eholster.mdl", true, false, "Model drawn at each holster grip point")
+    CreateClientConVar("vrmod_holster_model_x",   "0", true, false, "Holster model forward offset",  -32,  32)
+    CreateClientConVar("vrmod_holster_model_y",   "0", true, false, "Holster model sideways offset", -32,  32)
+    CreateClientConVar("vrmod_holster_model_z",   "0", true, false, "Holster model vertical offset", -32,  32)
+    CreateClientConVar("vrmod_holster_model_p",   "0", true, false, "Holster model pitch",          -180, 180)
+    CreateClientConVar("vrmod_holster_model_yaw", "0", true, false, "Holster model yaw",            -180, 180)
+    CreateClientConVar("vrmod_holster_model_r",   "0", true, false, "Holster model roll",           -180, 180)
+    -- Per-slot, because the head/shoulder pair reads very differently from the
+    -- hip pair: a holster on your hip looks right, one by your ear does not.
+    for i = 1, 4 do
+        CreateClientConVar("vrmod_holster_model_slot" .. i, "1", true, false, "Draw the holster model on slot " .. i, 0, 1)
+    end
 
     for i = 1, 4 do
         CreateClientConVar("vrmod_pouch_weapon_" .. i, "", true, FCVAR_ARCHIVE)
@@ -536,6 +552,16 @@ if CLIENT then
     local cv_ragdolls    = GetConVar("vrmod_holster_ragdolls")
     local cv_ragmodels   = GetConVar("vrmod_holster_ragdoll_models")
     local cv_persist     = GetConVar("vrmod_holster_persist")
+    local cv_hm_on       = GetConVar("vrmod_holster_model_enabled")
+    local cv_hmodel      = GetConVar("vrmod_holster_model")
+    local cv_hm_x        = GetConVar("vrmod_holster_model_x")
+    local cv_hm_y        = GetConVar("vrmod_holster_model_y")
+    local cv_hm_z        = GetConVar("vrmod_holster_model_z")
+    local cv_hm_p        = GetConVar("vrmod_holster_model_p")
+    local cv_hm_yaw      = GetConVar("vrmod_holster_model_yaw")
+    local cv_hm_r        = GetConVar("vrmod_holster_model_r")
+    local cv_hm_slot     = {}
+    for i = 1, 4 do cv_hm_slot[i] = GetConVar("vrmod_holster_model_slot" .. i) end
     local cv_slots, cv_sizes = {}, {}
     for i = 1, POUCH_SLOTS do
         cv_slots[i] = GetConVar("vrmod_pouch_weapon_" .. i)
@@ -1124,11 +1150,79 @@ if CLIENT then
         end
     end
 
+    -- ── Holster body model ──────────────────────────────────────────────
+    -- Sits at the grip centre rather than offset back like the stored weapon.
+    -- One clientside model is reused for every slot: pos and angles are set per
+    -- draw, so four holsters cost one entity instead of four.
+    local holsterBody, holsterBodyPath, holsterBodyWarned
+    local hbPos, hbAng = Vector(), Angle()
+    local hbX, hbY, hbZ, hbP, hbYaw, hbR = 0, 0, 0, 0, 0, 0
+    local hbSlot = {true, true, true, true}
+
+    -- Cached on change so the render path reads no convars at all.
+    local function RefreshHolsterBodyXform()
+        hbX, hbY, hbZ = cv_hm_x:GetFloat(), cv_hm_y:GetFloat(), cv_hm_z:GetFloat()
+        hbP, hbYaw, hbR = cv_hm_p:GetFloat(), cv_hm_yaw:GetFloat(), cv_hm_r:GetFloat()
+        for i = 1, 4 do hbSlot[i] = cv_hm_slot[i]:GetBool() end
+    end
+    RefreshHolsterBodyXform()
+    for _, s in ipairs({"x", "y", "z", "p", "yaw", "r", "slot1", "slot2", "slot3", "slot4"}) do
+        cvars.AddChangeCallback("vrmod_holster_model_" .. s, RefreshHolsterBodyXform, "vrmod_holster_model_xform")
+    end
+
+    local function EnsureHolsterBody()
+        -- Switched off collapses to the same path as a blank model name, so the
+        -- entity is freed rather than parked invisible for the rest of the session.
+        local path = cv_hm_on:GetBool() and cv_hmodel:GetString() or ""
+        if path == "" then
+            if IsValid(holsterBody) then holsterBody:Remove() end
+            holsterBody, holsterBodyPath = nil, nil
+            return nil
+        end
+        if holsterBodyPath ~= path then
+            if IsValid(holsterBody) then holsterBody:Remove() end
+            holsterBody, holsterBodyPath = nil, path
+            -- file.Exists, NOT util.IsValidModel: the latter reports false for a
+            -- model that exists but has not been loaded yet, which is every model
+            -- nothing has spawned. It rejected the CS:S holster on sight and the
+            -- cached path meant it never retried.
+            if not file.Exists(path, "GAME") then
+                if holsterBodyWarned ~= path then
+                    holsterBodyWarned = path
+                    vrmod.logger.Err("Holster model '" .. path .. "' not found - is CS:S content mounted?")
+                end
+                return nil
+            end
+            local csm = ClientsideModel(path, RENDERGROUP_TRANSLUCENT)
+            if not IsValid(csm) then return nil end
+            csm:SetNoDraw(true)
+            holsterBody = csm
+        end
+        return holsterBody
+    end
+
+    -- fwd/right come off a yaw-only angle, so their z is exactly 0 and the
+    -- offset composes without a LocalToWorld allocation per slot.
+    local function DrawHolsterBody(body, pos, bodyYaw, fwd, right)
+        hbPos:SetUnpacked(pos.x + fwd.x * hbX + right.x * hbY, pos.y + fwd.y * hbX + right.y * hbY, pos.z + hbZ)
+        hbAng:SetUnpacked(hbP, bodyYaw + hbYaw, hbR)
+        body:SetPos(hbPos)
+        body:SetAngles(hbAng)
+        -- One entity is drawn at every slot in the same frame; without dropping
+        -- the cache SetupBones is a no-op after the first and every later slot
+        -- reuses the first slot's transform.
+        body:InvalidateBoneCache()
+        body:SetupBones()
+        body:DrawModel()
+    end
+
     local holster_models = {}
     local holster_classes = {}
 
     hook.Add("VRMod_Exit", "vrmod_holster_cleanup_models", function()
         CleanupModels(holster_models, holster_classes)
+        if IsValid(holsterBody) then holsterBody:Remove() end
+        holsterBody, holsterBodyPath = nil, nil
     end)
 
     local slotOffsets  = { -21, -21, 11, 11 }
@@ -1162,7 +1256,9 @@ if CLIENT then
         if cv_enabled:GetBool() and g_VR.threePoints then
             local showSpheres = cv_visname:GetBool()
             local bodyYaw = g_VR.tracking.hmd and g_VR.tracking.hmd.ang.yaw or 0
-            local bodyFwd = Angle(0, bodyYaw, 0):Forward()
+            local bodyAng = Angle(0, bodyYaw, 0)
+            local bodyFwd, bodyRight = bodyAng:Forward(), bodyAng:Right()
+            local body = EnsureHolsterBody()
 
             for i = 1, POUCH_SLOTS do
                 local pos  = pouch_positions[i]
@@ -1193,6 +1289,11 @@ if CLIENT then
                         csm:DrawModel()
                     end
                 end
+
+                -- Last, so nothing this draw leaves behind can land on the stored
+                -- weapon's DrawModel. Order within the slot is otherwise identical
+                -- to what it was before the holster body existed.
+                if body and hbSlot[i] then DrawHolsterBody(body, pos, bodyYaw, bodyFwd, bodyRight) end
             end
         end
 

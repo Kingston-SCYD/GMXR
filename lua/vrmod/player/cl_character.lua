@@ -669,7 +669,9 @@ if CLIENT then
 						end
 					end)
 				end
-				return false
+				-- nil, not false: false means "deferred, retry" to the caller, and an
+				-- incompatible model would re-run this whole init on every retry.
+				return nil
 			end
 		end
 
@@ -992,27 +994,27 @@ if CLIENT then
 		if not IsValid(ply) then return end
 		local steamid = ply:SteamID()
 		local initResult = CharacterInit(ply)
-		print("[VRChar] CharacterInit " .. ply:Nick() .. " model=" .. tostring(ply:GetModel()) .. " result=" .. tostring(initResult) .. " retry=" .. tostring(ply.vrmod_charInitRetries))
+		local tname = "vrmod_charinit_" .. steamid
 		if initResult == false then
-			-- Deferred (model not ready on respawn race, or bone lookup failed).
-			-- Retry next tick so we catch the real model as soon as it's applied.
-			local retries = (ply.vrmod_charInitRetries or 0) + 1
-			ply.vrmod_charInitRetries = retries
-			if retries <= 20 then
-				timer.Simple(0, function()
+			-- Deferred: the playermodel isn't networked yet. 20 frames (~0.3s) only
+			-- covered the respawn race; a client joining mid-session waits on a
+			-- remote model for far longer and used to give up permanently, leaving
+			-- that player in desktop anims until they died. One self-terminating
+			-- timer covers 10s at 4 calls/sec, instead of a closure per frame.
+			if not timer.Exists(tname) then
+				timer.Create(tname, 0.25, 40, function()
 					if IsValid(ply) and g_VR.net and g_VR.net[steamid] and not activePlayers[steamid] then
 						g_VR.StartCharacterSystem(ply)
+					else
+						timer.Remove(tname)
 					end
 				end)
-			else
-				ply.vrmod_charInitRetries = nil
-				vrmod.logger.Err("StartCharacterSystem gave up after 20 retries for " .. steamid)
 			end
 			return
 		end
-		ply.vrmod_charInitRetries = nil
-		if not g_VR.net or not g_VR.net[steamid] then print("[VRChar] BAIL: g_VR.net missing for " .. steamid) return end
-		if not characterInfo[steamid] then print("[VRChar] BAIL: characterInfo missing for " .. steamid) return end
+		timer.Remove(tname)
+		if not g_VR.net or not g_VR.net[steamid] then vrmod.logger.Warn("StartCharacterSystem: no net entry for " .. steamid) return end
+		if not characterInfo[steamid] then vrmod.logger.Warn("StartCharacterSystem: no characterInfo for " .. steamid) return end
 		local info = characterInfo[steamid]
 		if info.boneCallback and info.boneCallback ~= 0 then
 			ply:RemoveCallback("BuildBonePositions", info.boneCallback)
@@ -1027,7 +1029,6 @@ if CLIENT then
 		hook.Add("CalcMainActivity", "vrutil_hook_calcmainactivity", CalcMainActivityFunc)
 		hook.Add("DoAnimationEvent", "vrutil_hook_doanimationevent", DoAnimationEventFunc)
 		activePlayers[steamid] = true
-		print("[VRChar] Character system ACTIVE for " .. steamid)
 		vrmod.logger.Info("Started character system for " .. steamid)
 	end
 
@@ -1059,7 +1060,7 @@ if CLIENT then
 		characterInfo[steamid] = nil
 		lastFrames[steamid] = nil
 		updatedPlayers[steamid] = nil
-		if IsValid(ply) then ply.vrmod_charInitRetries = nil end
+		timer.Remove("vrmod_charinit_" .. steamid)
 		if not next(activePlayers) then
 			hook.Remove("PrePlayerDraw", "vrutil_hook_preplayerdraw")
 			hook.Remove("PostPlayerDraw", "vrutil_hook_postplayerdraw")

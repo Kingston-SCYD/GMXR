@@ -10,6 +10,7 @@ local CLIENT_CVARS = {
 	-- General
 	"vrmod_laserpointer", "vrmod_useworldmodels", "vrmod_heightmenu", "vrmod_seated",
 	"vrmod_autostart", "vrmod_climbing", "vrmod_doors", "vrmod_flashlight_attachment",
+	"vrmod_flashlight_shadows", "vrmod_flashlight_depth",
 	"vrmod_menu_float", "vrmod_menu_scale", "vrmod_quickmenu_float",
 	-- Controls
 	"vrmod_smoothturn", "vrmod_smoothturnrate", "vrmod_snapturnangle", "vrmod_althead", "vrmod_althead_auto",
@@ -61,6 +62,10 @@ local CLIENT_CVARS = {
 	"vrmod_pouch_lefthandwep_enable", "vrmod_holster_showmodels", "vrmod_pouch_chest_z",
 	"vrmod_holster_prop_maxvolume", "vrmod_holster_ragdolls", "vrmod_holster_ragdoll_models",
 	"vrmod_holster_persist",
+	"vrmod_holster_model_enabled", "vrmod_holster_model",
+	"vrmod_holster_model_x", "vrmod_holster_model_y", "vrmod_holster_model_z",
+	"vrmod_holster_model_p", "vrmod_holster_model_yaw", "vrmod_holster_model_r",
+	"vrmod_holster_model_slot1", "vrmod_holster_model_slot2", "vrmod_holster_model_slot3", "vrmod_holster_model_slot4",
 	-- Face Tracking
 	"ft_enabled", "ft_port", "ft_rate", "ft_smooth", "ft_multiplier",
 }
@@ -68,7 +73,8 @@ local CLIENT_CVARS = {
 local SERVER_CVARS = {
 	"vrmod_allow_teleport", "vrmod_teleport_maxdist",
 	"vrmod_pickup_limit", "vrmod_pickup_npcs", "vrmod_pickup_no_phys",
-	"vrmod_pickup_weight", "vrmod_pickup_range",
+	"vrmod_pickup_weight", "vrmod_pickup_range", "vrmod_hand_physics",
+	"vrmod_pickup_players", "vrmod_pickup_players_adminprotect",
 	"vrmod_selfdamage",
 	"sv_vrmod_melee", "vrmod_melee_damage", "vrmod_melee_velthreshold",
 	"vrmod_melee_delay", "vrmod_melee_speedscale", "vrmod_melee_fist_collisionmodel",
@@ -76,6 +82,8 @@ local SERVER_CVARS = {
 	"sv_vrmod_headbutt", "vrmod_headbutt_damage", "vrmod_headbutt_velthreshold",
 	"vrmod_sv_climbing", "vrmod_sv_climbing_ledgeonly", "vrmod_sv_climbing_ladderonly",
 	"vrmod_sv_climbing_throw", "vrmod_sv_climbing_throwmin", "vrmod_sv_climbing_throwmax",
+	-- Hull
+	"vrmod_smallhull_all",
 	-- Networking
 	"vrmod_net_tickrate", "vrmod_net_minsend",
 }
@@ -191,12 +199,13 @@ do
 	local defaultClient = {
 		vrmod_laserpointer = "0", vrmod_useworldmodels = "0", vrmod_heightmenu = "0",
 		vrmod_seated = "0", vrmod_autostart = "0", vrmod_doors = "1",
-		vrmod_flashlight_attachment = "1", vrmod_menu_float = "1", vrmod_menu_scale = "1.0", vrmod_quickmenu_float = "0",
+		vrmod_flashlight_attachment = "1", vrmod_flashlight_shadows = "0", vrmod_flashlight_depth = "0",
+		vrmod_menu_float = "1", vrmod_menu_scale = "1.0", vrmod_quickmenu_float = "0",
 		vrmod_smoothturn = "1", vrmod_smoothturnrate = "180", vrmod_snapturnangle = "45", vrmod_althead = "0", vrmod_althead_auto = "1",
 		vrmod_controlleroffset_x = "-15", vrmod_controlleroffset_y = "-1",
 		vrmod_controlleroffset_z = "5", vrmod_controlleroffset_pitch = "50",
 		vrmod_controlleroffset_yaw = "0", vrmod_controlleroffset_roll = "0",
-		vrmod_desktopview = "3", vrmod_postprocess = "0", vrmod_skybox = "0",
+		vrmod_desktopview = "3", vrmod_postprocess = "0", vrmod_skybox = "1",
 		vrmod_znear = "1", vrmod_eyescale = "0.5", vrmod_perfoverrides = "1",
 		vrmod_perf_threaded_bones = "1", vrmod_perf_mcore = "1", vrmod_perf_mat_queue = "1",
 		vrmod_perf_no_bloom = "1", vrmod_perf_no_fancyblend = "1", vrmod_perf_no_lightwarp = "1",
@@ -232,11 +241,17 @@ do
 		vrmod_holster_showmodels = "1", vrmod_pouch_chest_z = "-3.4",
 		vrmod_holster_prop_maxvolume = "5750", vrmod_holster_ragdolls = "0",
 		vrmod_holster_ragdoll_models = "0", vrmod_holster_persist = "1",
+		vrmod_holster_model_enabled = "1", vrmod_holster_model = "models/weapons/w_eq_eholster.mdl",
+		vrmod_holster_model_x = "0", vrmod_holster_model_y = "0", vrmod_holster_model_z = "0",
+		vrmod_holster_model_p = "0", vrmod_holster_model_yaw = "0", vrmod_holster_model_r = "0",
+		vrmod_holster_model_slot1 = "1", vrmod_holster_model_slot2 = "1", vrmod_holster_model_slot3 = "1", vrmod_holster_model_slot4 = "1",
 	}
 	local defaultServer = {
 		vrmod_allow_teleport = "1", vrmod_teleport_maxdist = "0",
 		vrmod_pickup_limit = "1", vrmod_pickup_npcs = "1", vrmod_pickup_no_phys = "0",
 		vrmod_pickup_weight = "35", vrmod_pickup_range = "0.7", vrmod_selfdamage = "1",
+		vrmod_pickup_players = "0", vrmod_pickup_players_adminprotect = "1",
+		vrmod_hand_physics = "1",
 		sv_vrmod_melee = "1", vrmod_melee_damage = "2", vrmod_melee_velthreshold = "2.5",
 		vrmod_melee_delay = "0.03", vrmod_melee_speedscale = "0.001",
 		vrmod_melee_fist_collisionmodel = "models/props_junk/PopCan01a.mdl",
@@ -704,6 +719,12 @@ function VRUtilOpenMenu()
 		form.Header:SetVisible(false)
 		form.Paint = nil
 
+		form:CheckBox("Performance convar overrides (master)", "vrmod_perfoverrides")
+		form:ControlHelp("Master switch for the FPS-friendly engine overrides below. These apply the moment you tick them, on desktop as well as in VR, and stay applied after you exit. Unticking one returns that convar to its engine default rather than a value you set yourself.")
+		for _, o in ipairs(vrmod.PerfOverrides or {}) do
+			form:CheckBox(o.label, o.toggle)
+		end
+
 		-- Desktop view combo
 		local dvCombo = form:ComboBox("Desktop view", "vrmod_desktopview")
 		dvCombo:AddChoice("none", "1")
@@ -714,11 +735,10 @@ function VRUtilOpenMenu()
 
 		form:CheckBox("Enable engine postprocessing", "vrmod_postprocess")
 		form:CheckBox("3D Skybox (disable for more FPS)", "vrmod_skybox")
-		form:CheckBox("Performance convar overrides (master)", "vrmod_perfoverrides")
-		form:ControlHelp("Master switch for the FPS-friendly engine overrides below. Toggle individual ones as needed. All apply on next VR start.")
-		for _, o in ipairs(vrmod.PerfOverrides or {}) do
-			form:CheckBox(o.label, o.toggle)
-		end
+		form:CheckBox("Flashlight shadows", "vrmod_flashlight_shadows")
+		form:ControlHelp("Lets the VR flashlight cast shadows. Free to flip, but nothing changes unless the depth texture below is on too. Takes effect on your next flashlight toggle.")
+		form:CheckBox("Flashlight shadow depth texture", "vrmod_flashlight_depth")
+		form:ControlHelp("Off by default: the depth pass re-renders whenever your hands or a nearby prop sit in the beam, which stutters under the threaded material queue. Changing this reallocates the depth texture and WILL freeze the game for about a second. Applies outside VR -- toggling in-headset takes effect on exit.")
 
 		form:NumSlider("ZNear", "vrmod_znear", -3.0, 3.0, 2)
 		form:ControlHelp("How close objects can be before clipping. Lower values let you see closer objects.")
@@ -730,6 +750,8 @@ function VRUtilOpenMenu()
 		function resetBtn:DoClick()
 			RunConsoleCommand("vrmod_postprocess", "0")
 			RunConsoleCommand("vrmod_skybox", "1")
+			RunConsoleCommand("vrmod_flashlight_shadows", "0")
+			RunConsoleCommand("vrmod_flashlight_depth", "0")
 			RunConsoleCommand("vrmod_znear", "1.0")
 			RunConsoleCommand("vrmod_eyescale", "0.5")
 			RunConsoleCommand("vrmod_perfoverrides", "1")
@@ -912,13 +934,12 @@ function VRUtilOpenMenu()
 
 	-- ─────────────── Client > Holster ───────────────
 	do
-		local POUCH_SLOTS = 5
+		local POUCH_SLOTS = 4
 		local holsterPositions = {
 			{ part = "Head",  side = "Right"  },
 			{ part = "Head",  side = "Left"   },
 			{ part = "Chest", side = "Right"  },
 			{ part = "Chest", side = "Left"   },
-			{ part = "Chest", side = "Center" },
 		}
 		local t = vgui.Create("DScrollPanel", clientSheet)
 		clientSheet:AddSheet("Holster", t, "icon16/briefcase.png")
@@ -939,6 +960,33 @@ function VRUtilOpenMenu()
 		settingsForm:CheckBox("Allow Holstering Ragdolls", "vrmod_holster_ragdolls")
 		settingsForm:CheckBox("Show Ragdoll Models on Holster", "vrmod_holster_ragdoll_models")
 		settingsForm:CheckBox("Persist Holster Across Map Changes", "vrmod_holster_persist")
+
+		local modelForm = vgui.Create("DForm", t)
+		modelForm:SetName("Holster Model")
+		modelForm:Dock(TOP)
+		modelForm:DockMargin(5, 5, 5, 0)
+		modelForm:SetExpanded(true)
+		modelForm:CheckBox("Show Holster Model", "vrmod_holster_model_enabled")
+		modelForm:ControlHelp("Draws a model at the centre of every grip point. Off frees the model but keeps the path below.")
+		modelForm:TextEntry("Model", "vrmod_holster_model")
+		modelForm:ControlHelp("Defaults to the CS:S holster, which GMod mounts by default.")
+		for s = 1, POUCH_SLOTS do
+			modelForm:CheckBox("Draw on " .. holsterPositions[s].part .. " (" .. holsterPositions[s].side .. ")", "vrmod_holster_model_slot" .. s)
+		end
+		modelForm:NumSlider("Forward offset", "vrmod_holster_model_x", -32, 32, 1)
+		modelForm:NumSlider("Sideways offset", "vrmod_holster_model_y", -32, 32, 1)
+		modelForm:NumSlider("Vertical offset", "vrmod_holster_model_z", -32, 32, 1)
+		modelForm:NumSlider("Pitch", "vrmod_holster_model_p", -180, 180, 0)
+		modelForm:NumSlider("Yaw", "vrmod_holster_model_yaw", -180, 180, 0)
+		modelForm:ControlHelp("Rotation is applied on top of your body yaw, so the holster turns with you.")
+		modelForm:NumSlider("Roll", "vrmod_holster_model_r", -180, 180, 0)
+		local hmReset = modelForm:Button("Reset Holster Model")
+		function hmReset:DoClick()
+			RunConsoleCommand("vrmod_holster_model_enabled", "1")
+			RunConsoleCommand("vrmod_holster_model", "models/weapons/w_eq_eholster.mdl")
+			for s = 1, POUCH_SLOTS do RunConsoleCommand("vrmod_holster_model_slot" .. s, "1") end
+			for _, s in ipairs({"x", "y", "z", "p", "yaw", "r"}) do RunConsoleCommand("vrmod_holster_model_" .. s, "0") end
+		end
 
 		local sizeForm = vgui.Create("DForm", t)
 		sizeForm:SetName("Holster Sizes")
@@ -1435,6 +1483,12 @@ function VRUtilOpenMenu()
 		pickupForm:CheckBox("Disable prop physics", "vrmod_pickup_no_phys")
 		pickupForm:NumSlider("Pickup weight", "vrmod_pickup_weight", 1, 10000, 0)
 		pickupForm:NumSlider("Pickup range", "vrmod_pickup_range", 0.0, 10.0, 1)
+		pickupForm:CheckBox("Hand physics props", "vrmod_hand_physics")
+		pickupForm:ControlHelp("Spawns solid physics props on VR players' hands so they can shove objects around. Off despawns them, which also stops hands blocking bullets and movement. Applies live, no rejoin needed.")
+		pickupForm:CheckBox("Allow grabbing players", "vrmod_pickup_players")
+		pickupForm:ControlHelp("VR players can pick up other players. The target is swapped for a ragdoll and dragged along by it, the same way NPCs are. Hard landings deal fall damage.")
+		pickupForm:CheckBox("Protect higher ranks", "vrmod_pickup_players_adminprotect")
+		pickupForm:ControlHelp("Refuses grabs where the target's usergroup outranks the grabber's. Uses CAMI inheritance when an admin mod provides it, otherwise superadmin > admin > user.")
 
 		local combatForm = vgui.Create("DForm", t)
 		combatForm:SetName("Combat")
@@ -1462,6 +1516,8 @@ function VRUtilOpenMenu()
 				vrmod_allow_teleport = "1", vrmod_teleport_maxdist = "500",
 				vrmod_pickup_limit = "1", vrmod_pickup_npcs = "1", vrmod_pickup_no_phys = "0",
 				vrmod_pickup_weight = "150", vrmod_pickup_range = "3.5", vrmod_selfdamage = "1",
+				vrmod_pickup_players = "0", vrmod_pickup_players_adminprotect = "1",
+				vrmod_hand_physics = "1",
 				sv_vrmod_melee = "1", vrmod_melee_damage = "3", vrmod_melee_velthreshold = "1.5",
 				vrmod_melee_delay = "0.45", vrmod_melee_speedscale = "0.030",
 				vrmod_melee_fist_collisionmodel = defaultModel,
@@ -1506,6 +1562,8 @@ function VRUtilOpenMenu()
 		hullForm:ControlHelp("Shrinks the player collision box so you fit through tighter gaps and can stand closer to walls. Height is unchanged.")
 		hullForm:NumSlider("Hull width scale", "vrmod_hullscale", 0.1, 1, 3)
 		hullForm:ControlHelp("1 = GMod default (16u wide). 0.625 = the classic VR hull (10u). 0.1 = smallest (1.6u). Only applies while the reduced hull is enabled.")
+		hullForm:CheckBox("Affects all non-VR players", "vrmod_smallhull_all")
+		hullForm:ControlHelp("Gives every player the reduced hull, not just VR players, so mixed lobbies fit through the same gaps. Server setting: needs host or the RCON toggle. Non-VR players may reach spots the map assumes are sealed.")
 		hullForm:CheckBox("Head anti-clip", "vrmod_anticlip")
 		hullForm:ControlHelp("Pushes your view out of walls when leaning through them in roomscale. Disable if an addon's collision fights it (addons can also override via the VRMod_AllowHeadAntiClip hook).")
 
@@ -1513,6 +1571,8 @@ function VRUtilOpenMenu()
 		function resetBtn:DoClick()
 			RunConsoleCommand("vrmod_smallhull", "1")
 			RunConsoleCommand("vrmod_hullscale", "0.625")
+			RunConsoleCommand("vrmod_smallhull_all", "0")
+			RconCvar("vrmod_smallhull_all", "0")
 			RunConsoleCommand("vrmod_anticlip", "1")
 		end
 	end

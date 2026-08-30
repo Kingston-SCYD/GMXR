@@ -1,18 +1,16 @@
 --[[
-    VRMod Weapon Fix
-    Tab 1 – Muzzle Angles  : per-weapon P/Y/R correction + laser
-    Tab 2 – Grip Position  : physical freeze-and-reposition grip offset
-    Tab 3 – Animations     : per-weapon animation disabler
-    Tab 4 – World Models   : force world model rendering per weapon
-    Tab 5 – Attack Block   : disable IN_ATTACK for motion-controlled melees
+    VRMod Weapon Fixer
+
+    Muzzle Angles  : per-weapon P/Y/R muzzle correction + laser
+    Grip Position  : freeze-and-regrab grip offset
+    Animations     : per-weapon viewmodel animation disabler
+    World Models   : force world model rendering per weapon
+    Attack Block   : strip IN_ATTACK for motion-controlled melees
+    Presets        : import/export the whole config, shareable via Workshop
 
     Place in: garrysmod/lua/autorun/client/
-    One file, no dependencies.
+    One file, no dependencies. Stock Derma throughout.
 ]]
-
--- Discard slot for multi-return calls; without it `_, setPRow = AxisRow(...)`
--- below writes the global _ and breaks addons that expect it to stay nil.
-local _
 
 if SERVER then return end
 
@@ -20,179 +18,169 @@ if SERVER then return end
 -- Cached natives
 -- ============================================================================
 
-local LocalPlayer = LocalPlayer
-local IsValid = IsValid
-local WorldToLocal = WorldToLocal
-local LocalToWorld = LocalToWorld
-local string_find = string.find
-local string_format = string.format
-local math_Clamp = math.Clamp
-local math_Round = math.Round
-local bit_band  = bit.band
-local bit_bnot  = bit.bnot
+local LocalPlayer, IsValid       = LocalPlayer, IsValid
+local WorldToLocal, LocalToWorld = WorldToLocal, LocalToWorld
+local Vector, Angle, Color       = Vector, Angle, Color
+local SortedPairs, pairs, ipairs = SortedPairs, pairs, ipairs
+local next, istable              = next, istable
+local string_find                = string.find
+local string_format              = string.format
+local math_Round                 = math.Round
+local table_Count                = table.Count
+local bit_band                   = bit.band
+local vgui_Create                = vgui.Create
 
--- ============================================================================
--- Shared palette
--- ============================================================================
+local ATK_MASK = bit.bnot(IN_ATTACK + IN_ATTACK2)
+local EMPTY    = {}
 
-local COL_BG         = Color(30,  30,  30,  245)
-local COL_PANEL      = Color(38,  38,  42,  245)
-local COL_ROW        = Color(48,  48,  54,  230)
-local COL_HEADER     = Color(22,  22,  26,  255)
-local COL_ACCENT     = Color(80,  160, 220, 255)
-local COL_BTN        = Color(58,  58,  65,  255)
-local COL_BTN_HOV    = Color(82,  134, 194, 255)
-local COL_SAVE       = Color(50,  160, 80,  255)
-local COL_SAVE_HOV   = Color(72,  204, 104, 255)
-local COL_RESET      = Color(180, 60,  60,  255)
-local COL_RESET_HOV  = Color(220, 82,  82,  255)
-local COL_START      = Color(60,  130, 200, 255)
-local COL_START_HOV  = Color(80,  170, 240, 255)
-local COL_CANCEL     = Color(140, 90,  40,  255)
-local COL_CANCEL_HOV = Color(190, 120, 50,  255)
-local COL_LASER_ON   = Color(50,  200, 90,  255)
-local COL_LASER_HOV  = Color(70,  240, 110, 255)
-local COL_LASER_OFF  = Color(58,  58,  65,  255)
-local COL_TEXT       = Color(222, 222, 222, 255)
-local COL_DIM        = Color(140, 140, 148, 255)
-local COL_WARN       = Color(230, 180, 50,  255)
-local COL_ACTIVE     = Color(50,  210, 100, 255)
-local COL_MARKER_BG  = Color(34,  90,  34,  210)
-
--- ============================================================================
--- Shared UI helpers
--- ============================================================================
-
-local function StyledButton(parent, label, col, hoverCol, onClick)
-    local btn = vgui.Create("DButton", parent)
-    btn:SetText(label) btn:SetFont("DermaDefaultBold") btn:SetTextColor(COL_TEXT)
-    local hov = false
-    btn.Paint = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and hoverCol or col) end
-    btn.OnCursorEntered = function() hov = true  end
-    btn.OnCursorExited  = function() hov = false end
-    btn.DoClick = onClick
-    return btn
+local function Msg(txt, isError)
+    notification.AddLegacy(txt, isError and NOTIFY_ERROR or NOTIFY_GENERIC, 3)
 end
 
-local function Separator(parent)
-    local s = vgui.Create("DPanel", parent)
-    s:Dock(TOP) s:SetTall(1) s:DockMargin(4, 4, 4, 4)
-    s.Paint = function(_, w, h) draw.RoundedBox(0, 0, 0, w, h, COL_ACCENT) end
+local function ActiveClass()
+    local wep = LocalPlayer():GetActiveWeapon()
+    if IsValid(wep) then return wep:GetClass() end
 end
 
-local function SectionLabel(parent, text)
-    local l = vgui.Create("DLabel", parent)
-    l:Dock(TOP) l:SetTall(16) l:DockMargin(8, 2, 8, 0)
-    l:SetFont("DermaDefault") l:SetTextColor(COL_DIM) l:SetText(text)
+-- ============================================================================
+-- Shared active-weapon watcher
+-- One GetActiveWeapon per frame for every open panel instead of one each, and
+-- no hook at all while the menu is closed.
+-- ============================================================================
+
+local watchers, watchN     = {}, 0
+local watchClass, watchWM  = nil, nil
+
+local function WatchTick()
+    local class = ActiveClass() or "None"
+    local wm    = g_VR.wmActive or false
+    if class == watchClass and wm == watchWM then return end
+    watchClass, watchWM = class, wm
+    for _, fn in pairs(watchers) do fn(class, wm) end
 end
 
-local function WeaponBanner(parent)
-    local wp = vgui.Create("DPanel", parent)
-    wp:Dock(TOP) wp:SetTall(46) wp:DockMargin(4, 4, 4, 2)
-    wp.Paint = function(_, w, h)
-        draw.RoundedBox(6, 0, 0, w, h, COL_HEADER)
-        draw.SimpleText("Active Weapon", "DermaDefaultBold", 8, 5, COL_DIM)
+-- fn(class, isWorldModel) fires on registration and on every change.
+local function Watch(panel, fn, onRemove)
+    watchers[panel] = fn
+    watchN = watchN + 1
+    if watchN == 1 then hook.Add("Think", "vrmod_weaponfix_watch", WatchTick) end
+    panel.OnRemove = function()
+        if not watchers[panel] then return end
+        watchers[panel] = nil
+        watchN = watchN - 1
+        if watchN == 0 then hook.Remove("Think", "vrmod_weaponfix_watch") end
+        if onRemove then onRemove() end
     end
-    local lbl = vgui.Create("DLabel", wp)
-    lbl:Dock(FILL) lbl:DockMargin(8, 18, 8, 4)
-    lbl:SetFont("DermaDefaultBold") lbl:SetTextColor(COL_TEXT)
-    return lbl
-end
-
-local function WeaponList(parent, savedTable, onRowClick, formatRight)
-    local scroll = vgui.Create("DScrollPanel", parent)
-    scroll:Dock(TOP) scroll:SetTall(120) scroll:DockMargin(4, 2, 4, 4)
-    local function Rebuild()
-        scroll:Clear()
-        local any = false
-        for class, entry in SortedPairs(savedTable) do
-            any = true
-            local btn = vgui.Create("DButton", scroll)
-            btn:SetText("") btn:Dock(TOP) btn:DockMargin(0,0,0,2) btn:SetTall(24)
-            local hov = false
-            btn.Paint = function(_, w, h)
-                draw.RoundedBox(4, 0, 0, w, h, hov and COL_BTN_HOV or COL_ROW)
-                draw.SimpleText(class,              "DermaDefault", 8,   h*0.5, COL_TEXT, TEXT_ALIGN_LEFT,  TEXT_ALIGN_CENTER)
-                draw.SimpleText(formatRight(entry), "DermaDefault", w-8, h*0.5, COL_DIM,  TEXT_ALIGN_RIGHT, TEXT_ALIGN_CENTER)
-            end
-            btn.OnCursorEntered = function() hov = true  end
-            btn.OnCursorExited  = function() hov = false end
-            btn.DoClick = function() onRowClick(class, entry) end
-        end
-        if not any then
-            local e = vgui.Create("DLabel", scroll)
-            e:Dock(TOP) e:SetTall(24) e:SetTextColor(COL_DIM) e:SetText("  No saved offsets yet.")
-        end
-    end
-    Rebuild()
-    return scroll, Rebuild
+    fn(ActiveClass() or "None", g_VR.wmActive or false)
 end
 
 -- ============================================================================
--- TAB 1 – MUZZLE ANGLES
+-- Derma helpers
 -- ============================================================================
 
-local MUZZLE_FILE      = "vrmod_muzzle_offsets.json"
-local WM_MUZZLE_FILE   = "vrmod_muzzle_offsets_wm.json"
-local LASER_FILE       = "vrmod_muzzle_lasers.json"
+local function MakeForm(parent, name)
+    local form = vgui_Create("DForm", parent)
+    form:SetName(name)
+    form:Dock(TOP)
+    form:DockMargin(5, 5, 5, 0)
+    form:SetExpanded(true)
+    return form
+end
+
+local function MakeList(form, tall, ...)
+    local lv = vgui_Create("DListView", form)
+    lv:SetTall(tall)
+    lv:SetMultiSelect(false)
+    for _, name in ipairs({...}) do lv:AddColumn(name) end
+    form:AddItem(lv)
+    return lv
+end
+
+-- Bound checkbox that never re-enters its own OnChange when refreshed.
+local function MakeCheck(form, label, onChange)
+    local chk, lock = form:CheckBox(label), false
+    chk.OnChange = function(_, v) if not lock then onChange(v) end end
+    chk.SetQuiet = function(_, v) lock = true chk:SetValue(v or false) lock = false end
+    return chk
+end
+
+-- ============================================================================
+-- MUZZLE ANGLES
+-- ============================================================================
+
+local MUZZLE_FILE    = "vrmod_muzzle_offsets.json"
+local WM_MUZZLE_FILE = "vrmod_muzzle_offsets_wm.json"
+local LASER_FILE     = "vrmod_muzzle_lasers.json"
 
 local builtinDefaults = {
     ["weapon_hl1_glock"] = { p = 5, y = -2.5, r = 0 },
 }
 
-local muzzleSaved     = {}
-local muzzlePreview   = nil
-local wmMuzzleSaved   = {}
-local wmMuzzlePreview = nil
-local laserEnabled    = {}
-local laserColors     = {}
-local laserMaterials  = {}
+local muzzleSaved, muzzlePreview     = {}, nil
+local wmMuzzleSaved, wmMuzzlePreview = {}, nil
+local laserEnabled, laserColors, laserMaterials = {}, {}, {}
 
-local DEFAULT_LASER = { r = 0, g = 220, b = 255 }
+local DEFAULT_LASER     = { r = 0, g = 220, b = 255 }
+local DEFAULT_LASER_MAT = "trails/laser"
+
+local LASER_MATERIALS = {
+    "trails/laser", "trails/smoke", "trails/electric", "trails/star",
+    "trails/beam", "trails/lol", "trails/plasma", "trails/tube",
+    "trails/scanline", "trails/heart", "trails/floater", "trails/zig",
+    "trails/bluelaser",
+    "cable/rope", "cable/xbeam", "cable/cable2", "cable/physbeam",
+    "cable/hydra", "cable/redlaser",
+}
+
+local laserMatCache = {}
+for _, path in ipairs(LASER_MATERIALS) do laserMatCache[path] = Material(path) end
+
+local function GetLaserMat(class)
+    return laserMatCache[laserMaterials[class] or DEFAULT_LASER_MAT] or laserMatCache[DEFAULT_LASER_MAT]
+end
 
 local function GetLaserColor(class)
-    local c = laserColors[class]
-    if c then return Color(c.r, c.g, c.b, 200) end
-    return Color(DEFAULT_LASER.r, DEFAULT_LASER.g, DEFAULT_LASER.b, 200)
+    local c = laserColors[class] or DEFAULT_LASER
+    return Color(c.r, c.g, c.b, 200)
 end
 
 local function MuzzleLoad()
     local raw = file.Read(MUZZLE_FILE, "DATA")
     if raw then muzzleSaved = util.JSONToTable(raw) or {} end
+
     local migrated = false
     for class, off in pairs(muzzleSaved) do
-        if off.auto then muzzleSaved[class] = nil; migrated = true end
+        if off.auto then muzzleSaved[class] = nil migrated = true end
     end
     for class, def in pairs(builtinDefaults) do
-        if not muzzleSaved[class] then
-            muzzleSaved[class] = { p = def.p, y = def.y, r = def.r }
-        end
+        if not muzzleSaved[class] then muzzleSaved[class] = { p = def.p, y = def.y, r = def.r } end
     end
     if migrated then file.Write(MUZZLE_FILE, util.TableToJSON(muzzleSaved, true)) end
-    local wmraw = file.Read(WM_MUZZLE_FILE, "DATA")
-    if wmraw then wmMuzzleSaved = util.JSONToTable(wmraw) or {} end
-    local lraw = file.Read(LASER_FILE, "DATA")
-    if lraw then
-        local t = util.JSONToTable(lraw) or {}
+
+    raw = file.Read(WM_MUZZLE_FILE, "DATA")
+    if raw then wmMuzzleSaved = util.JSONToTable(raw) or {} end
+
+    raw = file.Read(LASER_FILE, "DATA")
+    if raw then
+        local t = util.JSONToTable(raw) or EMPTY
         laserEnabled   = t.enabled   or {}
         laserColors    = t.colors    or {}
         laserMaterials = t.materials or {}
     end
 end
+
 local function MuzzleSave()
     file.Write(MUZZLE_FILE, util.TableToJSON(muzzleSaved, true))
     file.Write(WM_MUZZLE_FILE, util.TableToJSON(wmMuzzleSaved, true))
-    file.Write(LASER_FILE,  util.TableToJSON({
-        enabled   = laserEnabled,
-        colors    = laserColors,
-        materials = laserMaterials,
+    file.Write(LASER_FILE, util.TableToJSON({
+        enabled = laserEnabled, colors = laserColors, materials = laserMaterials,
     }, true))
 end
 MuzzleLoad()
 
--- ============================================================================
+-- ---------------------------------------------------------------------------
 -- Weapon class checks
--- ============================================================================
+-- ---------------------------------------------------------------------------
 
 local SKIP_CLASSES = { weapon_vrmod_empty = true, weapon_fists = true }
 
@@ -207,19 +195,12 @@ end
 local function ShouldProcess(wep)
     if not IsValid(wep) then return false end
     if SKIP_CLASSES[wep:GetClass()] then return false end
-    if IsArcVRWeapon(wep) then return false end
-    return true
+    return not IsArcVRWeapon(wep)
 end
 
--- ============================================================================
--- Muzzle offset application
--- ============================================================================
-
-local function ApplyMuzzleOffset(ang, p, y, r)
-    ang:RotateAroundAxis(ang:Right(), p)
-    ang:RotateAroundAxis(ang:Up(), y)
-    ang:RotateAroundAxis(ang:Forward(), r)
-end
+-- ---------------------------------------------------------------------------
+-- Offset application
+-- ---------------------------------------------------------------------------
 
 do
     local origUpdateViewModel = vrmod.utils.UpdateViewModel
@@ -229,60 +210,39 @@ do
 
         local muz = g_VR.viewModelMuzzle
         if not muz then return end
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not ShouldProcess(wep) then return end
 
-        local class = wep:GetClass()
-        local off
-        if g_VR.wmActive then
-            off = wmMuzzlePreview or wmMuzzleSaved[class]
-        else
-            off = muzzlePreview or muzzleSaved[class]
+        local wm  = g_VR.wmActive
+        local off = wm and wmMuzzlePreview or not wm and muzzlePreview
+        if not off then
+            local wep = LocalPlayer():GetActiveWeapon()
+            if not ShouldProcess(wep) then return end
+            off = (wm and wmMuzzleSaved or muzzleSaved)[wep:GetClass()]
+            if not off then return end
         end
-        if not off then return end
+
         local p, y, r = off.p or 0, off.y or 0, off.r or 0
         if p == 0 and y == 0 and r == 0 then return end
-        ApplyMuzzleOffset(muz.Ang, p, y, r)
+
+        local ang = muz.Ang
+        ang:RotateAroundAxis(ang:Right(), p)
+        ang:RotateAroundAxis(ang:Up(), y)
+        ang:RotateAroundAxis(ang:Forward(), r)
     end
 end
 
--- ============================================================================
--- Per-weapon laser
--- ============================================================================
-
-local DEFAULT_LASER_MAT = "trails/laser"
-
-local LASER_MATERIALS = {
-    "trails/laser", "trails/smoke", "trails/electric", "trails/star",
-    "trails/beam", "trails/lol", "trails/plasma", "trails/tube",
-    "trails/scanline", "trails/heart", "trails/floater", "trails/zig",
-    "trails/bluelaser",
-    "cable/rope", "cable/xbeam", "cable/cable2", "cable/physbeam",
-    "cable/hydra", "cable/redlaser",
-}
-
-local laserMatCache = {}
-for _, path in ipairs(LASER_MATERIALS) do
-    laserMatCache[path] = Material(path)
-end
-
-local function GetLaserMat(class)
-    local path = laserMaterials[class] or DEFAULT_LASER_MAT
-    return laserMatCache[path] or laserMatCache[DEFAULT_LASER_MAT]
-end
-
 hook.Add("PostDrawTranslucentRenderables", "vrmod_muzzlefix_laser", function(depth, sky)
-    if depth or sky then return end
+    if depth or sky or not next(laserEnabled) then return end
+
     local ply = LocalPlayer()
     local wep = ply:GetActiveWeapon()
     if not IsValid(wep) then return end
+
     local class = wep:GetClass()
     if not laserEnabled[class] then return end
 
-    -- wm_base draws from its own worldmodel muzzle (the viewmodel one is the
-    -- suppressed dumbass), traced to the hit point. Uses the same per-class enable
-    -- / material / colour config as every other weapon, so the existing menu
-    -- configures it.
+    -- wm_base draws from its own worldmodel muzzle (the viewmodel one is
+    -- suppressed), traced to the hit point. Same per-class config as everything
+    -- else, so this menu configures it too.
     if wep.IsWMBase and wep.WMGetMuzzleWorld then
         local mp, dir = wep:WMGetMuzzleWorld(ply)
         if not mp then return end
@@ -292,745 +252,205 @@ hook.Add("PostDrawTranslucentRenderables", "vrmod_muzzlefix_laser", function(dep
         return
     end
 
-    -- Default: viewmodel muzzle (unchanged).
     local muz = g_VR.viewModelMuzzle
     if not muz then return end
-    local fwd = muz.Ang:Forward()
     render.SetMaterial(GetLaserMat(class))
-    render.DrawBeam(muz.Pos, muz.Pos + fwd * 1000, 3, 0, 1, GetLaserColor(class))
+    render.DrawBeam(muz.Pos, muz.Pos + muz.Ang:Forward() * 1000, 3, 0, 1, GetLaserColor(class))
 end)
 
 -- ============================================================================
--- Muzzle panel UI
+-- GRIP POSITION
 -- ============================================================================
 
--- Axis row with ±0.1, ±1, ±5 nudge buttons + slider + value label
-local function AxisRow(parent, axisLabel, getter, setter)
-    local row = vgui.Create("DPanel", parent)
-    row:Dock(TOP) row:DockMargin(4,2,4,2) row:SetTall(28)
-    row.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, COL_ROW) end
+local GRIP_FILE    = "vrmod_grip_offsets.json"
+local GRIP_LH_FILE = "vrmod_grip_offsets_lefthand.json"
 
-    local api = {}
-
-    local lbl = vgui.Create("DLabel", row)
-    lbl:SetText(axisLabel) lbl:SetFont("DermaDefaultBold") lbl:SetTextColor(COL_ACCENT)
-    lbl:Dock(LEFT) lbl:DockMargin(6,0,2,0) lbl:SetWide(34) lbl:SetContentAlignment(4)
-
-    -- Minus buttons: -5 -1 -0.1
-    for _, step in ipairs({-5, -1, -0.1}) do
-        local txt = step == -0.1 and "-.1" or tostring(step)
-        local b = StyledButton(row, txt, COL_BTN, COL_BTN_HOV, function()
-            api.set(math_Round(math_Clamp(getter() + step, -180, 180), 1))
-        end)
-        b:Dock(LEFT) b:DockMargin(1,3,1,3) b:SetWide(step == -0.1 and 28 or 26)
-    end
-
-    -- Plus buttons on the right: +5 +1 +0.1 (docked RIGHT so order is reversed)
-    local valLbl = vgui.Create("DLabel", row)
-    valLbl:SetFont("DermaDefault") valLbl:SetTextColor(COL_TEXT)
-    valLbl:Dock(RIGHT) valLbl:DockMargin(0,0,4,0) valLbl:SetWide(50) valLbl:SetContentAlignment(6)
-
-    for _, step in ipairs({5, 1, 0.1}) do
-        local txt = step == 0.1 and "+.1" or "+"..tostring(step)
-        local b = StyledButton(row, txt, COL_BTN, COL_BTN_HOV, function()
-            api.set(math_Round(math_Clamp(getter() + step, -180, 180), 1))
-        end)
-        b:Dock(RIGHT) b:DockMargin(1,3,1,3) b:SetWide(step == 0.1 and 28 or 26)
-    end
-
-    local slider = vgui.Create("DNumSlider", row)
-    slider:Dock(FILL) slider:DockMargin(2,2,2,2)
-    slider:SetMin(-180) slider:SetMax(180) slider:SetDecimals(1) slider:SetValue(getter())
-    if IsValid(slider.Label)    then slider.Label:SetWide(0)    end
-    if IsValid(slider.TextArea) then slider.TextArea:SetWide(0) end
-
-    slider.OnValueChanged = function(_, val)
-        setter(math_Round(val, 1))
-        valLbl:SetText(string_format("%.1f°", val))
-    end
-
-    local publicSet = function(val)
-        setter(val)
-        slider:SetValue(val)
-        valLbl:SetText(string_format("%.1f°", val))
-    end
-    api.set = publicSet
-    valLbl:SetText(string_format("%.1f°", getter()))
-    return row, publicSet
-end
-
-local function BuildMuzzlePanel(parent)
-    -- Wrap everything in a scroll panel so all content is reachable
-    local scroll = vgui.Create("DScrollPanel", parent)
-    scroll:Dock(FILL) scroll:DockMargin(0,0,0,0)
-
-    local inner = scroll  -- all children dock into scroll
-
-    local wepLbl = WeaponBanner(inner)
-
-    -- ── Mode indicator ────────────────────────────────────────────────────
-    local modeLbl = vgui.Create("DLabel", inner)
-    modeLbl:Dock(TOP) modeLbl:SetTall(18) modeLbl:DockMargin(8,0,8,0)
-    modeLbl:SetFont("DermaDefaultBold") modeLbl:SetContentAlignment(4)
-
-    -- Track which mode sliders/buttons target
-    local isWM = false
-
-    -- ── Laser controls ────────────────────────────────────────────────────
-    Separator(inner)
-
-    local laserRow = vgui.Create("DPanel", inner)
-    laserRow:Dock(TOP) laserRow:SetTall(30) laserRow:DockMargin(4,0,4,2) laserRow.Paint = function() end
-
-    local laserBtn, colorSwatch, matCombo
-
-    local function UpdateLaserUI(class)
-        if not IsValid(laserBtn) then return end
-        local on = laserEnabled[class]
-        laserBtn:SetText(on and "  Laser: ON" or "  Laser: OFF")
-        local col    = on and COL_LASER_ON  or COL_LASER_OFF
-        local colHov = on and COL_LASER_HOV or COL_BTN_HOV
-        local hov = false
-        laserBtn.Paint           = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and colHov or col) end
-        laserBtn.OnCursorEntered = function() hov = true  end
-        laserBtn.OnCursorExited  = function() hov = false end
-        if IsValid(colorSwatch) then colorSwatch.currentColor = GetLaserColor(class) end
-        if IsValid(matCombo) then matCombo:SetValue(laserMaterials[class] or DEFAULT_LASER_MAT) end
-    end
-
-    laserBtn = vgui.Create("DButton", laserRow)
-    laserBtn:SetText("  Laser: OFF")
-    laserBtn:SetFont("DermaDefaultBold") laserBtn:SetTextColor(COL_TEXT)
-    laserBtn:Dock(LEFT) laserBtn:SetWide(148) laserBtn:DockMargin(0,3,6,3)
-    laserBtn.DoClick = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then return end
-        local class = wep:GetClass()
-        laserEnabled[class] = not laserEnabled[class] or nil
-        MuzzleSave()
-        UpdateLaserUI(class)
-    end
-
-    colorSwatch = vgui.Create("DButton", laserRow)
-    colorSwatch:SetText("")
-    colorSwatch:Dock(LEFT) colorSwatch:SetWide(26) colorSwatch:DockMargin(0,4,4,4)
-    colorSwatch.currentColor = GetLaserColor("")
-    colorSwatch.Paint = function(self, w, h)
-        draw.RoundedBox(4, 1, 1, w-2, h-2, Color(20,20,20,200))
-        draw.RoundedBox(3, 2, 2, w-4, h-4, self.currentColor)
-    end
-    colorSwatch.DoClick = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then
-            notification.AddLegacy("[MuzzleFix] Equip a weapon first", NOTIFY_ERROR, 3)
-            return
-        end
-        local class = wep:GetClass()
-        local existing = laserColors[class] or DEFAULT_LASER
-
-        local pf = vgui.Create("DFrame")
-        pf:SetSize(250, 280)
-        pf:SetTitle("Laser Colour – "..class)
-        pf:MakePopup() pf:Center()
-        pf.Paint = function(_, w, h)
-            draw.RoundedBox(6, 0, 0, w, h, COL_BG)
-            draw.RoundedBox(6, 0, 0, w, 24, COL_HEADER)
-        end
-
-        local mixer = vgui.Create("DColorMixer", pf)
-        mixer:SetPos(8, 30) mixer:SetSize(234, 190)
-        mixer:SetPalette(false) mixer:SetAlphaBar(false)
-        mixer:SetColor(Color(existing.r, existing.g, existing.b, 255))
-
-        local presets = {
-            {"Red",Color(255,50,50)}, {"Green",Color(50,255,80)}, {"Blue",Color(50,150,255)},
-            {"Cyan",Color(0,220,255)}, {"Yellow",Color(255,230,30)}, {"White",Color(255,255,255)},
-        }
-        local presRow = vgui.Create("DPanel", pf)
-        presRow:SetPos(8, 226) presRow:SetSize(234, 22) presRow.Paint = function() end
-        for _, pre in ipairs(presets) do
-            local sw = vgui.Create("DButton", presRow)
-            sw:SetText("") sw:Dock(LEFT) sw:SetWide(34) sw:DockMargin(0,0,3,0)
-            local hov = false
-            sw.Paint = function(_, w, h)
-                local c = pre[2]
-                draw.RoundedBox(3, 0, 0, w, h, Color(c.r, c.g, c.b, hov and 255 or 180))
-            end
-            sw.OnCursorEntered = function() hov = true  end
-            sw.OnCursorExited  = function() hov = false end
-            sw.DoClick = function() mixer:SetColor(pre[2]) end
-        end
-
-        local applyBtn = StyledButton(pf, "Apply", COL_SAVE, COL_SAVE_HOV, function()
-            local chosen = mixer:GetColor()
-            laserColors[class] = { r = chosen.r, g = chosen.g, b = chosen.b }
-            MuzzleSave()
-            colorSwatch.currentColor = GetLaserColor(class)
-            pf:Close()
-        end)
-        applyBtn:SetPos(8, 252) applyBtn:SetSize(114, 22)
-
-        local cancelBtn = StyledButton(pf, "Cancel", COL_RESET, COL_RESET_HOV, function() pf:Close() end)
-        cancelBtn:SetPos(128, 252) cancelBtn:SetSize(114, 22)
-    end
-
-    local laserHint = vgui.Create("DLabel", laserRow)
-    laserHint:Dock(FILL) laserHint:DockMargin(2,0,0,0)
-    laserHint:SetFont("DermaDefault") laserHint:SetTextColor(COL_DIM)
-    laserHint:SetText("Shows muzzle direction in-world")
-    laserHint:SetContentAlignment(4)
-
-    -- Material dropdown
-    local matRow = vgui.Create("DPanel", inner)
-    matRow:Dock(TOP) matRow:SetTall(24) matRow:DockMargin(4,0,4,4) matRow.Paint = function() end
-
-    local matLbl = vgui.Create("DLabel", matRow)
-    matLbl:Dock(LEFT) matLbl:SetWide(68) matLbl:DockMargin(4,0,4,0)
-    matLbl:SetFont("DermaDefault") matLbl:SetTextColor(COL_DIM)
-    matLbl:SetText("Material:") matLbl:SetContentAlignment(4)
-
-    matCombo = vgui.Create("DComboBox", matRow)
-    matCombo:Dock(FILL) matCombo:DockMargin(0,2,4,2)
-    matCombo:SetFont("DermaDefault") matCombo:SetValue(DEFAULT_LASER_MAT)
-    for _, path in ipairs(LASER_MATERIALS) do matCombo:AddChoice(path, path) end
-    matCombo.OnSelect = function(_, _, _, data)
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then return end
-        laserMaterials[wep:GetClass()] = data
-        MuzzleSave()
-    end
-
-    -- ── Angle adjustment ──────────────────────────────────────────────────
-    Separator(inner)
-    SectionLabel(inner, "  Adjust muzzle angles (applied in real-time):")
-    SectionLabel(inner, "  Enable laser to see changes live.")
-
-    local liveP, liveY, liveR = 0, 0, 0
-    local setPRow, setYRow, setRRow
-
-    local function syncPreview()
-        local off = { p = liveP, y = liveY, r = liveR }
-        if isWM then
-            wmMuzzlePreview = off; muzzlePreview = nil
-        else
-            muzzlePreview = off; wmMuzzlePreview = nil
-        end
-    end
-
-    _, setPRow = AxisRow(inner, "Pitch", function() return liveP end, function(v) liveP = v syncPreview() end)
-    _, setYRow = AxisRow(inner, "Yaw",   function() return liveY end, function(v) liveY = v syncPreview() end)
-    _, setRRow = AxisRow(inner, "Roll",  function() return liveR end, function(v) liveR = v syncPreview() end)
-
-    Separator(inner)
-
-    local actionRow = vgui.Create("DPanel", inner)
-    actionRow:Dock(TOP) actionRow:SetTall(32) actionRow:DockMargin(4,0,4,4) actionRow.Paint = function() end
-
-    local saveBtn = StyledButton(actionRow, "Save", COL_SAVE, COL_SAVE_HOV, function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then notification.AddLegacy("[MuzzleFix] No weapon!", NOTIFY_ERROR, 3) return end
-        local class = wep:GetClass()
-        local tbl = isWM and wmMuzzleSaved or muzzleSaved
-        tbl[class] = { p = liveP, y = liveY, r = liveR }
-        MuzzleSave(); muzzlePreview = nil; wmMuzzlePreview = nil
-        local tag = isWM and "WM" or "VM"
-        notification.AddLegacy("[MuzzleFix] Saved "..tag.." for "..class, NOTIFY_GENERIC, 3)
-    end)
-    saveBtn:Dock(LEFT) saveBtn:SetWide(80) saveBtn:DockMargin(0,2,4,2)
-
-    local resetBtn = StyledButton(actionRow, "Reset weapon", COL_RESET, COL_RESET_HOV, function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then return end
-        local class = wep:GetClass()
-        local tbl = isWM and wmMuzzleSaved or muzzleSaved
-        tbl[class] = nil; MuzzleSave()
-        liveP, liveY, liveR = 0, 0, 0; syncPreview()
-        setPRow(0); setYRow(0); setRRow(0)
-        notification.AddLegacy("[MuzzleFix] Reset "..class, NOTIFY_GENERIC, 3)
-    end)
-    resetBtn:Dock(LEFT) resetBtn:SetWide(120) resetBtn:DockMargin(0,2,4,2)
-
-    local zeroBtn = StyledButton(actionRow, "Zero all", COL_BTN, COL_BTN_HOV, function()
-        liveP, liveY, liveR = 0, 0, 0; syncPreview()
-        setPRow(0); setYRow(0); setRRow(0)
-    end)
-    zeroBtn:Dock(LEFT) zeroBtn:SetWide(80) zeroBtn:DockMargin(0,2,0,2)
-
-    Separator(inner)
-    SectionLabel(inner, "  Saved viewmodel offsets (click to load):")
-
-    local _, rebuildList = WeaponList(inner, muzzleSaved,
-        function(_, off)
-            liveP, liveY, liveR = off.p or 0, off.y or 0, off.r or 0
-            syncPreview(); setPRow(liveP); setYRow(liveY); setRRow(liveR)
-        end,
-        function(off) return string_format("P:%.1f  Y:%.1f  R:%.1f", off.p or 0, off.y or 0, off.r or 0) end
-    )
-
-    Separator(inner)
-    SectionLabel(inner, "  Saved world model offsets (click to load):")
-
-    local _, rebuildWMList = WeaponList(inner, wmMuzzleSaved,
-        function(_, off)
-            liveP, liveY, liveR = off.p or 0, off.y or 0, off.r or 0
-            syncPreview(); setPRow(liveP); setYRow(liveY); setRRow(liveR)
-        end,
-        function(off) return string_format("P:%.1f  Y:%.1f  R:%.1f", off.p or 0, off.y or 0, off.r or 0) end
-    )
-
-    local os_, or_ = saveBtn.DoClick, resetBtn.DoClick
-    saveBtn.DoClick  = function(s) os_(s); rebuildList(); rebuildWMList() end
-    resetBtn.DoClick = function(s) or_(s); rebuildList(); rebuildWMList() end
-
-    local lastClass = ""
-    local lastWM = false
-    parent.Think = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        local class = IsValid(wep) and wep:GetClass() or "None"
-        local wm = g_VR.wmActive or false
-        if class == lastClass and wm == lastWM then return end
-        lastClass = class
-        lastWM = wm
-        isWM = wm
-        wepLbl:SetText(class)
-        UpdateLaserUI(class)
-        if wm then
-            modeLbl:SetText("World Model offsets")
-            modeLbl:SetTextColor(COL_WARN)
-        else
-            modeLbl:SetText("Viewmodel offsets")
-            modeLbl:SetTextColor(COL_DIM)
-        end
-        local tbl = wm and wmMuzzleSaved or muzzleSaved
-        local off = tbl[class] or { p=0, y=0, r=0 }
-        liveP, liveY, liveR = off.p or 0, off.y or 0, off.r or 0
-        syncPreview(); setPRow(liveP); setYRow(liveY); setRRow(liveR)
-    end
-
-    parent.OnRemove = function() muzzlePreview = nil; wmMuzzlePreview = nil end
-end
-
--- ============================================================================
--- TAB 2 – GRIP POSITION
--- ============================================================================
-
-local GRIP_FILE     = "vrmod_grip_offsets.json"
-local GRIP_LH_FILE  = "vrmod_grip_offsets_lefthand.json"
-local gripSaved     = {}
-local gripSavedLH   = {}
-local gripCurrent   = { pos = Vector(), ang = Angle() }
-local gripRepos     = false
+local gripSaved, gripSavedLH = {}, {}
+local gripCurrent = { pos = Vector(), ang = Angle() }
+local gripRepos, gripUnsaved = false, false
 local gripFrozenPos, gripFrozenAng = nil, nil
-local gripUnsaved   = false
 local gripListeners = {}
-local gripIsLH      = false
 
 vrmod_gripfix = vrmod_gripfix or {}
 vrmod_gripfix.lhOffsets = gripSavedLH
 vrmod_gripfix.lhLive    = nil
 
 local function GripStatus(msg)
-    for _, fn in ipairs(gripListeners) do pcall(fn, msg) end
+    for _, fn in pairs(gripListeners) do fn(msg) end
+end
+
+-- Flat px/py/pz/ap/ay/ar is both the on-disk and the preset format, so the
+-- same two functions serve saving, loading, exporting and importing.
+local function GripPack(src)
+    local out = {}
+    for class, e in pairs(src) do
+        out[class] = { px = e.pos.x, py = e.pos.y, pz = e.pos.z, ap = e.ang.p, ay = e.ang.y, ar = e.ang.r }
+    end
+    return out
+end
+
+local function GripUnpack(src, dst, overwrite)
+    local n = 0
+    for class, e in pairs(src or EMPTY) do
+        if overwrite or not dst[class] then
+            dst[class] = {
+                pos = Vector(e.px or 0, e.py or 0, e.pz or 0),
+                ang = Angle(e.ap or 0, e.ay or 0, e.ar or 0),
+            }
+            n = n + 1
+        end
+    end
+    return n
 end
 
 local function GripLoad()
     local raw = file.Read(GRIP_FILE, "DATA")
-    if raw then
-        for class, e in pairs(util.JSONToTable(raw) or {}) do
-            gripSaved[class] = {
-                pos = Vector(e.px or 0, e.py or 0, e.pz or 0),
-                ang = Angle (e.ap or 0, e.ay or 0, e.ar or 0),
-            }
-        end
-    end
-    local rawLH = file.Read(GRIP_LH_FILE, "DATA")
-    if rawLH then
-        for class, e in pairs(util.JSONToTable(rawLH) or {}) do
-            gripSavedLH[class] = {
-                pos = Vector(e.px or 0, e.py or 0, e.pz or 0),
-                ang = Angle (e.ap or 0, e.ay or 0, e.ar or 0),
-            }
-        end
-    end
+    if raw then GripUnpack(util.JSONToTable(raw), gripSaved, true) end
+    raw = file.Read(GRIP_LH_FILE, "DATA")
+    if raw then GripUnpack(util.JSONToTable(raw), gripSavedLH, true) end
 end
+
 local function GripSaveFile()
-    local out = {}
-    for class, e in pairs(gripSaved) do
-        out[class] = { px=e.pos.x, py=e.pos.y, pz=e.pos.z, ap=e.ang.p, ay=e.ang.y, ar=e.ang.r }
-    end
-    file.Write(GRIP_FILE, util.TableToJSON(out, true))
-    local outLH = {}
-    for class, e in pairs(gripSavedLH) do
-        outLH[class] = { px=e.pos.x, py=e.pos.y, pz=e.pos.z, ap=e.ang.p, ay=e.ang.y, ar=e.ang.r }
-    end
-    file.Write(GRIP_LH_FILE, util.TableToJSON(outLH, true))
+    file.Write(GRIP_FILE, util.TableToJSON(GripPack(gripSaved), true))
+    file.Write(GRIP_LH_FILE, util.TableToJSON(GripPack(gripSavedLH), true))
 end
 GripLoad()
 
-local function GetHandPose(forceLeft)
-    if not g_VR or not g_VR.tracking then return nil, nil end
-    local p = (forceLeft or gripIsLH) and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
-    return p and p.pos, p and p.ang
+-- Which hand is holding the gun. VRMod's own flag first, ArcVR's as fallback:
+-- reading only ArcticVR.GunInLeftHand reports right-handed whenever ArcVR
+-- isn't installed, since sh_lefthand's bridge onto it is guarded by
+-- `if ArcticVR then`.
+local function WepLeft()
+    return g_VR.gunInLeftHand or (ArcticVR and ArcticVR.GunInLeftHand) or false
 end
+
+local function GetHandPose()
+    local t = g_VR and g_VR.tracking
+    local p = t and (WepLeft() and t.pose_lefthand or t.pose_righthand)
+    if p then return p.pos, p.ang end
+end
+
 local function GetVMI() return g_VR and g_VR.currentvmi end
 
 hook.Add("Think", "vrmod_gripoffset_apply", function()
     if not g_VR or not g_VR.active then return end
-    if gripIsLH then
-        if gripRepos and gripFrozenPos then
-            local hp, ha = GetHandPose(); if not hp then return end
-            local op, oa = WorldToLocal(gripFrozenPos, gripFrozenAng, hp, ha)
-            vrmod_gripfix.lhLive = { pos = op, ang = oa }
-        end
-        return
-    end
-    local vmi = GetVMI(); if not vmi then return end
-    local hp, ha = GetHandPose(); if not hp then return end
+    local vmi = GetVMI() if not vmi then return end
+
     if gripRepos and gripFrozenPos then
-        local op, oa = WorldToLocal(gripFrozenPos, gripFrozenAng, hp, ha)
-        vmi.offsetPos = op; vmi.offsetAng = oa
+        local hp, ha = GetHandPose() if not hp then return end
+        vmi.offsetPos, vmi.offsetAng = WorldToLocal(gripFrozenPos, gripFrozenAng, hp, ha)
         return
     end
+
     local c = gripCurrent
     if c.pos:LengthSqr() == 0 and c.ang.p == 0 and c.ang.y == 0 and c.ang.r == 0 then return end
-    vmi.offsetPos = Vector(c.pos); vmi.offsetAng = Angle(c.ang)
+    vmi.offsetPos = Vector(c.pos)
+    vmi.offsetAng = Angle(c.ang)
 end)
 
 hook.Add("VRMod_Input", "vrmod_gripoffset_grab", function(action, pressed)
-    if not gripRepos then return end
-    if action ~= (gripIsLH and "boolean_left_pickup" or "boolean_right_pickup") then return end
+    if not gripRepos or action ~= (WepLeft() and "boolean_left_pickup" or "boolean_right_pickup") then return end
     if not pressed then return true end
-    local hp, ha = GetHandPose(); if not hp then return end
+
+    local hp, ha = GetHandPose() if not hp then return end
     local np, na = WorldToLocal(gripFrozenPos, gripFrozenAng, hp, ha)
-    -- Copy rather than share: gripCurrent, g_VR.currentvmi and gripSaved all
-    -- end up holding these, and anything that edits a Vector/Angle in place
-    -- would otherwise silently rewrite the others (and the saved JSON).
-    gripCurrent.pos = Vector(np); gripCurrent.ang = Angle(na)
-    if gripIsLH then
-        vrmod_gripfix.lhLive = { pos = Vector(np), ang = Angle(na) }
-    else
-        local vmi = GetVMI()
-        if vmi then vmi.offsetPos = Vector(np); vmi.offsetAng = Angle(na) end
-    end
-    gripRepos = false; gripFrozenPos = nil; gripFrozenAng = nil
-    vrmod_gripfix.repos = nil; vrmod_gripfix.suppressDrop = true; timer.Simple(0.5, function() vrmod_gripfix.suppressDrop = false end)
+
+    -- Copy rather than share: gripCurrent, g_VR.currentvmi and gripSaved all end
+    -- up holding these, and anything editing a Vector/Angle in place would
+    -- otherwise silently rewrite the others (and the saved JSON).
+    gripCurrent.pos, gripCurrent.ang = Vector(np), Angle(na)
+
+    local vmi = GetVMI()
+    if vmi then vmi.offsetPos, vmi.offsetAng = Vector(np), Angle(na) end
+
+    gripRepos, gripFrozenPos, gripFrozenAng = false, nil, nil
+    vrmod_gripfix.repos = nil
+    vrmod_gripfix.suppressDrop = true
+    timer.Simple(0.5, function() vrmod_gripfix.suppressDrop = false end)
+
     gripUnsaved = true
-    GripStatus("Grip set! Press Save to keep it.")
-    notification.AddLegacy("[GripOffset] Grip repositioned — press Save.", NOTIFY_GENERIC, 4)
+    GripStatus("Grip set - press Save to keep it.")
+    Msg("[GripOffset] Grip repositioned - press Save.")
     return true
 end)
 
 hook.Add("VRMod_AllowDefaultAction", "vrmod_gripoffset_blockdefault", function(action)
-    if (gripRepos or vrmod_gripfix.suppressDrop) and (action == "boolean_left_pickup" or action == "boolean_right_pickup") then return false end
+    if not gripRepos and not vrmod_gripfix.suppressDrop then return end
+    if action == "boolean_left_pickup" or action == "boolean_right_pickup" then return false end
 end)
 
 local lastGripClass = ""
+
 hook.Add("Think", "vrmod_gripoffset_wepchange", function()
-    local wep = LocalPlayer():GetActiveWeapon()
-    local class = IsValid(wep) and wep:GetClass() or ""
+    local class = ActiveClass() or ""
     if class == lastGripClass then return end
     lastGripClass = class
+
     if gripRepos then
-        gripRepos = false; gripFrozenPos = nil; gripFrozenAng = nil; vrmod_gripfix.repos = nil
-        gripIsLH = false; vrmod_gripfix.lhLive = nil
-        GripStatus("Cancelled (weapon changed).")
+        gripRepos, gripFrozenPos, gripFrozenAng = false, nil, nil
+        vrmod_gripfix.repos = nil
     end
     gripUnsaved = false
+
     local saved = gripSaved[class]
-    if saved then gripCurrent.pos = Vector(saved.pos); gripCurrent.ang = Angle(saved.ang)
-    else gripCurrent.pos = Vector(); gripCurrent.ang = Angle() end
+    if saved then
+        gripCurrent.pos, gripCurrent.ang = Vector(saved.pos), Angle(saved.ang)
+    else
+        gripCurrent.pos, gripCurrent.ang = Vector(), Angle()
+    end
+    GripStatus("Ready.")
 end)
 
 hook.Add("VRMod_Exit", "vrmod_gripoffset_exit", function(ply)
     if ply ~= LocalPlayer() then return end
-    gripRepos = false; gripFrozenPos = nil; gripFrozenAng = nil; vrmod_gripfix.repos = nil
-    gripIsLH = false; vrmod_gripfix.lhLive = nil
+    gripRepos, gripFrozenPos, gripFrozenAng = false, nil, nil
+    vrmod_gripfix.repos = nil
+    vrmod_gripfix.lhLive = nil
 end)
 
 local function GripStart()
-    if not g_VR or not g_VR.active then GripStatus("VR not active.") return end
-    local vmi = GetVMI(); if not vmi then GripStatus("No weapon VMI.") return end
-    gripIsLH = false or false
-    local hp, ha = GetHandPose(); if not hp then GripStatus("No hand tracking.") return end
+    if not g_VR or not g_VR.active then GripStatus("VR is not active.") return end
+    local vmi = GetVMI() if not vmi then GripStatus("No weapon view model info.") return end
+    local hp, ha = GetHandPose() if not hp then GripStatus("No hand tracking.") return end
 
-    if gripIsLH then
-        local wep = LocalPlayer():GetActiveWeapon()
-        local class = IsValid(wep) and wep:GetClass() or ""
-        local lhGrip = gripSavedLH[class]
-        if lhGrip then
-            gripFrozenPos, gripFrozenAng = LocalToWorld(lhGrip.pos, lhGrip.ang, hp, ha)
-        else
-            local gp, ga = LocalToWorld(vmi.offsetPos, vmi.offsetAng, hp, ha)
-            gripFrozenPos, gripFrozenAng = LocalToWorld(Vector(0, -2.5, 0), Angle(0, 0, -5), gp, ga)
-        end
-    else
-        gripFrozenPos, gripFrozenAng = LocalToWorld(vmi.offsetPos, vmi.offsetAng, hp, ha)
-    end
-
-    gripRepos = true; vrmod_gripfix.repos = true
-    local hand = gripIsLH and "left" or "right"
-    GripStatus("Gun frozen. Move "..hand.." hand to it, then grab.")
-    notification.AddLegacy("[GripOffset] Gun frozen — move "..hand.." hand and grab.", NOTIFY_GENERIC, 5)
+    gripFrozenPos, gripFrozenAng = LocalToWorld(vmi.offsetPos, vmi.offsetAng, hp, ha)
+    gripRepos = true
+    vrmod_gripfix.repos = true
+    GripStatus("Gun frozen - move your weapon hand to it, then grab.")
+    Msg("[GripOffset] Gun frozen - move your hand to it and grab.")
 end
 
 local function GripCancel()
-    gripRepos = false; gripFrozenPos = nil; gripFrozenAng = nil; vrmod_gripfix.repos = nil
-    if gripIsLH then
-        vrmod_gripfix.lhLive = nil
-    else
-        local vmi = GetVMI()
-        if vmi then vmi.offsetPos = Vector(gripCurrent.pos); vmi.offsetAng = Angle(gripCurrent.ang) end
-    end
-    gripIsLH = false
+    gripRepos, gripFrozenPos, gripFrozenAng = false, nil, nil
+    vrmod_gripfix.repos = nil
+    local vmi = GetVMI()
+    if vmi then vmi.offsetPos, vmi.offsetAng = Vector(gripCurrent.pos), Angle(gripCurrent.ang) end
     GripStatus("Cancelled.")
 end
 
 local function GripSaveCurrent()
-    local wep = LocalPlayer():GetActiveWeapon()
-    if not IsValid(wep) then GripStatus("No weapon equipped.") return false end
-    local class = wep:GetClass()
-    if gripIsLH or false then
-        gripSavedLH[class] = { pos = Vector(gripCurrent.pos), ang = Angle(gripCurrent.ang) }
-        vrmod_gripfix.lhLive = nil
-        gripIsLH = false
-    else
-        gripSaved[class] = { pos = Vector(gripCurrent.pos), ang = Angle(gripCurrent.ang) }
-    end
-    GripSaveFile(); gripUnsaved = false
-    GripStatus("Saved for "..class)
+    local class = ActiveClass()
+    if not class then GripStatus("No weapon equipped.") return false end
+    gripSaved[class] = { pos = Vector(gripCurrent.pos), ang = Angle(gripCurrent.ang) }
+    GripSaveFile()
+    gripUnsaved = false
+    GripStatus("Saved for " .. class)
     return true
 end
 
 local function GripReset()
-    local wep = LocalPlayer():GetActiveWeapon(); if not IsValid(wep) then return end
-    local class = wep:GetClass()
-    if false then
-        gripSavedLH[class] = nil; vrmod_gripfix.lhLive = nil
-    else
-        gripSaved[class] = nil
-    end
+    local class = ActiveClass() if not class then return end
+    gripSaved[class] = nil
     GripSaveFile()
-    gripCurrent.pos = Vector(); gripCurrent.ang = Angle()
-    if not false then
-        local vmi = GetVMI()
-        if vmi then vmi.offsetPos = Vector(); vmi.offsetAng = Angle() end
-    end
-    gripUnsaved = false; GripStatus("Reset for "..class)
-end
-
-local function BuildGripPanel(parent)
-    local statusLbl
-    local idx = #gripListeners + 1
-    gripListeners[idx] = function(msg) if IsValid(statusLbl) then statusLbl:SetText(msg) end end
-    parent.OnRemove = function()
-        gripListeners[idx] = nil
-        if gripRepos then GripCancel() end
-    end
-
-    local wepLbl = WeaponBanner(parent)
-
-    local statPanel = vgui.Create("DPanel", parent)
-    statPanel:Dock(TOP) statPanel:SetTall(26) statPanel:DockMargin(4,0,4,4)
-    statPanel.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, Color(35,35,42,220)) end
-    statusLbl = vgui.Create("DLabel", statPanel)
-    statusLbl:Dock(FILL) statusLbl:DockMargin(8,0,8,0)
-    statusLbl:SetFont("DermaDefault") statusLbl:SetTextColor(COL_DIM)
-    statusLbl:SetText("Ready.") statusLbl:SetContentAlignment(4)
-
-    -- Visual foregrip only toggle (requires foregrip addon)
-    local fgBtn, lastFGClass, UpdateFGBtn
-    if vrmod_foregrip and vrmod_foregrip.SetVisualOnly then
-        local fgRow = vgui.Create("DPanel", parent)
-        fgRow:Dock(TOP) fgRow:SetTall(32) fgRow:DockMargin(4,2,4,0) fgRow.Paint = function() end
-
-        UpdateFGBtn = function(class)
-            if not IsValid(fgBtn) then return end
-            local vo = vrmod_foregrip.visualOnly
-            local on = vo and vo[class]
-            fgBtn:SetText(on and "  Foregrip: Visual Only" or "  Foregrip: Two-Hand Aim")
-            local col    = on and COL_LASER_ON  or COL_LASER_OFF
-            local colHov = on and COL_LASER_HOV or COL_BTN_HOV
-            local hov = false
-            fgBtn.Paint           = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and colHov or col) end
-            fgBtn.OnCursorEntered = function() hov = true  end
-            fgBtn.OnCursorExited  = function() hov = false end
-        end
-
-        fgBtn = vgui.Create("DButton", fgRow)
-        fgBtn:SetFont("DermaDefaultBold") fgBtn:SetTextColor(COL_TEXT)
-        fgBtn:Dock(LEFT) fgBtn:SetWide(210) fgBtn:DockMargin(0,3,6,3)
-        fgBtn.DoClick = function()
-            local wep = LocalPlayer():GetActiveWeapon()
-            if not IsValid(wep) then return end
-            local c = wep:GetClass()
-            local vo = vrmod_foregrip.visualOnly
-            vrmod_foregrip.SetVisualOnly(c, not vo[c])
-            UpdateFGBtn(c)
-        end
-
-        local fgLbl = vgui.Create("DLabel", fgRow)
-        fgLbl:Dock(FILL) fgLbl:DockMargin(0,0,0,0)
-        fgLbl:SetFont("DermaDefault") fgLbl:SetTextColor(COL_DIM)
-        fgLbl:SetText("Pin hand without rotating weapon")
-
-        lastFGClass = ""
-        local wep = LocalPlayer():GetActiveWeapon()
-        UpdateFGBtn(IsValid(wep) and wep:GetClass() or "")
-    end
-
-    -- Foregrip grab-zone shape + scale (requires foregrip addon)
-    if vrmod_foregrip then
-        local zoneRow = vgui.Create("DPanel", parent)
-        zoneRow:Dock(TOP) zoneRow:SetTall(32) zoneRow:DockMargin(4,2,4,0) zoneRow.Paint = function() end
-
-        local zoneBtn
-        local function UpdateZoneBtn()
-            if not IsValid(zoneBtn) then return end
-            local on = GetConVar("vrmod_foregrip_sphere"):GetBool()
-            zoneBtn:SetText(on and "  Grab Zone: Sphere" or "  Grab Zone: Box")
-            local col    = on and COL_LASER_ON  or COL_LASER_OFF
-            local colHov = on and COL_LASER_HOV or COL_BTN_HOV
-            local hov = false
-            zoneBtn.Paint           = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and colHov or col) end
-            zoneBtn.OnCursorEntered = function() hov = true  end
-            zoneBtn.OnCursorExited  = function() hov = false end
-        end
-        zoneBtn = vgui.Create("DButton", zoneRow)
-        zoneBtn:SetFont("DermaDefaultBold") zoneBtn:SetTextColor(COL_TEXT)
-        zoneBtn:Dock(LEFT) zoneBtn:SetWide(210) zoneBtn:DockMargin(0,3,6,3)
-        zoneBtn.DoClick = function()
-            RunConsoleCommand("vrmod_foregrip_sphere", GetConVar("vrmod_foregrip_sphere"):GetBool() and "0" or "1")
-            timer.Simple(0, UpdateZoneBtn)
-        end
-        UpdateZoneBtn()
-
-        local zoneLbl = vgui.Create("DLabel", zoneRow)
-        zoneLbl:Dock(FILL)
-        zoneLbl:SetFont("DermaDefault") zoneLbl:SetTextColor(COL_DIM)
-        zoneLbl:SetText("Box = directional, Sphere = radial")
-
-        local scaleSlider = vgui.Create("DNumSlider", parent)
-        scaleSlider:Dock(TOP) scaleSlider:DockMargin(8,2,8,0) scaleSlider:SetTall(28)
-        scaleSlider:SetText("Sphere Scale")
-        scaleSlider:SetMin(0.25) scaleSlider:SetMax(4) scaleSlider:SetDecimals(2)
-        scaleSlider:SetConVar("vrmod_foregrip_scale")
-        if IsValid(scaleSlider.Label) then scaleSlider.Label:SetTextColor(COL_DIM) end
-    end
-
-    Separator(parent)
-
-    local handModeLbl = vgui.Create("DLabel", parent)
-    handModeLbl:Dock(TOP) handModeLbl:SetTall(18) handModeLbl:DockMargin(8,2,8,0)
-    handModeLbl:SetFont("DermaDefaultBold") handModeLbl:SetContentAlignment(4)
-
-    local instrPanel = vgui.Create("DPanel", parent)
-    instrPanel:Dock(TOP) instrPanel:SetTall(72) instrPanel:DockMargin(4,2,4,4)
-    instrPanel.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, COL_ROW) end
-    for i, line in ipairs({
-        "1.  Press  Start Reposition",
-        "2.  Gun freezes in world space",
-        "3.  Move your weapon hand to where the gun is",
-        "4.  Grab  (weapon hand grip)",
-        "5.  Gun snaps to your new grip point",
-    }) do
-        local l = vgui.Create("DLabel", instrPanel)
-        l:SetPos(10,(i-1)*13+3) l:SetSize(420,14)
-        l:SetFont("DermaDefault") l:SetText(line)
-        l:SetTextColor(i == 1 and COL_ACCENT or COL_DIM)
-    end
-
-    Separator(parent)
-
-    local ctrlRow = vgui.Create("DPanel", parent)
-    ctrlRow:Dock(TOP) ctrlRow:SetTall(38) ctrlRow:DockMargin(4,4,4,0) ctrlRow.Paint = function() end
-    local startBtn  = StyledButton(ctrlRow, "Start Reposition", COL_START,  COL_START_HOV,  GripStart)
-    local cancelBtn = StyledButton(ctrlRow, "Cancel",           COL_CANCEL, COL_CANCEL_HOV, GripCancel)
-    startBtn:Dock(LEFT)  startBtn:SetWide(180)  startBtn:DockMargin(0,3,6,3)
-    cancelBtn:Dock(LEFT) cancelBtn:SetWide(100) cancelBtn:DockMargin(0,3,0,3)
-
-    local activePanel = vgui.Create("DPanel", parent)
-    activePanel:Dock(TOP) activePanel:SetTall(26) activePanel:DockMargin(4,2,4,2)
-    activePanel.Paint = function(_, w, h)
-        if not gripRepos then return end
-        draw.RoundedBox(5, 0, 0, w, h, COL_MARKER_BG)
-        draw.SimpleText("REPOSITIONING — move hand to gun, then grab",
-            "DermaDefaultBold", w*0.5, h*0.5, COL_ACTIVE, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
-    end
-
-    Separator(parent)
-
-    local saveRow = vgui.Create("DPanel", parent)
-    saveRow:Dock(TOP) saveRow:SetTall(38) saveRow:DockMargin(4,4,4,0) saveRow.Paint = function() end
-
-    local saveBtn = StyledButton(saveRow, "Save for this weapon", COL_SAVE, COL_SAVE_HOV, function()
-        if GripSaveCurrent() then
-            notification.AddLegacy("[GripOffset] Saved!", NOTIFY_GENERIC, 3)
-        end
-    end)
-    saveBtn:Dock(LEFT) saveBtn:SetWide(190) saveBtn:DockMargin(0,3,6,3)
-
-    local resetBtn = StyledButton(saveRow, "Reset weapon", COL_RESET, COL_RESET_HOV, function()
-        GripReset()
-        notification.AddLegacy("[GripOffset] Reset.", NOTIFY_GENERIC, 3)
-    end)
-    resetBtn:Dock(LEFT) resetBtn:SetWide(130) resetBtn:DockMargin(0,3,0,3)
-
-    local unsavedLbl = vgui.Create("DLabel", parent)
-    unsavedLbl:Dock(TOP) unsavedLbl:SetTall(16) unsavedLbl:DockMargin(8,0,8,2)
-    unsavedLbl:SetFont("DermaDefault") unsavedLbl:SetTextColor(COL_WARN) unsavedLbl:SetText("")
-
-    Separator(parent)
-    SectionLabel(parent, "  Saved weapons — Right Hand (click to load):")
-
-    local _, rebuildFn = WeaponList(parent, gripSaved,
-        function(_, entry)
-            gripCurrent.pos = Vector(entry.pos); gripCurrent.ang = Angle(entry.ang)
-            local vmi = GetVMI()
-            if vmi then vmi.offsetPos = Vector(entry.pos); vmi.offsetAng = Angle(entry.ang) end
-            GripStatus("Loaded.")
-        end,
-        function(entry) return string_format("X:%.1f Y:%.1f Z:%.1f", entry.pos.x, entry.pos.y, entry.pos.z) end
-    )
-
-    Separator(parent)
-    SectionLabel(parent, "  Saved weapons — Left Hand (click to load):")
-
-    local _, rebuildLHFn = WeaponList(parent, gripSavedLH,
-        function(_, entry)
-            gripCurrent.pos = Vector(entry.pos); gripCurrent.ang = Angle(entry.ang)
-            vrmod_gripfix.lhLive = { pos = Vector(entry.pos), ang = Angle(entry.ang) }
-            GripStatus("Loaded (left hand).")
-        end,
-        function(entry) return string_format("X:%.1f Y:%.1f Z:%.1f", entry.pos.x, entry.pos.y, entry.pos.z) end
-    )
-
-    local os_, or_ = saveBtn.DoClick, resetBtn.DoClick
-    saveBtn.DoClick  = function(s) os_(s); rebuildFn(); rebuildLHFn() end
-    resetBtn.DoClick = function(s) or_(s); rebuildFn(); rebuildLHFn() end
-
-    local lastClass = ""
-    parent.Think = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        local class = IsValid(wep) and wep:GetClass() or "None"
-        if class ~= lastClass then
-            lastClass = class; wepLbl:SetText(class)
-            if fgBtn and class ~= lastFGClass then lastFGClass = class; UpdateFGBtn(class) end
-        end
-        unsavedLbl:SetText(gripUnsaved and "● Unsaved changes" or "")
-        local isLH = false or false
-        local hasLH = gripSavedLH[lastClass] ~= nil
-        if isLH then
-            handModeLbl:SetText(hasLH and "Left-Hand Mode (saved offset exists)" or "Left-Hand Mode (no offset — will use default)")
-            handModeLbl:SetTextColor(hasLH and COL_ACTIVE or COL_WARN)
-        else
-            handModeLbl:SetText("Right-Hand Mode")
-            handModeLbl:SetTextColor(COL_DIM)
-        end
-    end
+    gripCurrent.pos, gripCurrent.ang = Vector(), Angle()
+    local vmi = GetVMI()
+    if vmi then vmi.offsetPos, vmi.offsetAng = Vector(), Angle() end
+    gripUnsaved = false
+    GripStatus("Reset for " .. class)
 end
 
 -- ============================================================================
--- TAB 3 – ANIMATION DISABLER
+-- ANIMATION DISABLER
 -- ============================================================================
 
 local ANIM_FILE    = "weapon_anim_disabled.txt"
@@ -1040,150 +460,51 @@ local function AnimLoad()
     local raw = file.Read(ANIM_FILE, "DATA")
     if raw then animDisabled = util.JSONToTable(raw) or {} end
 end
-local function AnimSave()
-    file.Write(ANIM_FILE, util.TableToJSON(animDisabled))
-end
+local function AnimSave() file.Write(ANIM_FILE, util.TableToJSON(animDisabled)) end
 AnimLoad()
 
 hook.Add("PreDrawViewModel", "vrmod_weaponfix_animdisable", function(vm, _, wep)
+    if not next(animDisabled) then return end
     if not IsValid(vm) or not IsValid(wep) then return end
-    if animDisabled[wep:GetClass()] then
-        vm:SetCycle(0)
-        vm:SetPlaybackRate(0)
-    end
+    if not animDisabled[wep:GetClass()] then return end
+    vm:SetCycle(0)
+    vm:SetPlaybackRate(0)
 end)
 
-local function BuildAnimPanel(parent)
-    local wepLbl = WeaponBanner(parent)
-
-    local btnRow = vgui.Create("DPanel", parent)
-    btnRow:Dock(TOP) btnRow:SetTall(34) btnRow:DockMargin(4,4,4,4) btnRow.Paint = function() end
-
-    local toggleBtn, listScroll
-    local function UpdateToggleBtn(class)
-        if not IsValid(toggleBtn) then return end
-        local off = animDisabled[class]
-        toggleBtn:SetText(off and "Animations: DISABLED" or "Animations: Enabled")
-        local col    = off and COL_LASER_ON  or Color(40,80,40,220)
-        local colHov = off and COL_LASER_HOV or Color(50,110,50,220)
-        local hov = false
-        toggleBtn.Paint           = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and colHov or col) end
-        toggleBtn.OnCursorEntered = function() hov = true  end
-        toggleBtn.OnCursorExited  = function() hov = false end
-    end
-
-    toggleBtn = vgui.Create("DButton", btnRow)
-    toggleBtn:SetFont("DermaDefaultBold") toggleBtn:SetTextColor(COL_TEXT)
-    toggleBtn:Dock(LEFT) toggleBtn:SetWide(220) toggleBtn:DockMargin(0,2,6,2)
-    toggleBtn.DoClick = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then
-            notification.AddLegacy("[AnimFix] No weapon equipped!", NOTIFY_ERROR, 3) return
-        end
-        local class = wep:GetClass()
-        animDisabled[class] = not animDisabled[class] or nil
-        AnimSave()
-        UpdateToggleBtn(class)
-        RebuildAnimList(listScroll)
-    end
-
-    local clearBtn = StyledButton(btnRow, "Enable All", COL_RESET, COL_RESET_HOV, function()
-        animDisabled = {}; AnimSave()
-        local wep = LocalPlayer():GetActiveWeapon()
-        UpdateToggleBtn(IsValid(wep) and wep:GetClass() or "")
-        RebuildAnimList(listScroll)
-        notification.AddLegacy("[AnimFix] All animations re-enabled", NOTIFY_GENERIC, 3)
-    end)
-    clearBtn:Dock(LEFT) clearBtn:SetWide(110) clearBtn:DockMargin(0,2,0,2)
-
-    Separator(parent)
-    SectionLabel(parent, "  Weapons with animations disabled:")
-
-    listScroll = vgui.Create("DScrollPanel", parent)
-    listScroll:Dock(FILL) listScroll:DockMargin(4,2,4,4)
-    listScroll.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, Color(18,18,18,180)) end
-
-    function RebuildAnimList(scroll)
-        scroll:Clear()
-        local sorted = {}
-        for class in SortedPairs(animDisabled) do
-            if animDisabled[class] then sorted[#sorted+1] = class end
-        end
-        if #sorted == 0 then
-            local lbl = vgui.Create("DLabel", scroll)
-            lbl:Dock(TOP) lbl:SetTall(28) lbl:DockMargin(0,6,0,0)
-            lbl:SetFont("DermaDefault") lbl:SetTextColor(COL_DIM)
-            lbl:SetText("  No weapons have animations disabled")
-            lbl:SetContentAlignment(4)
-            return
-        end
-        for _, class in ipairs(sorted) do
-            local row = vgui.Create("DPanel", scroll)
-            row:Dock(TOP) row:SetTall(26) row:DockMargin(2,2,2,0)
-            row.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, COL_ROW) end
-
-            local lbl = vgui.Create("DLabel", row)
-            lbl:Dock(FILL) lbl:DockMargin(8,0,0,0)
-            lbl:SetFont("DermaDefault") lbl:SetTextColor(COL_TEXT)
-            lbl:SetText(class) lbl:SetContentAlignment(4)
-
-            local re = StyledButton(row, "Re-enable", Color(50,80,50,220), Color(60,110,60,220), function()
-                animDisabled[class] = nil; AnimSave()
-                local wep = LocalPlayer():GetActiveWeapon()
-                UpdateToggleBtn(IsValid(wep) and wep:GetClass() or "")
-                RebuildAnimList(scroll)
-            end)
-            re:Dock(RIGHT) re:SetWide(80) re:DockMargin(0,3,4,3)
-        end
-    end
-
-    RebuildAnimList(listScroll)
-
-    local lastClass = ""
-    parent.Think = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        local class = IsValid(wep) and wep:GetClass() or "None"
-        if class == lastClass then return end
-        lastClass = class
-        wepLbl:SetText(class)
-        UpdateToggleBtn(class)
-    end
-end
-
 -- ============================================================================
--- TAB 4 – PER-WEAPON WORLD MODELS
+-- PER-WEAPON WORLD MODELS
 -- ============================================================================
 
 local WM_FILE = "vrmod_worldmodel_weapons.json"
+
 g_VR = g_VR or {}
 g_VR.wmWeapons = g_VR.wmWeapons or {}
-g_VR.wmForced  = g_VR.wmForced or {}   -- class -> true: always worldmodel, set by code (e.g. wm_base), not user-toggleable
-g_VR.wmActive = g_VR.wmActive or false
+g_VR.wmForced  = g_VR.wmForced or {}  -- class -> true: always worldmodel, set by code (e.g. wm_base), not user-toggleable
+g_VR.wmActive  = g_VR.wmActive or false
 
 local function WMLoad()
     local raw = file.Read(WM_FILE, "DATA")
-    if raw then
-        for class, v in pairs(util.JSONToTable(raw) or {}) do
-            if v then g_VR.wmWeapons[class] = true end
-        end
+    if not raw then return end
+    for class, v in pairs(util.JSONToTable(raw) or EMPTY) do
+        if v then g_VR.wmWeapons[class] = true end
     end
 end
 local function WMSave() file.Write(WM_FILE, util.TableToJSON(g_VR.wmWeapons, true)) end
 WMLoad()
 
--- Immediately apply WM/VM switch for the current weapon without waiting
--- for a weapon-switch net message.  Switching TO viewmodel mode may leave
--- finger angles zeroed until the next full weapon swap.
+-- Apply the WM/VM switch for the current weapon immediately instead of waiting
+-- for a weapon-switch net message. Switching TO viewmodel mode may leave finger
+-- angles zeroed until the next full weapon swap.
 local function WMApplyNow()
-    if not g_VR or not g_VR.active then return end
+    if not g_VR.active then return end
     local ply = LocalPlayer()
     local wep = ply:GetActiveWeapon()
     if not IsValid(wep) then return end
-    local class = wep:GetClass()
-    if g_VR.wmWeapons[class] or g_VR.wmForced[class] or wep.IsWMBase then
+
+    if g_VR.wmWeapons[wep:GetClass()] or g_VR.wmForced[wep:GetClass()] or wep.IsWMBase then
         g_VR.wmActive = true
         wep:SetNoDraw(false) -- see sh_network: nothing else un-hides it
-        g_VR.viewModel = wep
+        g_VR.viewModel  = wep
         g_VR.currentvmi = nil
         if g_VR.zeroHandAngles then
             vrmod.SetRightHandOpenFingerAngles(g_VR.zeroHandAngles)
@@ -1204,130 +525,31 @@ end
 function g_VR.ForceWorldModel(class, force)
     if not class then return end
     g_VR.wmForced[class] = (force ~= false) or nil
-    local ply = LocalPlayer()
-    local wep = IsValid(ply) and ply:GetActiveWeapon()
-    if IsValid(wep) and wep:GetClass() == class then WMApplyNow() end
+    if ActiveClass() == class then WMApplyNow() end
 end
 
 hook.Add("VRMod_Exit", "vrmod_wm_exit", function(ply)
-    if ply ~= LocalPlayer() then return end
-    g_VR.wmActive = false
+    if ply == LocalPlayer() then g_VR.wmActive = false end
 end)
 
 -- Re-resolve the worldmodel weapon whenever g_VR.viewModel has gone stale.
--- A drop followed by an instant regrab Remove()s the world entity and hands
--- back a fresh weapon without the server ever emitting a switchweapon -- from
--- its point of view the active class never changed -- so g_VR.viewModel is left
+-- A drop followed by an instant regrab Remove()s the world entity and hands back
+-- a fresh weapon without the server ever emitting a switchweapon -- from its
+-- point of view the active class never changed -- so g_VR.viewModel is left
 -- pointing at a dead entity and nothing draws or muzzles. One native per frame
 -- on the steady path, and the identity compare exits before any table lookup.
 hook.Add("VRMod_Tracking", "vrmod_wm_revalidate", function()
     if not g_VR.wmActive then return end
     local wep = LocalPlayer():GetActiveWeapon()
     if g_VR.viewModel == wep or not IsValid(wep) then return end
-    local class = wep:GetClass()
-    if g_VR.wmWeapons[class] or g_VR.wmForced[class] or wep.IsWMBase then
+    if g_VR.wmWeapons[wep:GetClass()] or g_VR.wmForced[wep:GetClass()] or wep.IsWMBase then
         wep:SetNoDraw(false)
         g_VR.viewModel = wep
     end
 end)
 
-local function BuildWorldModelPanel(parent)
-    local wepLbl = WeaponBanner(parent)
-
-    SectionLabel(parent, "  Force world model rendering per weapon (no VR restart needed)")
-
-    local btnRow = vgui.Create("DPanel", parent)
-    btnRow:Dock(TOP) btnRow:SetTall(34) btnRow:DockMargin(4,4,4,4) btnRow.Paint = function() end
-
-    local toggleBtn, listScroll
-
-    local function UpdateToggleBtn(class)
-        if not IsValid(toggleBtn) then return end
-        local on = g_VR.wmWeapons[class]
-        toggleBtn:SetText(on and "  World Model: ON" or "  World Model: OFF")
-        local col    = on and COL_LASER_ON  or COL_LASER_OFF
-        local colHov = on and COL_LASER_HOV or COL_BTN_HOV
-        local hov = false
-        toggleBtn.Paint           = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and colHov or col) end
-        toggleBtn.OnCursorEntered = function() hov = true  end
-        toggleBtn.OnCursorExited  = function() hov = false end
-    end
-
-    local function RebuildWMList(scroll)
-        scroll:Clear()
-        local sorted = {}
-        for class in SortedPairs(g_VR.wmWeapons) do
-            if g_VR.wmWeapons[class] then sorted[#sorted+1] = class end
-        end
-        if #sorted == 0 then
-            local lbl = vgui.Create("DLabel", scroll)
-            lbl:Dock(TOP) lbl:SetTall(28) lbl:DockMargin(0,6,0,0)
-            lbl:SetFont("DermaDefault") lbl:SetTextColor(COL_DIM)
-            lbl:SetText("  No per-weapon world model overrides") lbl:SetContentAlignment(4)
-            return
-        end
-        for _, class in ipairs(sorted) do
-            local row = vgui.Create("DPanel", scroll)
-            row:Dock(TOP) row:SetTall(26) row:DockMargin(2,2,2,0)
-            row.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, COL_ROW) end
-            local lbl = vgui.Create("DLabel", row)
-            lbl:Dock(FILL) lbl:DockMargin(8,0,0,0)
-            lbl:SetFont("DermaDefault") lbl:SetTextColor(COL_TEXT)
-            lbl:SetText(class) lbl:SetContentAlignment(4)
-            local re = StyledButton(row, "Use Viewmodel", Color(50,80,50,220), Color(60,110,60,220), function()
-                g_VR.wmWeapons[class] = nil; WMSave(); WMApplyNow()
-                UpdateToggleBtn(IsValid(LocalPlayer():GetActiveWeapon()) and LocalPlayer():GetActiveWeapon():GetClass() or "")
-                RebuildWMList(scroll)
-            end)
-            re:Dock(RIGHT) re:SetWide(110) re:DockMargin(0,3,4,3)
-        end
-    end
-
-    toggleBtn = vgui.Create("DButton", btnRow)
-    toggleBtn:SetFont("DermaDefaultBold") toggleBtn:SetTextColor(COL_TEXT)
-    toggleBtn:Dock(LEFT) toggleBtn:SetWide(220) toggleBtn:DockMargin(0,2,6,2)
-    toggleBtn.DoClick = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then
-            notification.AddLegacy("[WorldModel] No weapon equipped!", NOTIFY_ERROR, 3) return
-        end
-        local class = wep:GetClass()
-        g_VR.wmWeapons[class] = not g_VR.wmWeapons[class] or nil
-        WMSave(); WMApplyNow()
-        UpdateToggleBtn(class)
-        RebuildWMList(listScroll)
-        notification.AddLegacy("[WorldModel] "..class..": "..(g_VR.wmWeapons[class] and "WORLD MODEL" or "viewmodel"), NOTIFY_GENERIC, 3)
-    end
-
-    local clearBtn = StyledButton(btnRow, "Clear All", COL_RESET, COL_RESET_HOV, function()
-        table.Empty(g_VR.wmWeapons); WMSave(); WMApplyNow()
-        UpdateToggleBtn(IsValid(LocalPlayer():GetActiveWeapon()) and LocalPlayer():GetActiveWeapon():GetClass() or "")
-        RebuildWMList(listScroll)
-        notification.AddLegacy("[WorldModel] All overrides cleared", NOTIFY_GENERIC, 3)
-    end)
-    clearBtn:Dock(LEFT) clearBtn:SetWide(110) clearBtn:DockMargin(0,2,0,2)
-
-    Separator(parent)
-    SectionLabel(parent, "  Weapons using world model:")
-
-    listScroll = vgui.Create("DScrollPanel", parent)
-    listScroll:Dock(FILL) listScroll:DockMargin(4,2,4,4)
-    listScroll.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, Color(18,18,18,180)) end
-    RebuildWMList(listScroll)
-
-    local lastClass = ""
-    parent.Think = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        local class = IsValid(wep) and wep:GetClass() or "None"
-        if class == lastClass then return end
-        lastClass = class
-        wepLbl:SetText(class)
-        UpdateToggleBtn(class)
-    end
-end
-
 -- ============================================================================
--- TAB 5 – ATTACK DISABLER
+-- ATTACK DISABLER
 -- ============================================================================
 
 local ATKBLOCK_FILE = "vrmod_attack_disabled.json"
@@ -1340,192 +562,604 @@ end
 local function AtkSave() file.Write(ATKBLOCK_FILE, util.TableToJSON(atkDisabled)) end
 AtkLoad()
 
--- Strip IN_ATTACK + IN_ATTACK2 for blocked weapons
 hook.Add("CreateMove", "vrmod_weaponfix_atkblock", function(cmd)
-    if not g_VR or not g_VR.active then return end
+    if not next(atkDisabled) or not g_VR.active then return end
     local wep = LocalPlayer():GetActiveWeapon()
     if not IsValid(wep) or not atkDisabled[wep:GetClass()] then return end
-    cmd:SetButtons(bit_band(cmd:GetButtons(), bit_bnot(IN_ATTACK + IN_ATTACK2)))
+    cmd:SetButtons(bit_band(cmd:GetButtons(), ATK_MASK))
 end)
 
-local function BuildAtkBlockPanel(parent)
-    local wepLbl = WeaponBanner(parent)
-    SectionLabel(parent, "  Block built-in attack for melee weapons (VR motion melee still works)")
+-- ============================================================================
+-- PRESETS
+--
+-- A preset is one table holding every per-weapon fix. Exporting writes two
+-- copies into data/vrmod_weaponfix_presets/:
+--   <name>.json      re-importable locally
+--   <name>.lua.txt   drop the ".txt" and put it in your addon's
+--                    lua/vrmod_weaponfix_presets/ folder to publish it
+-- Importing scans the LUA search path, so every subscribed Workshop addon that
+-- ships a preset shows up in the list with no extra wiring.
+-- ============================================================================
 
-    local btnRow = vgui.Create("DPanel", parent)
-    btnRow:Dock(TOP) btnRow:SetTall(34) btnRow:DockMargin(4,4,4,4) btnRow.Paint = function() end
+local PRESET_DIR = "vrmod_weaponfix_presets"
 
-    local toggleBtn, listScroll
+local function KeyList(t)
+    local out, n = {}, 0
+    for k, v in SortedPairs(t) do
+        if v then n = n + 1 out[n] = k end
+    end
+    return out
+end
 
-    local function UpdateToggleBtn(class)
-        if not IsValid(toggleBtn) then return end
-        local off = atkDisabled[class]
-        toggleBtn:SetText(off and "  Attack: BLOCKED" or "  Attack: Enabled")
-        local col    = off and COL_RESET     or Color(40,80,40,220)
-        local colHov = off and COL_RESET_HOV or Color(50,110,50,220)
-        local hov = false
-        toggleBtn.Paint           = function(_, w, h) draw.RoundedBox(5, 0, 0, w, h, hov and colHov or col) end
-        toggleBtn.OnCursorEntered = function() hov = true  end
-        toggleBtn.OnCursorExited  = function() hov = false end
+local function PresetCollect(name)
+    return {
+        name     = name,
+        author   = LocalPlayer():Nick(),
+        muzzle   = muzzleSaved,
+        muzzlewm = wmMuzzleSaved,
+        grip     = GripPack(gripSaved),
+        gripleft = GripPack(gripSavedLH),
+        anim     = KeyList(animDisabled),
+        wm       = KeyList(g_VR.wmWeapons),
+        atk      = KeyList(atkDisabled),
+    }
+end
+
+local function PresetCount(p)
+    return table_Count(p.muzzle or EMPTY) + table_Count(p.muzzlewm or EMPTY)
+         + table_Count(p.grip or EMPTY)   + table_Count(p.gripleft or EMPTY)
+         + #(p.anim or EMPTY) + #(p.wm or EMPTY) + #(p.atk or EMPTY)
+end
+
+local function PresetApply(p, overwrite)
+    if not istable(p) then return 0 end
+    local n = 0
+
+    for _, pair in ipairs({ { p.muzzle, muzzleSaved }, { p.muzzlewm, wmMuzzleSaved } }) do
+        local dst = pair[2]
+        for class, off in pairs(pair[1] or EMPTY) do
+            if overwrite or not dst[class] then
+                dst[class] = { p = off.p or 0, y = off.y or 0, r = off.r or 0 }
+                n = n + 1
+            end
+        end
     end
 
-    local function RebuildAtkList(scroll)
-        scroll:Clear()
-        local sorted = {}
-        for class in SortedPairs(atkDisabled) do
-            if atkDisabled[class] then sorted[#sorted+1] = class end
+    n = n + GripUnpack(p.grip, gripSaved, overwrite)
+          + GripUnpack(p.gripleft, gripSavedLH, overwrite)
+
+    for _, pair in ipairs({ { p.anim, animDisabled }, { p.wm, g_VR.wmWeapons }, { p.atk, atkDisabled } }) do
+        local dst = pair[2]
+        for _, class in ipairs(pair[1] or EMPTY) do
+            if not dst[class] then dst[class] = true n = n + 1 end
         end
-        if #sorted == 0 then
-            local lbl = vgui.Create("DLabel", scroll)
-            lbl:Dock(TOP) lbl:SetTall(28) lbl:DockMargin(0,6,0,0)
-            lbl:SetFont("DermaDefault") lbl:SetTextColor(COL_DIM)
-            lbl:SetText("  No weapons have attacks blocked") lbl:SetContentAlignment(4)
+    end
+
+    MuzzleSave() GripSaveFile() AnimSave() WMSave() AtkSave()
+    WMApplyNow()
+    lastGripClass = "" -- forces the held weapon's grip offset to re-apply
+
+    return n
+end
+
+local function PresetList()
+    local out, n = {}, 0
+
+    for _, f in ipairs(file.Find(PRESET_DIR .. "/*.lua", "LUA")) do
+        local ok, t = pcall(include, PRESET_DIR .. "/" .. f)
+        if ok and istable(t) then
+            n = n + 1
+            out[n] = { file = f, source = "Addon", data = t }
+        end
+    end
+
+    for _, f in ipairs(file.Find(PRESET_DIR .. "/*.json", "DATA")) do
+        local t = util.JSONToTable(file.Read(PRESET_DIR .. "/" .. f, "DATA") or "")
+        if istable(t) then
+            n = n + 1
+            out[n] = { file = f, source = "Local", data = t }
+        end
+    end
+
+    return out
+end
+
+local function PresetExport(name)
+    name = string.lower(string.gsub(name or "", "[^%w_%-]", "_"))
+    if name == "" then name = "preset" end
+
+    file.CreateDir(PRESET_DIR)
+    local json = util.TableToJSON(PresetCollect(name), true)
+
+    -- file.Write refuses a .lua extension, so the shareable copy lands as
+    -- .lua.txt and the user drops the ".txt".
+    file.Write(PRESET_DIR .. "/" .. name .. ".json", json)
+    file.Write(PRESET_DIR .. "/" .. name .. ".lua.txt", "return util.JSONToTable([==[\n" .. json .. "\n]==])\n")
+
+    return name
+end
+
+-- ============================================================================
+-- PANEL: MUZZLE ANGLES
+-- ============================================================================
+
+local function BuildMuzzlePanel(root)
+    local form = MakeForm(root, "Muzzle Angles")
+
+    local wepLbl  = form:Help("Weapon: none")
+    local modeLbl = form:Help("Editing: viewmodel offsets")
+
+    local isWM = false
+    local liveP, liveY, liveR = 0, 0, 0
+
+    local function SyncPreview()
+        local off = { p = liveP, y = liveY, r = liveR }
+        if isWM then wmMuzzlePreview, muzzlePreview = off, nil
+        else muzzlePreview, wmMuzzlePreview = off, nil end
+    end
+
+    -- Laser --------------------------------------------------------------
+    local laserChk = MakeCheck(form, "Show muzzle laser", function(v)
+        local class = ActiveClass()
+        if not class then Msg("[MuzzleFix] No weapon equipped.", true) return end
+        laserEnabled[class] = v or nil
+        MuzzleSave()
+    end)
+    form:ControlHelp("Draws a beam down the muzzle so you can see the correction live.")
+
+    local matBox = form:ComboBox("Laser material")
+    for _, path in ipairs(LASER_MATERIALS) do matBox:AddChoice(path, path) end
+    matBox.OnSelect = function(_, _, _, data)
+        local class = ActiveClass() if not class then return end
+        laserMaterials[class] = data
+        MuzzleSave()
+    end
+
+    local colBtn = form:Button("Laser Colour...")
+    colBtn.DoClick = function()
+        local class = ActiveClass()
+        if not class then Msg("[MuzzleFix] Equip a weapon first.", true) return end
+
+        local existing = laserColors[class] or DEFAULT_LASER
+        local pf = vgui_Create("DFrame")
+        pf:SetSize(260, 260)
+        pf:SetTitle("Laser Colour - " .. class)
+        pf:Center()
+        pf:MakePopup()
+
+        local mixer = vgui_Create("DColorMixer", pf)
+        mixer:Dock(FILL)
+        mixer:DockMargin(6, 6, 6, 6)
+        mixer:SetAlphaBar(false)
+        mixer:SetColor(Color(existing.r, existing.g, existing.b))
+
+        local apply = vgui_Create("DButton", pf)
+        apply:SetText("Apply")
+        apply:Dock(BOTTOM)
+        apply:DockMargin(6, 0, 6, 6)
+        apply.DoClick = function()
+            local c = mixer:GetColor()
+            laserColors[class] = { r = c.r, g = c.g, b = c.b }
+            MuzzleSave()
+            pf:Close()
+        end
+    end
+
+    -- Angles -------------------------------------------------------------
+    local pitch = form:NumSlider("Pitch", nil, -180, 180, 1)
+    local yaw   = form:NumSlider("Yaw", nil, -180, 180, 1)
+    local roll  = form:NumSlider("Roll", nil, -180, 180, 1)
+    form:ControlHelp("Drag, or type an exact value. Applied live - press Save to keep it.")
+
+    pitch.OnValueChanged = function(_, v) liveP = math_Round(v, 1) SyncPreview() end
+    yaw.OnValueChanged   = function(_, v) liveY = math_Round(v, 1) SyncPreview() end
+    roll.OnValueChanged  = function(_, v) liveR = math_Round(v, 1) SyncPreview() end
+
+    local list
+    local function LoadInto(p, y, r)
+        pitch:SetValue(p) yaw:SetValue(y) roll:SetValue(r)
+    end
+
+    local function Rebuild()
+        list:Clear()
+        for _, set in ipairs({ { muzzleSaved, "Viewmodel" }, { wmMuzzleSaved, "World model" } }) do
+            for class, off in SortedPairs(set[1]) do
+                local ln = list:AddLine(class, set[2],
+                    string_format("%.1f / %.1f / %.1f", off.p or 0, off.y or 0, off.r or 0))
+                ln.class, ln.tbl = class, set[1]
+            end
+        end
+    end
+
+    local saveBtn = form:Button("Save For This Weapon")
+    saveBtn.DoClick = function()
+        local class = ActiveClass()
+        if not class then Msg("[MuzzleFix] No weapon equipped.", true) return end
+        local tbl = isWM and wmMuzzleSaved or muzzleSaved
+        tbl[class] = { p = liveP, y = liveY, r = liveR }
+        MuzzleSave()
+        muzzlePreview, wmMuzzlePreview = nil, nil
+        Rebuild()
+        Msg("[MuzzleFix] Saved " .. (isWM and "world model" or "viewmodel") .. " offset for " .. class)
+    end
+
+    local resetBtn = form:Button("Reset This Weapon")
+    resetBtn.DoClick = function()
+        local class = ActiveClass() if not class then return end
+        local tbl = isWM and wmMuzzleSaved or muzzleSaved
+        tbl[class] = nil
+        MuzzleSave()
+        LoadInto(0, 0, 0)
+        Rebuild()
+        Msg("[MuzzleFix] Reset " .. class)
+    end
+
+    local zeroBtn = form:Button("Zero Sliders")
+    zeroBtn.DoClick = function() LoadInto(0, 0, 0) end
+
+    -- Saved list ---------------------------------------------------------
+    local listForm = MakeForm(root, "Saved Muzzle Offsets")
+    list = MakeList(listForm, 150, "Weapon", "Mode", "Pitch / Yaw / Roll")
+    list.OnRowSelected = function(_, _, ln)
+        local off = ln.tbl[ln.class] or EMPTY
+        LoadInto(off.p or 0, off.y or 0, off.r or 0)
+    end
+
+    local delBtn = listForm:Button("Delete Selected")
+    delBtn.DoClick = function()
+        local _, ln = list:GetSelectedLine() if not ln then return end
+        ln.tbl[ln.class] = nil
+        MuzzleSave()
+        Rebuild()
+    end
+    Rebuild()
+
+    Watch(root, function(class, wm)
+        isWM = wm
+        wepLbl:SetText("Weapon: " .. class)
+        modeLbl:SetText(wm and "Editing: world model offsets" or "Editing: viewmodel offsets")
+        laserChk:SetQuiet(laserEnabled[class])
+        matBox:SetValue(laserMaterials[class] or DEFAULT_LASER_MAT)
+        local off = (wm and wmMuzzleSaved or muzzleSaved)[class] or EMPTY
+        LoadInto(off.p or 0, off.y or 0, off.r or 0)
+    end, function()
+        muzzlePreview, wmMuzzlePreview = nil, nil
+    end)
+end
+
+-- ============================================================================
+-- PANEL: GRIP POSITION
+-- ============================================================================
+
+local function BuildGripPanel(root)
+    local form = MakeForm(root, "Grip Position")
+
+    local wepLbl    = form:Help("Weapon: none")
+    local statusLbl = form:Help("Ready.")
+
+    gripListeners[root] = function(msg)
+        if not IsValid(statusLbl) then return end
+        statusLbl:SetText(gripUnsaved and (msg .. "  (unsaved)") or msg)
+    end
+
+    form:Help("1. Press Start Reposition\n2. The gun freezes in world space\n" ..
+              "3. Move your weapon hand to where the gun is\n4. Grab with the weapon-hand grip\n" ..
+              "5. The gun snaps to your new grip point")
+
+    local startBtn = form:Button("Start Reposition")
+    startBtn.DoClick = GripStart
+
+    local cancelBtn = form:Button("Cancel Reposition")
+    cancelBtn.DoClick = GripCancel
+
+    local saveBtn = form:Button("Save For This Weapon")
+    local resetBtn = form:Button("Reset This Weapon")
+
+    -- Foregrip addon options ---------------------------------------------
+    local fgChk
+    if vrmod_foregrip then
+        local fgForm = MakeForm(root, "Foregrip")
+
+        if vrmod_foregrip.SetVisualOnly then
+            fgChk = MakeCheck(fgForm, "Visual only (pin hand without rotating weapon)", function(v)
+                local class = ActiveClass() if not class then return end
+                vrmod_foregrip.SetVisualOnly(class, v)
+            end)
+        end
+
+        fgForm:CheckBox("Spherical grab zone", "vrmod_foregrip_sphere")
+        fgForm:ControlHelp("Off = directional box, on = radial sphere.")
+        fgForm:NumSlider("Grab zone scale", "vrmod_foregrip_scale", 0.25, 4, 2)
+        fgForm:CheckBox("Show grab zone", "vrmod_foregrip_debug")
+        fgForm:ControlHelp("Draws the live zone: green = a grab would latch, blue = gripping, grey = out of reach. The orange cube marks the hand foregrip thinks holds the gun.")
+    end
+
+    -- Saved lists ---------------------------------------------------------
+    local listForm = MakeForm(root, "Saved Grip Offsets")
+    local list = MakeList(listForm, 150, "Weapon", "Hand", "X / Y / Z")
+
+    local function Rebuild()
+        list:Clear()
+        for _, set in ipairs({ { gripSaved, "Right" }, { gripSavedLH, "Left" } }) do
+            for class, e in SortedPairs(set[1]) do
+                local ln = list:AddLine(class, set[2],
+                    string_format("%.1f / %.1f / %.1f", e.pos.x, e.pos.y, e.pos.z))
+                ln.class, ln.tbl, ln.left = class, set[1], set[1] == gripSavedLH
+            end
+        end
+    end
+
+    list.OnRowSelected = function(_, _, ln)
+        local e = ln.tbl[ln.class] if not e then return end
+        if ln.left then
+            vrmod_gripfix.lhLive = { pos = Vector(e.pos), ang = Angle(e.ang) }
+            GripStatus("Loaded left-hand offset for " .. ln.class)
             return
         end
-        for _, class in ipairs(sorted) do
-            local row = vgui.Create("DPanel", scroll)
-            row:Dock(TOP) row:SetTall(26) row:DockMargin(2,2,2,0)
-            row.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, COL_ROW) end
-            local lbl = vgui.Create("DLabel", row)
-            lbl:Dock(FILL) lbl:DockMargin(8,0,0,0)
-            lbl:SetFont("DermaDefault") lbl:SetTextColor(COL_TEXT)
-            lbl:SetText(class) lbl:SetContentAlignment(4)
-            local re = StyledButton(row, "Unblock", Color(50,80,50,220), Color(60,110,60,220), function()
-                atkDisabled[class] = nil; AtkSave()
-                local wep = LocalPlayer():GetActiveWeapon()
-                UpdateToggleBtn(IsValid(wep) and wep:GetClass() or "")
-                RebuildAtkList(scroll)
-            end)
-            re:Dock(RIGHT) re:SetWide(80) re:DockMargin(0,3,4,3)
+        gripCurrent.pos, gripCurrent.ang = Vector(e.pos), Angle(e.ang)
+        local vmi = GetVMI()
+        if vmi then vmi.offsetPos, vmi.offsetAng = Vector(e.pos), Angle(e.ang) end
+        GripStatus("Loaded " .. ln.class)
+    end
+
+    local delBtn = listForm:Button("Delete Selected")
+    delBtn.DoClick = function()
+        local _, ln = list:GetSelectedLine() if not ln then return end
+        ln.tbl[ln.class] = nil
+        GripSaveFile()
+        Rebuild()
+    end
+    Rebuild()
+
+    saveBtn.DoClick  = function() if GripSaveCurrent() then Rebuild() Msg("[GripOffset] Saved.") end end
+    resetBtn.DoClick = function() GripReset() Rebuild() Msg("[GripOffset] Reset.") end
+
+    Watch(root, function(class)
+        wepLbl:SetText("Weapon: " .. class)
+        if fgChk then
+            local vo = vrmod_foregrip.visualOnly
+            fgChk:SetQuiet(vo and vo[class])
+        end
+    end, function()
+        gripListeners[root] = nil
+        if gripRepos then GripCancel() end
+    end)
+end
+
+-- ============================================================================
+-- PANELS: simple per-class toggle lists (animations / world models / attacks)
+-- ============================================================================
+
+-- One builder covers three tabs that only differ in wording and storage.
+local function BuildTogglePanel(root, cfg)
+    local form = MakeForm(root, cfg.title)
+    local wepLbl = form:Help("Weapon: none")
+    form:ControlHelp(cfg.help)
+
+    local list
+    local function Rebuild()
+        list:Clear()
+        for class in SortedPairs(cfg.tbl) do
+            if cfg.tbl[class] then list:AddLine(class) end
         end
     end
 
-    toggleBtn = vgui.Create("DButton", btnRow)
-    toggleBtn:SetFont("DermaDefaultBold") toggleBtn:SetTextColor(COL_TEXT)
-    toggleBtn:Dock(LEFT) toggleBtn:SetWide(220) toggleBtn:DockMargin(0,2,6,2)
-    toggleBtn.DoClick = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        if not IsValid(wep) then notification.AddLegacy("[AtkBlock] No weapon equipped!", NOTIFY_ERROR, 3) return end
-        local class = wep:GetClass()
-        atkDisabled[class] = not atkDisabled[class] or nil
-        AtkSave(); UpdateToggleBtn(class); RebuildAtkList(listScroll)
+    local chk = MakeCheck(form, cfg.label, function(v)
+        local class = ActiveClass()
+        if not class then Msg("[WeaponFix] No weapon equipped.", true) return end
+        cfg.tbl[class] = v or nil
+        cfg.save()
+        if cfg.onChange then cfg.onChange() end
+        Rebuild()
+    end)
+
+    local clearBtn = form:Button(cfg.clear)
+    clearBtn.DoClick = function()
+        table.Empty(cfg.tbl)
+        cfg.save()
+        if cfg.onChange then cfg.onChange() end
+        chk:SetQuiet(false)
+        Rebuild()
+        Msg("[WeaponFix] " .. cfg.clear .. " done.")
     end
 
-    local clearBtn = StyledButton(btnRow, "Unblock All", COL_RESET, COL_RESET_HOV, function()
-        atkDisabled = {}; AtkSave()
-        local wep = LocalPlayer():GetActiveWeapon()
-        UpdateToggleBtn(IsValid(wep) and wep:GetClass() or "")
-        RebuildAtkList(listScroll)
-        notification.AddLegacy("[AtkBlock] All attacks unblocked", NOTIFY_GENERIC, 3)
+    local listForm = MakeForm(root, cfg.listTitle)
+    list = MakeList(listForm, 170, "Weapon")
+
+    local delBtn = listForm:Button("Remove Selected")
+    delBtn.DoClick = function()
+        local _, ln = list:GetSelectedLine() if not ln then return end
+        cfg.tbl[ln:GetColumnText(1)] = nil
+        cfg.save()
+        if cfg.onChange then cfg.onChange() end
+        chk:SetQuiet(cfg.tbl[ActiveClass() or ""])
+        Rebuild()
+    end
+    Rebuild()
+
+    Watch(root, function(class)
+        wepLbl:SetText("Weapon: " .. class)
+        chk:SetQuiet(cfg.tbl[class])
     end)
-    clearBtn:Dock(LEFT) clearBtn:SetWide(110) clearBtn:DockMargin(0,2,0,2)
+end
 
-    Separator(parent)
-    SectionLabel(parent, "  Weapons with attacks blocked:")
+local function BuildAnimPanel(root)
+    BuildTogglePanel(root, {
+        title     = "Animations",
+        help      = "Freezes the viewmodel animation for weapons whose anims fight the VR pose.",
+        label     = "Disable animations for this weapon",
+        clear     = "Re-enable All",
+        listTitle = "Animations Disabled",
+        tbl       = animDisabled,
+        save      = AnimSave,
+    })
+end
 
-    listScroll = vgui.Create("DScrollPanel", parent)
-    listScroll:Dock(FILL) listScroll:DockMargin(4,2,4,4)
-    listScroll.Paint = function(_, w, h) draw.RoundedBox(4, 0, 0, w, h, Color(18,18,18,180)) end
-    RebuildAtkList(listScroll)
+local function BuildWorldModelPanel(root)
+    BuildTogglePanel(root, {
+        title     = "World Models",
+        help      = "Renders the weapon's world model instead of its viewmodel. Applies instantly, no VR restart.",
+        label     = "Force world model for this weapon",
+        clear     = "Clear All Overrides",
+        listTitle = "Using World Model",
+        tbl       = g_VR.wmWeapons,
+        save      = WMSave,
+        onChange  = WMApplyNow,
+    })
+end
 
-    local lastClass = ""
-    parent.Think = function()
-        local wep = LocalPlayer():GetActiveWeapon()
-        local class = IsValid(wep) and wep:GetClass() or "None"
-        if class == lastClass then return end
-        lastClass = class
-        wepLbl:SetText(class)
-        UpdateToggleBtn(class)
+local function BuildAtkBlockPanel(root)
+    BuildTogglePanel(root, {
+        title     = "Attack Block",
+        help      = "Strips IN_ATTACK and IN_ATTACK2 so motion melee is the only way to swing.",
+        label     = "Block built-in attack for this weapon",
+        clear     = "Unblock All",
+        listTitle = "Attacks Blocked",
+        tbl       = atkDisabled,
+        save      = AtkSave,
+    })
+end
+
+-- ============================================================================
+-- PANEL: PRESETS
+-- ============================================================================
+
+local function BuildPresetPanel(root)
+    local inForm = MakeForm(root, "Import")
+    inForm:ControlHelp("Presets found in your data folder and in any subscribed addon that ships one.")
+
+    local list = MakeList(inForm, 150, "Preset", "Author", "Source", "Weapons")
+    local found = {}
+
+    local function Refresh()
+        list:Clear()
+        found = PresetList()
+        for i, p in ipairs(found) do
+            list:AddLine(p.data.name or p.file, p.data.author or "?", p.source, tostring(PresetCount(p.data))).idx = i
+        end
+    end
+
+    local overwrite = false
+    local owChk = inForm:CheckBox("Overwrite my existing entries")
+    owChk.OnChange = function(_, v) overwrite = v end
+    inForm:ControlHelp("Off: the preset only fills in weapons you have not configured yourself.")
+
+    local applyBtn = inForm:Button("Apply Selected Preset")
+    applyBtn.DoClick = function()
+        local _, ln = list:GetSelectedLine()
+        if not ln then Msg("[WeaponFix] Select a preset first.", true) return end
+        local n = PresetApply(found[ln.idx].data, overwrite)
+        Msg("[WeaponFix] Applied " .. n .. " weapon fixes.")
+    end
+
+    local refreshBtn = inForm:Button("Rescan For Presets")
+    refreshBtn.DoClick = Refresh
+
+    local delBtn = inForm:Button("Delete Selected (local only)")
+    delBtn.DoClick = function()
+        local _, ln = list:GetSelectedLine() if not ln then return end
+        local p = found[ln.idx]
+        if p.source ~= "Local" then Msg("[WeaponFix] Addon presets must be unsubscribed, not deleted.", true) return end
+        file.Delete(PRESET_DIR .. "/" .. p.file)
+        Refresh()
+    end
+    Refresh()
+
+    local outForm = MakeForm(root, "Export")
+    outForm:ControlHelp("Writes every muzzle, grip, animation, world model and attack-block fix you have set.")
+
+    local nameEntry = outForm:TextEntry("Preset name")
+    nameEntry:SetValue("my_fixes")
+
+    local expBtn = outForm:Button("Export Preset")
+    local expHelp = outForm:Help(" ")
+    expBtn.DoClick = function()
+        local name = PresetExport(nameEntry:GetValue())
+        Refresh()
+        expHelp:SetText(string_format(
+            "Written to garrysmod/data/%s/\n\n" ..
+            "To share on the Workshop:\n" ..
+            "1. Rename %s.lua.txt to %s.lua\n" ..
+            "2. Put it in <youraddon>/lua/%s/\n" ..
+            "3. Publish the addon as normal\n\n" ..
+            "Anyone subscribed sees it in this list automatically.",
+            PRESET_DIR, name, name, PRESET_DIR))
+        Msg("[WeaponFix] Exported preset '" .. name .. "'.")
     end
 end
 
 -- ============================================================================
--- Tabbed popup
+-- Frame
 -- ============================================================================
 
-local mainFrame = nil
+local TABS = {
+    { "Muzzle Angles", BuildMuzzlePanel,     "icon16/bullet_go.png" },
+    { "Grip Position", BuildGripPanel,       "icon16/wrench.png" },
+    { "Animations",    BuildAnimPanel,       "icon16/film.png" },
+    { "World Models",  BuildWorldModelPanel, "icon16/box.png" },
+    { "Attack Block",  BuildAtkBlockPanel,   "icon16/cancel.png" },
+    { "Presets",       BuildPresetPanel,     "icon16/package.png" },
+}
+
+local mainFrame
 
 local function OpenWeaponFixMenu()
-    if IsValid(mainFrame) then mainFrame:MakePopup() mainFrame:Center() return end
+    if IsValid(mainFrame) then mainFrame:Center() mainFrame:MakePopup() return end
 
-    local frame = vgui.Create("DFrame")
-    frame:SetSize(500, 580)
-    frame:SetTitle("VRMod – Weapon Fix")
-    frame:MakePopup() frame:Center()
-    frame.Paint = function(_, w, h)
-        draw.RoundedBox(6, 0, 0, w, h, COL_BG)
-        draw.RoundedBox(6, 0, 0, w, 24, COL_HEADER)
-    end
+    local frame = vgui_Create("DFrame")
+    frame:SetSize(540, 620)
+    frame:SetTitle("VRMod - Weapon Fixer")
+    frame:SetSizable(true)
+    frame:SetMinimumSize(460, 400)
+    frame:SetDeleteOnClose(true)
+    frame:Center()
+    frame:MakePopup()
     mainFrame = frame
-    frame.OnRemove = function()
-        mainFrame = nil
-        muzzlePreview = nil
-        if gripRepos then GripCancel() end
-    end
 
-    local sheet = vgui.Create("DPropertySheet", frame)
-    sheet:Dock(FILL) sheet:DockMargin(4, 26, 4, 4)
-    sheet.Paint = function() end
+    local sheet = vgui_Create("DPropertySheet", frame)
+    sheet:Dock(FILL)
 
-    for _, info in ipairs({
-        {"Muzzle Angles", BuildMuzzlePanel},
-        {"Grip Position", BuildGripPanel},
-        {"Animations",    BuildAnimPanel},
-        {"World Models",  BuildWorldModelPanel},
-        {"Attack Block",  BuildAtkBlockPanel},
-    }) do
-        local p = vgui.Create("DPanel", sheet)
-        p:Dock(FILL)
-        p.Paint = function(_, w, h) draw.RoundedBox(0, 0, 0, w, h, COL_PANEL) end
-        info[2](p)
-        sheet:AddSheet(info[1], p)
+    for _, tab in ipairs(TABS) do
+        local scroll = vgui_Create("DScrollPanel", sheet)
+        tab[2](scroll)
+        sheet:AddSheet(tab[1], scroll, tab[3])
     end
 end
 
-concommand.Add("vrmod_weaponfix_menu", OpenWeaponFixMenu, nil, "Open VRMod Weapon Fix menu")
-concommand.Add("vrmod_muzzlefix_menu", OpenWeaponFixMenu, nil, "Alias")
+concommand.Add("vrmod_weaponfix_menu", OpenWeaponFixMenu, nil, "Open the VRMod Weapon Fixer")
+concommand.Add("vrmod_muzzlefix_menu", OpenWeaponFixMenu, nil, "Alias for vrmod_weaponfix_menu")
 
 -- ============================================================================
--- VRMod Menu tab integration
+-- Menu integration
 -- ============================================================================
 
 hook.Add("VRMod_Menu", "vrmod_weaponfix_hook", function(frame)
-    if IsValid(frame.DPropertySheet) then
-        for _, info in ipairs({
-            {"Muzzle Fix",    BuildMuzzlePanel},
-            {"Grip Offset",   BuildGripPanel},
-            {"Animations",    BuildAnimPanel},
-            {"World Models",  BuildWorldModelPanel},
-            {"Attack Block",  BuildAtkBlockPanel},
-        }) do
-            local p = vgui.Create("DPanel", frame.DPropertySheet)
-            p:Dock(FILL)
-            p.Paint = function(_, w, h) draw.RoundedBox(0, 0, 0, w, h, COL_PANEL) end
-            info[2](p)
-            frame.DPropertySheet:AddSheet(info[1], p)
-        end
+    local sheet = frame.DPropertySheet
+    if IsValid(sheet) then
+        local panel = vgui_Create("DPanel", sheet)
+        local btn = vgui_Create("DButton", panel)
+        btn:SetText("Open Weapon Fixer")
+        btn:Dock(TOP)
+        btn:DockMargin(8, 8, 8, 0)
+        btn:SetTall(32)
+        btn.DoClick = OpenWeaponFixMenu
+        sheet:AddSheet("Weapon Fixer", panel, "icon16/wrench.png")
         return
     end
+
     local form = frame.SettingsForm
     if not IsValid(form) then return end
-    form:ControlHelp("=== Weapon Fix ===")
-    local btn = form:Button("Open Weapon Fix Menu")
-    btn.DoClick = function() RunConsoleCommand("vrmod_weaponfix_menu") end
+    form:ControlHelp("=== Weapon Fixer ===")
+    form:Button("Open Weapon Fixer").DoClick = OpenWeaponFixMenu
 end)
-
--- ============================================================================
--- VRMod quick-menu button
--- ============================================================================
 
 local menuItemRegistered = false
 
 local function TryRegisterMenuItem()
     if menuItemRegistered then return true end
     if not vrmod or not vrmod.AddInGameMenuItem then return false end
-    if not g_VR or not g_VR.active then return false end
-    vrmod.AddInGameMenuItem("Weapon Fix", 5, 4, function()
-        RunConsoleCommand("vrmod_weaponfix_menu")
-    end)
+    if not g_VR.active then return false end
+    vrmod.AddInGameMenuItem("Weapon Fix", 5, 4, OpenWeaponFixMenu)
     menuItemRegistered = true
     return true
 end
@@ -1540,31 +1174,13 @@ timer.Create("vrmod_weaponfix_menuitem_poll", 0.5, 0, function()
     if TryRegisterMenuItem() then timer.Remove("vrmod_weaponfix_menuitem_poll") end
 end)
 
--- ============================================================================
--- Spawn menu fallback
--- ============================================================================
-
 hook.Add("PopulateToolMenu", "vrmod_weaponfix_spawnmenu", function()
     spawnmenu.AddToolCategory("Utilities", "VRMod", "VRMod")
     spawnmenu.AddToolMenuOption("Utilities", "VRMod", "VRMod_WeaponFix", "Weapon Fix", "", "", function(panel)
         panel:ClearControls()
-        panel:Help("VRMod Weapon Fix – muzzle angle correction and grip position offset.")
-        panel:Help(" ")
-        local btn = panel:Button("Open Weapon Fix Menu")
-        btn.DoClick = function() RunConsoleCommand("vrmod_weaponfix_menu") end
-        panel:Help(" ")
-        panel:Help("Current weapon laser:")
-        local laserToggle = panel:Button("Toggle Laser for Current Weapon")
-        laserToggle.DoClick = function()
-            local wep = LocalPlayer():GetActiveWeapon()
-            if not IsValid(wep) then notification.AddLegacy("No weapon equipped!", NOTIFY_ERROR, 3) return end
-            local class = wep:GetClass()
-            laserEnabled[class] = not laserEnabled[class] or nil
-            MuzzleSave()
-            notification.AddLegacy("Laser "..(laserEnabled[class] and "ON" or "OFF").." for "..class, NOTIFY_GENERIC, 3)
-        end
-        panel:Help(" ")
-        panel:Help("Console: vrmod_weaponfix_menu, vrmod_muzzle_list, vrmod_grip_list")
+        panel:Help("VRMod Weapon Fixer - muzzle angles, grip offsets, animations, world models and attack blocking.")
+        panel:Button("Open Weapon Fixer").DoClick = OpenWeaponFixMenu
+        panel:Help("Console: vrmod_weaponfix_menu, vrmod_weaponfix_export, vrmod_weaponfix_presets")
     end)
 end)
 
@@ -1573,51 +1189,81 @@ end)
 -- ============================================================================
 
 concommand.Add("vrmod_muzzle_list", function()
-    print("[WeaponFix] Muzzle offsets (viewmodel):")
-    for c, off in pairs(muzzleSaved) do
-        print(string_format("  %-40s  P:%-6.1f Y:%-6.1f R:%-6.1f", c, off.p or 0, off.y or 0, off.r or 0))
+    for _, set in ipairs({ { muzzleSaved, "viewmodel" }, { wmMuzzleSaved, "world model" } }) do
+        print("[WeaponFix] Muzzle offsets (" .. set[2] .. "):")
+        local any = false
+        for c, off in SortedPairs(set[1]) do
+            print(string_format("  %-40s  P:%-6.1f Y:%-6.1f R:%-6.1f", c, off.p or 0, off.y or 0, off.r or 0))
+            any = true
+        end
+        if not any then print("  (none)") end
     end
-    print("[WeaponFix] Muzzle offsets (world model):")
-    local any = false
-    for c, off in pairs(wmMuzzleSaved) do
-        print(string_format("  %-40s  P:%-6.1f Y:%-6.1f R:%-6.1f", c, off.p or 0, off.y or 0, off.r or 0))
-        any = true
-    end
-    if not any then print("  (none)") end
-end)
-concommand.Add("vrmod_grip_list", function()
-    print("[WeaponFix] Grip offsets:")
-    for c, e in pairs(gripSaved) do
-        print(string_format("  %-40s  pos:%s  ang:%s", c, tostring(e.pos), tostring(e.ang)))
-    end
-end)
-concommand.Add("vrmod_grip_reposition_start",  GripStart)
-concommand.Add("vrmod_grip_reposition_cancel", GripCancel)
-concommand.Add("vrmod_grip_save",              GripSaveCurrent)
-concommand.Add("vrmod_grip_reset",             GripReset)
-concommand.Add("vrmod_muzzle_reset_current", function()
-    local wep = LocalPlayer():GetActiveWeapon()
-    if not IsValid(wep) then print("[WeaponFix] No weapon") return end
-    local class = wep:GetClass()
-    muzzleSaved[class] = nil; wmMuzzleSaved[class] = nil; MuzzleSave()
-    print("[WeaponFix] Muzzle reset (VM+WM) for "..class)
-end)
-concommand.Add("vrmod_wm_list", function()
-    print("[WeaponFix] World model weapons:")
-    local any = false
-    for c in SortedPairs(g_VR.wmWeapons) do
-        if g_VR.wmWeapons[c] then print("  "..c) any = true end
-    end
-    if not any then print("  (none)") end
-end)
-concommand.Add("vrmod_atkblock_list", function()
-    print("[WeaponFix] Attack-blocked weapons:")
-    local any = false
-    for c in SortedPairs(atkDisabled) do
-        if atkDisabled[c] then print("  "..c) any = true end
-    end
-    if not any then print("  (none)") end
 end)
 
--- ============================================================================
+concommand.Add("vrmod_grip_list", function()
+    for _, set in ipairs({ { gripSaved, "right hand" }, { gripSavedLH, "left hand" } }) do
+        print("[WeaponFix] Grip offsets (" .. set[2] .. "):")
+        local any = false
+        for c, e in SortedPairs(set[1]) do
+            print(string_format("  %-40s  pos:%s  ang:%s", c, tostring(e.pos), tostring(e.ang)))
+            any = true
+        end
+        if not any then print("  (none)") end
+    end
+end)
+
+local function PrintSet(label, tbl)
+    print("[WeaponFix] " .. label .. ":")
+    local any = false
+    for c in SortedPairs(tbl) do
+        if tbl[c] then print("  " .. c) any = true end
+    end
+    if not any then print("  (none)") end
+end
+
+concommand.Add("vrmod_wm_list", function() PrintSet("World model weapons", g_VR.wmWeapons) end)
+concommand.Add("vrmod_atkblock_list", function() PrintSet("Attack-blocked weapons", atkDisabled) end)
+concommand.Add("vrmod_anim_list", function() PrintSet("Animation-disabled weapons", animDisabled) end)
+
+concommand.Add("vrmod_grip_reposition_start", GripStart)
+concommand.Add("vrmod_grip_reposition_cancel", GripCancel)
+concommand.Add("vrmod_grip_save", GripSaveCurrent)
+concommand.Add("vrmod_grip_reset", GripReset)
+
+concommand.Add("vrmod_muzzle_reset_current", function()
+    local class = ActiveClass()
+    if not class then print("[WeaponFix] No weapon") return end
+    muzzleSaved[class], wmMuzzleSaved[class] = nil, nil
+    MuzzleSave()
+    print("[WeaponFix] Muzzle reset (VM+WM) for " .. class)
+end)
+
+concommand.Add("vrmod_weaponfix_export", function(_, _, args)
+    local name = PresetExport(args[1])
+    print("[WeaponFix] Exported to data/" .. PRESET_DIR .. "/" .. name .. ".json")
+    print("[WeaponFix] Rename " .. name .. ".lua.txt to " .. name .. ".lua and place it in")
+    print("[WeaponFix]   <youraddon>/lua/" .. PRESET_DIR .. "/  to publish it on the Workshop.")
+end, nil, "Export every weapon fix as a shareable preset")
+
+concommand.Add("vrmod_weaponfix_presets", function()
+    local presets = PresetList()
+    if #presets == 0 then print("[WeaponFix] No presets found.") return end
+    for _, p in ipairs(presets) do
+        print(string_format("  %-30s %-8s %-20s %d weapons",
+            p.file, p.source, p.data.author or "?", PresetCount(p.data)))
+    end
+end, nil, "List every preset found locally and in subscribed addons")
+
+concommand.Add("vrmod_weaponfix_apply", function(_, _, args)
+    local target = args[1]
+    if not target then print("[WeaponFix] Usage: vrmod_weaponfix_apply <file> [1 to overwrite]") return end
+    for _, p in ipairs(PresetList()) do
+        if p.file == target or p.data.name == target then
+            print("[WeaponFix] Applied " .. PresetApply(p.data, args[2] == "1") .. " weapon fixes.")
+            return
+        end
+    end
+    print("[WeaponFix] No preset named '" .. target .. "'.")
+end, nil, "Apply a preset by file or name")
+
 print("[VRMod WeaponFix] Loaded.")

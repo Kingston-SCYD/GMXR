@@ -2,7 +2,7 @@ AddCSLuaFile()
 
 --[[
 	VR Hull Reduction & Head Anti-Clip
-	- Shrinks player collision hull for VR players
+	- Shrinks player collision hull for VR players (optionally for everyone)
 	- Prevents HMD from clipping through walls by correcting g_VR.origin due to the smaller hull
 
 	SetHull/SetHullDuck do NOT replicate. Client prediction runs movement
@@ -10,6 +10,11 @@ AddCSLuaFile()
 	the two disagree every tick on slopes (different TryPlayerMove / StepMove
 	resolutions) and the resulting per-tick corrections show as jitter.
 	The apply/restore path now runs on BOTH realms to keep them in lockstep. (jockstep like jockstrap eheheheheeh)
+
+	Respawn resets hulls engine-side on BOTH realms, so the re-apply listens to
+	the shared player_spawn gameevent rather than the PlayerSpawn hook, which is
+	server-only. With the hook the server kept the small hull after a respawn
+	while the client silently reverted to 16u and predicted against it.
 ]]
 
 local DEF_HALF  = 16 -- GMod default player half-width
@@ -19,51 +24,85 @@ local DEF_MINS      = Vector(-DEF_HALF, -DEF_HALF, 0)
 local DEF_MAXS      = Vector( DEF_HALF,  DEF_HALF, STAND_TOP)
 local DEF_DUCK_MAXS = Vector( DEF_HALF,  DEF_HALF, DUCK_TOP)
 
+-- Scratch vectors: SetHull/SetHullDuck copy into the collision property, so
+-- these can be mutated and reused instead of allocating three per call.
+local SM_MINS = Vector()
+local SM_MAXS = Vector()
+local SM_DUCK = Vector()
+
 local cvHull  = CreateConVar("vrmod_smallhull", "1", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Use reduced collision hull for VR players", 0, 1)
 -- Width scale only (height is left at default). 1 = GMod default (16), 0.625 = the old fixed 10-unit hull, 0.1 = smallest.
 local cvScale = CreateConVar("vrmod_hullscale", "0.625", FCVAR_ARCHIVE + FCVAR_REPLICATED, "VR hull width scale: 1 = GMod default, down to 0.1", 0.1, 1)
+-- Extends the reduced hull to everyone so mixed lobbies traverse identical geometry.
+local cvAll   = CreateConVar("vrmod_smallhull_all", "0", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Apply the reduced hull to non-VR players as well", 0, 1)
 
-local function ApplyHull(ply)
-	if cvHull:GetBool() then
+local function SetHullFor(ply, small)
+	if small then
 		local hw = DEF_HALF * cvScale:GetFloat()
-		ply:SetHull(Vector(-hw, -hw, 0), Vector(hw, hw, STAND_TOP))
-		ply:SetHullDuck(Vector(-hw, -hw, 0), Vector(hw, hw, DUCK_TOP))
+		SM_MINS:SetUnpacked(-hw, -hw, 0)
+		SM_MAXS:SetUnpacked(hw, hw, STAND_TOP)
+		SM_DUCK:SetUnpacked(hw, hw, DUCK_TOP)
+		ply:SetHull(SM_MINS, SM_MAXS)
+		ply:SetHullDuck(SM_MINS, SM_DUCK)
 	else
 		ply:SetHull(DEF_MINS, DEF_MAXS)
 		ply:SetHullDuck(DEF_MINS, DEF_DUCK_MAXS)
 	end
 end
 
-local function RestoreHull(ply)
-	ply:SetHull(DEF_MINS, DEF_MAXS)
-	ply:SetHullDuck(DEF_MINS, DEF_DUCK_MAXS)
-end
-
 -- ply:IsInVR() is not a VRMod method; use the canonical g_VR state per realm.
-local function PlayerInVR(ply)
-	if CLIENT then return ply == LocalPlayer() and g_VR.active == true end
-	return g_VR[ply:SteamID()] ~= nil
+-- Clientside only LocalPlayer matters: SetHull on a remote player's clientside
+-- entity does nothing for prediction, so skip those calls entirely.
+local function ShouldShrink(ply)
+	if not cvHull:GetBool() then return false end
+	if CLIENT then
+		if ply ~= LocalPlayer() then return false end
+		return cvAll:GetBool() or (g_VR and g_VR.active) == true
+	end
+	return cvAll:GetBool() or (g_VR and g_VR[ply:SteamID()]) ~= nil
 end
 
-hook.Add("VRMod_Start", "vrmod_vr_hull", ApplyHull)
-hook.Add("VRMod_Exit",  "vrmod_vr_hull", RestoreHull)
+-- VR entry/exit: the g_VR entry is not necessarily populated/cleared yet when
+-- these fire, so the VR state is passed explicitly rather than read back.
+hook.Add("VRMod_Start", "vrmod_vr_hull", function(ply)
+	if CLIENT and ply ~= LocalPlayer() then return end
+	SetHullFor(ply, cvHull:GetBool())
+end)
 
--- Source resets hulls on respawn; re-apply once the respawn settles.
-hook.Add("PlayerSpawn", "vrmod_vr_hull", function(ply)
-	if not PlayerInVR(ply) then return end
+hook.Add("VRMod_Exit", "vrmod_vr_hull", function(ply)
+	if CLIENT and ply ~= LocalPlayer() then return end
+	SetHullFor(ply, cvHull:GetBool() and cvAll:GetBool())
+end)
+
+-- Source resets hulls on respawn; re-apply once the respawn settles. The
+-- deferral also covers Player(uid) not resolving yet on the spawning client.
+gameevent.Listen("player_spawn")
+hook.Add("player_spawn", "vrmod_vr_hull", function(data)
+	if not cvHull:GetBool() then return end
+	local uid = data.userid
 	timer.Simple(0, function()
-		if IsValid(ply) and PlayerInVR(ply) then ApplyHull(ply) end
+		local ply = Player(uid)
+		if IsValid(ply) and ShouldShrink(ply) then SetHullFor(ply, true) end
 	end)
 end)
 
+-- Runs on both realms: replicated convar updates fire this clientside too, so
+-- toggling mid-game keeps prediction in lockstep. Unconditional SetHullFor
+-- (not gated on ShouldShrink) so turning an option back off also restores.
 local function ReapplyHulls()
+	if CLIENT then
+		local lp = LocalPlayer()
+		if IsValid(lp) then SetHullFor(lp, ShouldShrink(lp)) end
+		return
+	end
 	for _, ply in player.Iterator() do
-		if PlayerInVR(ply) then ApplyHull(ply) end
+		SetHullFor(ply, ShouldShrink(ply))
 	end
 end
 
-cvars.AddChangeCallback("vrmod_smallhull", ReapplyHulls, "vrmod_vr_hull")
-cvars.AddChangeCallback("vrmod_hullscale", ReapplyHulls, "vrmod_vr_hull")
+cvars.AddChangeCallback("vrmod_smallhull",     ReapplyHulls, "vrmod_vr_hull")
+cvars.AddChangeCallback("vrmod_hullscale",     ReapplyHulls, "vrmod_vr_hull")
+cvars.AddChangeCallback("vrmod_smallhull_all", ReapplyHulls, "vrmod_vr_hull")
 
 if CLIENT then
 	local cvAnticlip = CreateClientConVar("vrmod_anticlip", "1", true, false, "Push the VR view out of walls in roomscale", 0, 1)

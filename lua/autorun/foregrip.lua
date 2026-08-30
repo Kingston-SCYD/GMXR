@@ -103,6 +103,35 @@ function vrmod_foregrip.SetVisualOnly(class, enabled)
 	VisualOnlySave()
 end
 
+-- Which hand is holding the gun. VRMod's own flag comes first and ArcVR's is
+-- the fallback: reading ONLY ArcticVR.GunInLeftHand left this stuck on false
+-- whenever ArcVR isn't installed, because sh_lefthand's bridge onto that flag
+-- is itself guarded by `if ArcticVR then`. Every wh/oh pair below inverts when
+-- this is wrong, so a left-handed player was reaching for the gun with the
+-- hand already holding it.
+local function WepLeft()
+	return g_VR.gunInLeftHand or (ArcticVR and ArcticVR.GunInLeftHand) or false
+end
+
+-- One writer for the two-hand flag. vrmod_wmrecoil halves recoil while it is
+-- set; publishing it on our own table too means consumers don't have to depend
+-- on the recoil addon being installed to know we're gripping.
+vrmod_foregrip.gripping = false
+local function SetGripping(state)
+	vrmod_foregrip.gripping = state
+	if vrmod_wmrecoil then vrmod_wmrecoil.gripping = state end
+end
+
+-- Debug capture, filled by the tracking pass and read by the block at the
+-- bottom of this file. Declared up here because ForegripRender PINS the
+-- offhand: after it runs, oh.pos is the grip point rather than the tracked
+-- hand, so anything reading the pose later sees a closed loop that looks
+-- perfectly consistent no matter how wrong the aim is. These hold the raw
+-- values from before the pin. Scratch objects, mutated in place.
+local dbgOn = false
+local dbgValid = false
+local _dbgOff, _dbgWep, _dbgWepAng = Vector(), Vector(), Angle()
+
 local EXCLUDED_CLASSES = {
 	weapon_fists = true,
 	weapon_vrmod_empty = true,
@@ -133,11 +162,21 @@ local function IsValidForegrip(wep)
 end
 
 local function CalcGripOffsets(wepPos, wepAng, offPos, offAng)
-	-- Left-hand weapons skip bone path: VM may not be repositioned yet
-	-- due to PreRender hook ordering. Tracking fallback is always current.
+	-- Left-hand weapons skip the bone path -- which this comment has always
+	-- claimed, but the condition below never actually tested for.
+	--
+	-- sh_lefthand redirects a left-handed gun by rewriting g_VR.viewModelPos
+	-- and viewModelAng. It never moves the viewmodel ENTITY, and core VRMod
+	-- re-parks that entity at the right hand every frame via
+	-- UpdateViewModelPos(rightPos, rightAng). So vm:GetBoneMatrix() returns a
+	-- hand bone sitting at the RIGHT hand -- which, left-handed, is also the
+	-- offhand. Pinning the support hand to that bone anchors it to its own
+	-- motion instead of to the gun, which is why the aim reads correct (it is
+	-- computed from the real hand positions) while the hand still swings
+	-- opposite to the grab. The viewModelPos fallback is where the gun is.
 	gripWM = g_VR.wmActive or false
 	local vm = LocalPlayer():GetViewModel()
-	if not g_VR.wmActive and IsValid(vm) then
+	if not g_VR.wmActive and not WepLeft() and IsValid(vm) then
 		gripBone = vm:LookupBone("ValveBiped.Bip01_R_Hand")
 		if not gripBone or gripBone < 0 then
 			gripBone = vm:LookupBone("weapon_root")
@@ -283,7 +322,7 @@ end
 
 hook.Add("VRMod_Input", "Foregrip", function(action, pressed)
 	if not g_VR.active then return end
-	local wepLeft = ArcticVR and ArcticVR.GunInLeftHand or false
+	local wepLeft = WepLeft()
 	if action ~= (wepLeft and "boolean_right_pickup" or "boolean_left_pickup") then return end
 	local wh = wepLeft and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
 	local oh = wepLeft and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
@@ -311,7 +350,7 @@ hook.Add("VRMod_Tracking", "ForegripTracking", function()
 	if not isGripping and not isReleasing then
 		-- Press-buffer latch: recent press, button still held, hand slid in
 		if not (ohHeld and SysTime() - pressT < GRAB_GRACE) then return end
-		local wepLeft = ArcticVR and ArcticVR.GunInLeftHand or false
+		local wepLeft = WepLeft()
 		local wh = wepLeft and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
 		local oh = wepLeft and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
 		if not wh or not oh or not TryGrab(wh, oh) then return end
@@ -325,13 +364,20 @@ hook.Add("VRMod_Tracking", "ForegripTracking", function()
 		return
 	end
 
-	local wepLeft = ArcticVR and ArcticVR.GunInLeftHand or false
+	local wepLeft = WepLeft()
 	local wh = wepLeft and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
 	local oh = wepLeft and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
 	if not wh or not oh then
 		isGripping = false
 		isReleasing = false
 		return
+	end
+
+	if dbgOn then
+		_dbgOff:Set(oh.pos)
+		_dbgWep:Set(wh.pos)
+		_dbgWepAng:Set(wh.ang)
+		dbgValid = true
 	end
 
 	local frac = 1
@@ -364,18 +410,18 @@ hook.Add("VRMod_Tracking", "ForegripTracking", function()
 	end
 end)
 
-hook.Add("VRMod_PreRender", "ForegripRender", function()
+local function ForegripRender()
 	local hasWeapon = g_VR.currentvmi or g_VR.wmActive
 	if not isGripping or not hasWeapon then
 		if not hasWeapon then isGripping = false end
-		if vrmod_wmrecoil then vrmod_wmrecoil.gripping = false end
+		SetGripping(false)
 		return
 	end
 
 	-- Tell the worldmodel recoil system we're two-handing (it halves recoil).
-	if vrmod_wmrecoil then vrmod_wmrecoil.gripping = true end
+	SetGripping(true)
 
-	local wepLeft = ArcticVR and ArcticVR.GunInLeftHand or false
+	local wepLeft = WepLeft()
 	local wh = wepLeft and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
 	local oh = wepLeft and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
 	if not wh or not oh then
@@ -403,7 +449,7 @@ hook.Add("VRMod_PreRender", "ForegripRender", function()
 	-- last frame's hand for one frame is invisible, landing it a grip offset
 	-- away is not.
 	local aPos, aAng
-	if gripBone and not g_VR.wmActive then
+	if gripBone and not g_VR.wmActive and not wepLeft then
 		local vm = LocalPlayer():GetViewModel()
 		if not IsValid(vm) then return end
 		-- RefreshViewModelMuzzle invalidates this cache on every call and, on
@@ -459,7 +505,9 @@ hook.Add("VRMod_PreRender", "ForegripRender", function()
 			nf.lefthandAng = aAng
 		end
 	end
-end)
+end
+
+hook.Add("VRMod_PreRender", "ForegripRender", ForegripRender)
 
 hook.Add("VRMod_Exit", "ForegripExit", function(ply)
 	if ply ~= LocalPlayer() then return end
@@ -469,11 +517,117 @@ hook.Add("VRMod_Exit", "ForegripExit", function(ply)
 	gripBone = nil
 	gripPending = false
 	ohHeld = false
-	if vrmod_wmrecoil then vrmod_wmrecoil.gripping = false end
+	SetGripping(false)
 end)
 
 hook.Add("VRMod_Start", "ForegripCacheSID", function(ply)
-	if ply == LocalPlayer() then cachedSID = ply:SteamID() end
+	if ply ~= LocalPlayer() then return end
+	cachedSID = ply:SteamID()
+
+	-- Pin the offhand AFTER the weapon has been placed for this frame.
+	-- Right-handed that is already true: g_VR.viewModelPos is written during
+	-- the tracking phase, before any PreRender runs. Left-handed it is not --
+	-- sh_lefthand moves the gun from the right hand to the left in its own
+	-- VRMod_PreRender, which re-appends itself at VRMod_Start to run last. So
+	-- this pass was anchoring the offhand to the right-hand weapon pose while
+	-- the gun was drawn at the left hand.
+	--
+	-- Deferred by a zero timer rather than re-appending inline: both files
+	-- re-append during VRMod_Start and only the later one wins, so doing it
+	-- once every handler has returned lands us behind sh_lefthand no matter
+	-- what order the addons loaded in. Remove+Add appends; Add alone would
+	-- keep the existing position.
+	timer.Simple(0, function()
+		hook.Remove("VRMod_PreRender", "ForegripRender")
+		hook.Add("VRMod_PreRender", "ForegripRender", ForegripRender)
+	end)
+end)
+
+-- ── Debug: draw the grab zone ───────────────────────────────────────────────
+-- Deliberately re-derives the same three branches and the same constants that
+-- TryGrab tests against, so the drawn shape IS the tested shape. Colour says
+-- whether a grab would latch right now, and the marker at the weapon hand says
+-- which hand foregrip currently believes is holding the gun -- the thing that
+-- was silently wrong for every left-handed player.
+--
+-- PostDrawTranslucentRenderables rather than a VRMod render hook: it fires per
+-- eye, which is what a world-space overlay wants, and the custom PreRender
+-- variants don't fire at all on the OpenXR path.
+local cv_debug = CreateClientConVar("vrmod_foregrip_debug", "0", true, false, "Draw the foregrip grab zone and weapon hand")
+dbgOn = cv_debug:GetBool()
+cvars.AddChangeCallback("vrmod_foregrip_debug", function(_, _, v) dbgOn = tobool(v) end, "vrmod_foregrip")
+
+local DBG_HELD = Color(80, 200, 255)    -- gripping right now
+local DBG_IN   = Color(80, 255, 120)    -- offhand in the zone, grab would latch
+local DBG_OUT  = Color(140, 140, 140)   -- out of reach
+local DBG_HAND = Color(255, 200, 60)    -- weapon hand
+local DBG_AIM  = Color(255, 80, 220)    -- where the two-hand aim points
+local DBG_FWD  = Color(255, 255, 255)   -- where the gun actually points
+local DBG_MINS = Vector(-GRIP_BACK, -GRIP_SIDE, -GRIP_VERT)
+local DBG_MAXS = Vector(GRIP_FORWARD, GRIP_SIDE, GRIP_VERT)
+local DBG_HMIN = Vector(-1, -1, -1)
+local DBG_HMAX = Vector(1, 1, 1)
+
+local function ZoneColor(inside, valid)
+	if isGripping then return DBG_HELD end
+	if inside and valid then return DBG_IN end
+	return DBG_OUT
+end
+
+hook.Add("PostDrawTranslucentRenderables", "ForegripDebug", function()
+	if not dbgOn and not (vrmod.DebugVisible and vrmod.DebugVisible()) then return end
+	if not g_VR.active then return end
+
+	local wepLeft = WepLeft()
+	local wh = wepLeft and g_VR.tracking.pose_lefthand or g_VR.tracking.pose_righthand
+	local oh = wepLeft and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
+	if not wh or not oh then return end
+
+	local wep = LocalPlayer():GetActiveWeapon()
+	local valid = IsValidForegrip(wep) and (g_VR.currentvmi or g_VR.wmActive) and true or false
+
+	local lp = WorldToLocal(oh.pos, angle_zero, wh.pos, wh.ang)
+	local gp = IsValid(wep) and wep.VRGripPos or nil
+
+	render.SetColorMaterial()
+
+	local col
+	if gp then
+		local r = GRIP_POINT_RADIUS * cv_scale:GetFloat()
+		col = ZoneColor(lp:DistToSqr(gp) <= r * r, valid)
+		local c = LocalToWorld(gp, angle_zero, wh.pos, wh.ang)
+		render.DrawWireframeSphere(c, r, 12, 12, col, true)
+	elseif cv_sphere:GetBool() then
+		local r = GRIP_RADIUS * cv_scale:GetFloat()
+		col = ZoneColor(lp:LengthSqr() < r * r, valid)
+		render.DrawWireframeSphere(wh.pos, r, 12, 12, col, true)
+	else
+		col = ZoneColor(lp.x > -GRIP_BACK and lp.x < GRIP_FORWARD
+			and lp.y > -GRIP_SIDE and lp.y < GRIP_SIDE
+			and lp.z > -GRIP_VERT and lp.z < GRIP_VERT, valid)
+		render.DrawWireframeBox(wh.pos, wh.ang, DBG_MINS, DBG_MAXS, col, true)
+	end
+
+	render.DrawWireframeBox(wh.pos, wh.ang, DBG_HMIN, DBG_HMAX, DBG_HAND, true)
+	render.DrawLine(wh.pos, oh.pos, col, true)
+
+	-- Aim basis, only while actually gripping. GetTwoHandedAngle sets the
+	-- weapon HAND's angle so its forward runs along the gun-hand -> offhand
+	-- vector (magenta). The gun's forward is that composed with the viewmodel
+	-- offset angle, which sh_lefthand mirrors in left-hand mode (white).
+	-- If the two rays agree, the aim is right and the complaint is about the
+	-- body swinging on its lever arm; if white mirrors magenta about the hand,
+	-- the mirrored offset angle is the culprit, not this file.
+	local muz = g_VR.viewModelMuzzle
+	if isGripping and dbgValid and muz then
+		local d = _dbgOff - _dbgWep
+		if d:LengthSqr() > 1 then
+			d:Normalize()
+			d:Mul(40)
+			render.DrawLine(_dbgWep, _dbgWep + d, DBG_AIM, true)
+			render.DrawLine(muz.Pos, muz.Pos + muz.Ang:Forward() * 40, DBG_FWD, true)
+		end
+	end
 end)
 
 concommand.Add("vrmod_foregrip_test", function()
@@ -489,7 +643,7 @@ concommand.Add("vrmod_foregrip_test", function()
 	local lh = g_VR.tracking.pose_lefthand
 	local rh = g_VR.tracking.pose_righthand
 	if lh and rh then
-		local wepLeft = ArcticVR and ArcticVR.GunInLeftHand or false
+		local wepLeft = WepLeft()
 		local wh = wepLeft and lh or rh
 		local oh = wepLeft and rh or lh
 		local lp = (WorldToLocal(oh.pos, angle_zero, wh.pos, wh.ang))
@@ -502,6 +656,29 @@ concommand.Add("vrmod_foregrip_test", function()
 		else
 			print(string.format("  LocalOff: X:%.1f Y:%.1f Z:%.1f  (box: X:-%.0f/+%.0f Y:±%.0f Z:±%.0f)",
 				lp.x, lp.y, lp.z, GRIP_BACK, GRIP_FORWARD, GRIP_SIDE, GRIP_VERT))
+		end
+	end
+	if not dbgOn then
+		print("  (set vrmod_foregrip_debug 1 for the aim readout)")
+	elseif dbgValid then
+		-- Raw, pre-pin geometry. The LocalOff above is measured after
+		-- ForegripRender has moved the offhand onto the grip, so during a grip
+		-- it reports the pin, not your hand.
+		local raw = WorldToLocal(_dbgOff, angle_zero, _dbgWep, _dbgWepAng)
+		print(string.format("  RawOff:   X:%.1f Y:%.1f Z:%.1f", raw.x, raw.y, raw.z))
+
+		local muz = g_VR.viewModelMuzzle
+		local d = _dbgOff - _dbgWep
+		if muz and d:LengthSqr() > 1 then
+			d:Normalize()
+			local aimAng = d:Angle()
+			local mAng = muz.Ang
+			local dot = d:Dot(mAng:Forward())
+			if dot > 1 then dot = 1 elseif dot < -1 then dot = -1 end
+			print(string.format("  Aim  p %.1f y %.1f   Muzzle p %.1f y %.1f   delta p %.1f y %.1f   sep %.1f deg",
+				aimAng.p, aimAng.y, mAng.p, mAng.y,
+				math.AngleDifference(mAng.p, aimAng.p), math.AngleDifference(mAng.y, aimAng.y),
+				math.deg(math.acos(dot))))
 		end
 	end
 	local sid = LocalPlayer():SteamID()

@@ -3,7 +3,9 @@ local vrHands = {}
 local SIDES = {"right", "left"} -- hoisted: no per-call table alloc in spawn/repair loops
 -- Master switch for the server-side hand physics props. On (default): solid vphysics
 -- hands that push objects. Off: nothing spawns, so nothing can block bullets/movement.
-local cv_handphysics = CreateConVar("vrmod_hand_physics", "1", FCVAR_ARCHIVE + FCVAR_NOTIFY, "Enable server-side VR hand physics props. Disable to stop hands interacting with the world.")
+-- Replicated so the settings menu checkbox can bind to it and show the live
+-- server value; without that flag the client has no such convar at all.
+local cv_handphysics = CreateConVar("vrmod_hand_physics", "1", FCVAR_ARCHIVE + FCVAR_NOTIFY + FCVAR_REPLICATED, "Enable server-side VR hand physics props. Disable to stop hands interacting with the world.")
 -- Utility to get cached physics data from weapon
 local function GetCachedWeaponParams(wep, ply, side)
     local radius, reach, mins, maxs, angles = vrmod.utils.GetWeaponMeleeParams(wep, ply, side)

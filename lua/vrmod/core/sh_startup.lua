@@ -63,7 +63,7 @@ if CLIENT then
     vrmod.AddCallbackedConvar("vrmod_horizontaloffset", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_characteryawblend", nil, "1.5")
     vrmod.AddCallbackedConvar("vrmod_postprocess", nil, "0", nil, nil, nil, nil, tobool, function(val) if g_VR.view then g_VR.view.dopostprocess = val end end)
-    vrmod.AddCallbackedConvar("vrmod_skybox", nil, "0", nil, nil, nil, nil, tobool, function(val) RunConsoleCommand("r_3dsky", val and "1" or "0") end)
+    vrmod.AddCallbackedConvar("vrmod_skybox", nil, "1", nil, nil, nil, nil, tobool, function(val) RunConsoleCommand("r_3dsky", val and "1" or "0") end)
     vrmod.AddCallbackedConvar("vrmod_controlleroffset_x", nil, "-15")
     vrmod.AddCallbackedConvar("vrmod_controlleroffset_y", nil, "-1")
     vrmod.AddCallbackedConvar("vrmod_controlleroffset_z", nil, "5")

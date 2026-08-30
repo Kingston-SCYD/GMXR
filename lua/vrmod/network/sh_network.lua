@@ -462,7 +462,10 @@ if CLIENT then
 	-- edits from the Server tab take effect without a VR restart.
 	cvars.AddChangeCallback("vrmod_net_tickrate", function()
 		if timer.Exists("vrmod_transmit") then
-			deltaTickCounter = 0 -- next packet is a keyframe: clean resync at the new rate
+			-- Both, not just the counter: the send is gated on FramesAreEqual, so a
+			-- player standing still at the moment of the change never emitted the
+			-- resync at all and remotes kept posing against the old baseline.
+			deltaTickCounter, lastSentFrame = 0, nil
 			StartTransmitTimer()
 		end
 	end, "vrmod_net_tickrate_live")
@@ -642,16 +645,26 @@ if CLIENT then
 		net.SendToServer()
 	end
  
+	-- Joins are one-shot and unacknowledged: if the VR player's entity isn't
+	-- replicated here yet, or we asked the server before they existed, the join
+	-- is discarded and this client drops their frames forever -- no IK until they
+	-- die and the server broadcasts a fresh join. Any evidence of a missed join
+	-- re-asks, coalesced to at most one request per second.
+	local function RequestVRPlayers()
+		if timer.Exists("vrutil_requestvrplayers") then return end
+		timer.Create("vrutil_requestvrplayers", 1, 1, function()
+			net.Start("vrutil_net_requestvrplayers")
+			net.SendToServer()
+		end)
+	end
+
 	-- === RECEIVE REMOTE FRAMES — ring buffer instead of overwrite ===
 	net.Receive("vrutil_net_tick", function(len)
 		local ply = net.ReadEntity()
 		if not IsValid(ply) or ply == LocalPlayer() then return end
 		local steamid = ply:SteamID()
 		local tab = g_VR.net[steamid]
-		if not tab then return end
-		if (tab.bufCount or 0) == 0 then
-			print("[VRNet] First tick for " .. ply:Nick() .. " (" .. steamid .. ")")
-		end
+		if not tab then RequestVRPlayers() return end
  
 		local frame = netReadFrame()
 		frame._recvTime = SysTime()
@@ -682,7 +695,7 @@ if CLIENT then
 	-- === PLAYER JOIN — buffer fields added ===
 	net.Receive("vrutil_net_join", function(len)
 		local ply = net.ReadEntity()
-		if not IsValid(ply) then return end
+		if not IsValid(ply) then RequestVRPlayers() return end
 		local sid = ply:SteamID()
 		local prev = g_VR.net[sid]
 		g_VR.net[sid] = {
@@ -881,10 +894,7 @@ if CLIENT then
 	-- === AUTOSTART / VEHICLE HOOKS (unchanged) ===
 	hook.Add("CreateMove", "vrutil_hook_joincreatemove", function(cmd)
 		hook.Remove("CreateMove", "vrutil_hook_joincreatemove")
-		timer.Simple(2, function()
-			net.Start("vrutil_net_requestvrplayers")
-			net.SendToServer()
-		end)
+		timer.Simple(1, RequestVRPlayers)
 		timer.Simple(2, function()
 			if SysTime() < 120 then GetConVar("vrmod_autostart"):SetBool(false) end
 			if GetConVar("vrmod_autostart"):GetBool() then
@@ -1014,6 +1024,20 @@ if SERVER then
 
 	vrmod.NetReceiveLimited("vrutil_net_exit", 5, 0, function(len, ply) net_exit(ply:SteamID()) end)
 	hook.Add("PlayerDisconnected", "vrutil_hook_playerdisconnected", function(ply) net_exit(ply:SteamID()) end)
+	-- A join hands the client an empty frame buffer, and the transmit timer only
+	-- fires on movement -- a VR player standing still leaves lerpedFrame nil, so
+	-- the character system has nothing to pose against and the model falls back to
+	-- desktop anims. Push the last known frame instead of waiting for motion.
+	-- Reliable, unlike the relay: this one can't be dropped.
+	local function SendLatestFrame(vrPly, data, target)
+		local f = data.latestFrame
+		if not f then return end
+		net.Start("vrutil_net_tick")
+		net.WriteEntity(vrPly)
+		netWriteFrame(f)
+		if target then net.Send(target) else net.Broadcast() end
+	end
+
 	net.Receive("vrutil_net_requestvrplayers", function(len, ply)
 		ply.hasRequestedVRPlayers = true
 		for k, v in pairs(g_VR) do
@@ -1038,6 +1062,8 @@ if SERVER then
 						net.WriteFloat(v.charHeadToHmd or 6.3)
 						net.Send(ply)
 					end
+
+					SendLatestFrame(vrPly, v, ply)
 				else
 					vrmod.logger.Err("Invalid SteamID \"" .. k .. "\" found in player table")
 				end
@@ -1097,6 +1123,7 @@ if SERVER then
 			net.WriteBool(vrData.characterAltHead)
 			net.WriteBool(vrData.dontHideBullets)
 			net.Broadcast()
+			SendLatestFrame(ply, vrData)
 		end)
 	end)
 

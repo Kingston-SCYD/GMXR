@@ -26,7 +26,14 @@ if CLIENT then
 	local cv_debug_input = CreateClientConVar("vrmod_debug_input", "0", false, false, "Print all VR input events")
 	local cv_debug_frame = CreateClientConVar("vrmod_debug_frame", "0", false, false, "Print per-eye pose/timing each frame")
 	local cv_pausecard = CreateClientConVar("vrmod_pausecard", "1", true, false, "Show a reason card in the headset while the VR render loop is paused", 0, 1)
-	local cv_handsmooth = CreateClientConVar("vrmod_hand_smoothing", "0.98", true, false, "Hand pose smoothing, per 90Hz frame. 1 = off, lowest latency", 0.1, 1)
+	-- Hand pose smoothing, fixed rather than a convar. 1 disables it, and 1 is
+	-- deliberate: the filter blends last frame's WORLD-space hand pose against
+	-- this frame's while the eyes are late-latched to a newer time base, and that
+	-- mismatch is itself the jitter (see the prediction comment in UpdateTracking).
+	-- Anything below 1 brings it back. Left as a named constant so the filter can
+	-- be re-tested without restoring the convar.
+	local HAND_SMOOTH = 1
+	local HAND_SMOOTH_INV = 1 - HAND_SMOOTH -- per 90Hz frame, normalised below
 	local cv_handpredict = CreateClientConVar("vrmod_hand_predict", "0", true, false, "Seconds of velocity extrapolation on hand poses. Cancels the eye/hand latch gap", 0, 0.05)
 	local cv_debug_latency = CreateClientConVar("vrmod_debug_latency", "0", false, false, "Measure how far the hand poses trail the late-latched eye poses")
 	local _latTick = 0
@@ -39,7 +46,6 @@ if CLIENT then
 	local cropVerticalMargin, cropHorizontalOffset
 	local lastPosePos = {}
 	local lastPoseAng = {}
-	local convarOverrides = {}
 	local _xrPoseLeft, _xrPoseRight, _rawHmdPose
 	local wasPaused = false
 	local cropL_u0, cropL_v0, cropL_u1, cropL_v1 = 0, 0, 1, 1
@@ -74,26 +80,18 @@ if CLIENT then
 	-- RunConsoleCommand, and engine-created convars also reject Lua SetString
 	-- ("not created by Lua") — guard both so one blocked convar can't error out
 	-- VR start/exit. Everything unblocked keeps the deferred RunConsoleCommand
-	-- path (OverridePerformanceConvars relies on gmod_mcore_test applying deferred).
+	-- path (ApplyPerformanceConvars relies on gmod_mcore_test applying deferred).
+	-- Ones that fail both paths are remembered: the apply pass runs on every
+	-- toggle change now, and re-pcalling a convar that can never work just
+	-- filled the console with the same two lines.
+	local unsettable = {}
 	local function setConvar(cv, name, value)
 		if not IsConCommandBlocked(name) then
 			RunConsoleCommand(name, value)
-		elseif not pcall(cv.SetString, cv, value) then
-			vrmod.logger.Err("Convar '" .. name .. "' is blocked and not settable from Lua, skipping")
+		elseif not unsettable[name] and not pcall(cv.SetString, cv, value) then
+			unsettable[name] = true
+			vrmod.logger.Err("Convar '" .. name .. "' is blocked and not settable from Lua, skipping (set it with +" .. name .. " in launch options)")
 		end
-	end
-
-	local function overrideConvar(name, value)
-		local cv = GetConVar(name)
-		if cv then
-			convarOverrides[name] = cv:GetString()
-			setConvar(cv, name, value)
-		end
-	end
-
-	local function restoreConvarOverrides()
-		for k, v in pairs(convarOverrides) do setConvar(GetConVar(k), k, v) end
-		convarOverrides = {}
 	end
 
 	-- Per-eye RT dimensions, cached at SetupRenderTargets (RT size only
@@ -170,15 +168,12 @@ if CLIENT then
 	local _angVelAng = Angle()
 
 	local function UpdateTracking()
-		-- The old fixed 0.98-per-frame filter cost a fraction of a frame of
-		-- latency at 90Hz but twice that at 45, so the same setting felt
-		-- laggier the worse your framerate. Normalise it to a 90Hz reference
-		-- and let it be turned off outright.
-		local smoothingFactor = cv_handsmooth:GetFloat()
-		if smoothingFactor < 1 then
-			local dt = RealFrameTime()
-			smoothingFactor = dt > 0 and 1 - (1 - smoothingFactor) ^ (dt * 90) or 1
-		end
+		-- A flat 0.98-per-frame filter costs a fraction of a frame of latency at
+		-- 90Hz but twice that at 45, so it felt laggier the worse your framerate.
+		-- Normalised against a 90Hz reference so the cost holds at any rate.
+		-- Still guarded below, since dt == 0 leaves the factor at 1.
+		local dt = RealFrameTime()
+		local smoothingFactor = dt > 0 and 1 - HAND_SMOOTH_INV ^ (dt * 90) or 1
 		local predictT = cv_handpredict:GetFloat()
 		local maxPosDeltaSqr = 100
 		local maxPosDelta = 10
@@ -227,7 +222,6 @@ local currentAng = v.ang
 
 			local rawVel = v.vel
 			if rawVel.x == 0 and rawVel.y == 0 and rawVel.z == 0 and lastPos then
-				local dt = RealFrameTime()
 				if dt > 0.0001 then
 					_velVec:Set(currentPos)
 					_velVec:Sub(lastPos)
@@ -242,7 +236,6 @@ local currentAng = v.ang
 			worldPose.vel = wv
 			local rawAngVel = v.angvel
 			if rawAngVel.p == 0 and rawAngVel.y == 0 and rawAngVel.r == 0 and lastAng then
-				local dt = RealFrameTime()
 				if dt > 0.0001 then
 					_angVelAng:SetUnpacked(math_AngleDifference(currentAng.p, lastAng.p) / dt, math_AngleDifference(currentAng.y, lastAng.y) / dt, math_AngleDifference(currentAng.r, lastAng.r) / dt)
 					rawAngVel = _angVelAng
@@ -878,26 +871,47 @@ if _xrPoseLeft and _xrPoseRight then
 	for _, o in ipairs(vrmod.PerfOverrides) do
 		if not GetConVar(o.toggle) then CreateClientConVar(o.toggle, "1", true, false, "Perf override: " .. o.cvar) end
 	end
+	-- Master switch. The UI checkbox and the reset button both referenced this
+	-- but nothing ever created it, so the box was inert and `vrmod_perfoverrides 1`
+	-- printed "Unknown command" while the overrides applied regardless.
+	if not GetConVar("vrmod_perfoverrides") then CreateClientConVar("vrmod_perfoverrides", "1", true, false, "Master switch for the vrmod_perf_* engine overrides", 0, 1) end
 
-	-- Returns whether threaded rendering ends up active. overrideConvar defers
-	-- via RunConsoleCommand, so gmod_mcore_test can't be read back this frame --
-	-- we report what we applied instead. Feeds VRMOD_SetMulticoreMode.
-	local function OverridePerformanceConvars()
+	-- These are settings, not session borrows: applied at load, on change and
+	-- at VR start, and deliberately NOT unwound on exit. Off writes the engine
+	-- default rather than a captured baseline -- every one of these is
+	-- FCVAR_ARCHIVE, so a baseline read at load would already be last session's
+	-- applied value and unticking a box would restore nothing.
+	-- Returns whether threaded rendering ends up active. setConvar defers via
+	-- RunConsoleCommand, so gmod_mcore_test can't be read back this frame -- we
+	-- report what we intended instead. Feeds VRMOD_SetMulticoreMode.
+	local function ApplyPerformanceConvars()
+		local sky = GetConVar("r_3dsky")
 		-- Skybox tracks its own setting and applies regardless of the master toggle.
-		overrideConvar("r_3dsky", convars.vrmod_skybox:GetBool() and "1" or "0")
-		local master = GetConVar("vrmod_perfoverrides")
-		if master and not master:GetBool() then
-			local mq = GetConVar("mat_queue_mode")
-			return GetConVar("gmod_mcore_test"):GetBool() or (mq and mq:GetInt() >= 1)
-		end
+		if sky then setConvar(sky, "r_3dsky", convars.vrmod_skybox:GetBool() and "1" or "0") end
+		local on = GetConVar("vrmod_perfoverrides"):GetBool()
 		local mcore = false
 		for _, o in ipairs(vrmod.PerfOverrides) do
-			if GetConVar(o.toggle):GetBool() then
-				overrideConvar(o.cvar, o.val)
-				mcore = mcore or o.cvar == "gmod_mcore_test" or o.cvar == "mat_queue_mode"
+			local cv = GetConVar(o.cvar)
+			if cv then
+				local want = on and GetConVar(o.toggle):GetBool()
+				local val = want and o.val or cv:GetDefault()
+				setConvar(cv, o.cvar, val)
+				if o.cvar == "gmod_mcore_test" then mcore = mcore or val ~= "0"
+				elseif o.cvar == "mat_queue_mode" then mcore = mcore or (tonumber(val) or 0) >= 1 end
 			end
 		end
 		return mcore
+	end
+
+	-- One debounced apply per burst: a preset load or vrmod_reset writes every
+	-- toggle at once, and mat_queue_mode restarts the material system on each
+	-- write. Collapsing them keeps that to a single hitch.
+	local function QueuePerformanceApply() timer.Create("vrmod_perf_apply", 0.1, 1, ApplyPerformanceConvars) end
+	hook.Add("InitPostEntity", "vrmod_perf_apply", ApplyPerformanceConvars)
+	if IsValid(LocalPlayer()) then QueuePerformanceApply() end -- lua autorefresh: InitPostEntity already fired
+	cvars.AddChangeCallback("vrmod_perfoverrides", QueuePerformanceApply, "vrmod_perf_apply")
+	for _, o in ipairs(vrmod.PerfOverrides) do
+		cvars.AddChangeCallback(o.toggle, QueuePerformanceApply, "vrmod_perf_apply")
 	end
 
 local function SetupRenderTargets()
@@ -1124,7 +1138,6 @@ end
 	local function SetupShutdownHooks()
 		function VRUtilClientExit()
 			if not g_VR.active then return end
-			restoreConvarOverrides()
 			VRUtilMenuClose()
 			VRUtilNetworkCleanup()
 			vrmod.StopLocomotion()
@@ -1168,7 +1181,7 @@ end
 
 	function VRUtilClientStart()
 		if not PerformStartup() then return end
-		local mcoreOn = OverridePerformanceConvars()
+		local mcoreOn = ApplyPerformanceConvars()
 		if SetupRenderTargets() == false then return end
 		SetupActions()
 		SetupNetworkAndOrigin()

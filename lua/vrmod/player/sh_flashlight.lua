@@ -4,25 +4,30 @@ if CLIENT then
 	local flashlight = nil
 	local fwd, lastPos, lastAng = Vector(), Vector(1e9, 0, 0), Angle() -- scratch; lastPos far so first frame always updates
 	vrmod.AddCallbackedConvar("vrmod_flashlight_projtex", nil, "1", nil, nil, 0, 1, function(val) return math.floor(tonumber(val) or 0) end)
-	-- Engine flashlight shadow depth: the depth pass re-renders whenever an
-	-- animated caster (hands/body/props) is in the beam and flushes the
-	-- material queue under mat_queue_mode 2 -- the close-prop / pointed-down
-	-- eye stutter. MUST be committed while no VR session exists: changing it
-	-- in VR reallocates the depth texture and corrupts the shared eye RT
-	-- (RunConsoleCommand also defers a frame, so a "VR start" apply lands
-	-- mid-init). Applied at game load and on toggle change outside VR only.
-	CreateClientConVar("vrmod_flashlight_nodepth", "1", true, false, "Disable engine flashlight shadow depth (VR stutter fix; applies at load / outside VR only)", 0, 1)
+	-- Engine flashlight shadow depth (r_flashlightdepthtexture): the depth pass
+	-- re-renders whenever an animated caster (hands/body/props) is in the beam
+	-- and flushes the material queue under mat_queue_mode 2 -- the close-prop /
+	-- pointed-down eye stutter. MUST be committed while no VR session exists:
+	-- changing it in VR reallocates the depth texture and corrupts the shared
+	-- eye RT (RunConsoleCommand also defers a frame, so a "VR start" apply lands
+	-- mid-init). Applied at game load, on change outside VR, and on VR exit.
+	-- The realloc stalls the renderer for roughly a second whichever way it goes.
+	local cvDepth = CreateClientConVar("vrmod_flashlight_depth", "0", true, false, "Engine flashlight shadow depth texture. Freezes the game for about a second when changed; a toggle made in VR applies on exit", 0, 1)
+	-- Held separate from the depth texture because the costs are nothing alike:
+	-- this one only asks the projected texture to cast, is read at creation, and
+	-- allocates nothing. It does nothing on its own unless cvDepth is also on.
+	local cvShadows = CreateClientConVar("vrmod_flashlight_shadows", "0", true, false, "VR flashlight casts shadows (needs vrmod_flashlight_depth 1 to show)", 0, 1)
 	local function ApplyFlashlightDepth()
-		if g_VR.active then return end -- never reallocate the depth RT mid-session
-		local off = GetConVar("vrmod_flashlight_nodepth"):GetBool()
+		if g_VR.active then return end -- never reallocate the depth RT mid-session; VRMod_Exit re-runs this
+		local on = cvDepth:GetBool()
 		if IsConCommandBlocked("r_flashlightdepthtexture") then
-			if off then vrmod.logger.Err("r_flashlightdepthtexture is blocked from Lua; add +r_flashlightdepthtexture 0 to launch options") end
+			if not on then vrmod.logger.Err("r_flashlightdepthtexture is blocked from Lua; add +r_flashlightdepthtexture 0 to launch options") end
 			return
 		end
-		RunConsoleCommand("r_flashlightdepthtexture", off and "0" or "1")
+		RunConsoleCommand("r_flashlightdepthtexture", on and "1" or "0")
 	end
 	hook.Add("InitPostEntity", "vrmod_flashlight_depth", ApplyFlashlightDepth)
-	cvars.AddChangeCallback("vrmod_flashlight_nodepth", function() ApplyFlashlightDepth() end, "vrmod_flashlight_depth")
+	cvars.AddChangeCallback("vrmod_flashlight_depth", ApplyFlashlightDepth, "vrmod_flashlight_depth")
 	if IsValid(LocalPlayer()) then ApplyFlashlightDepth() end -- lua autorefresh: InitPostEntity already fired
 	local usingDL, farZ, tanHalf = false, 750, 0.5
 	local endPos, lightPos = Vector(), Vector() -- scratch
@@ -46,12 +51,12 @@ if CLIENT then
 				trace.filter = LocalPlayer()
 			else
 				flashlight = ProjectedTexture()
-				-- Never own a shadow depth map: the depth pass re-renders whenever
-				-- an animated caster (hands/body/props) sits in the beam, and under
-				-- mat_queue_mode 2 that pass flushes the queue every frame -- the
-				-- close-prop / pointed-down eye stutter (confirmed via
-				-- r_flashlightdepthtexture 0; see also the perf override).
-				flashlight:SetEnableShadows(false)
+				-- Shadows are opt-in (vrmod_flashlight_shadows, default off) and also need
+				-- vrmod_flashlight_depth: that pass re-renders whenever an animated caster
+				-- (hands/body/props) sits in the beam, and under mat_queue_mode 2 it flushes
+				-- the queue every frame -- the close-prop / pointed-down stutter. Read at
+				-- creation, so a toggle takes effect on the next flashlight switch.
+				flashlight:SetEnableShadows(cvShadows:GetBool())
 				flashlight:SetTexture("effects/flashlight001")
 				flashlight:SetFOV(fov)
 				flashlight:SetFarZ(farZ)
@@ -117,6 +122,7 @@ if CLIENT then
 	end)
 
 	hook.Add("VRMod_Exit", "flashlight", function(ply, steamid)
+		if ply == LocalPlayer() then timer.Simple(0, ApplyFlashlightDepth) end -- commit a deferred in-VR toggle
 		if ply == LocalPlayer() and flashlight then
 			hook.Remove("PreRender", "vrmod_flashlight")
 			if not usingDL then flashlight:Remove() end

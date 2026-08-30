@@ -4,6 +4,8 @@ local GRAB_HULL = 2 -- small probe box: a larger hull self-clips the wall at con
 local GRAB_BACKOFF = 4 -- start grab traces just behind the palm so a hand touching/penetrating the wall still hits the front face
 local LERP_SPEED = 10
 local VAULT_SPEED = 6
+local COAST_TIMEOUT = 0.35 -- ceiling on the freeze phase of the post-throw handoff
+local SETTLE_RATE = 4 -- 1/seconds: the offset built up running ahead of the server eases out over 0.25s
 local LEDGE_SCAN_RATE = 0.1
 local VAULT_STICK_THRESHOLD = 0.5
 local SYNC_INTERVAL = 0.033 -- send position to server ~30hz during climbing
@@ -174,6 +176,14 @@ if CLIENT then
 	local lerpSpeed = LERP_SPEED
 	-- When the last hand let go, for the head anti-clip grace window below.
 	local releaseTime = -1
+
+	-- Post-throw handoff (see BeginRelease). coastUntil > 0 means the origin is
+	-- still ours while the server catches up with the release.
+	local coastX, coastY, coastZ = 0, 0, 0
+	local coastUntil = 0
+	local settleStart = 0
+	local settleX, settleY, settleZ = 0, 0, 0
+	local cv_gravity
 
 	-- momentum tracking
 	local prevOriginX, prevOriginY, prevOriginZ = 0, 0, 0
@@ -406,10 +416,13 @@ if CLIENT then
 		ledgePos = nil
 	end
 
-	-- send current position to server for entity sync
-	local function SyncPosToServer()
+	-- Send current position to server for entity sync. Takes the same body point
+	-- that was just handed to SetPos: syncing g_VR.origin instead left the server
+	-- (and every other client) holding a position offset by the whole roomscale
+	-- HMD-to-origin vector, which the release SetPos then closed in one step.
+	local function SyncPosToServer(pos)
 		net.Start("vrmod_brushclimb_sync")
-		net.WriteVector(g_VR.origin)
+		net.WriteVector(pos)
 		net.SendToServer()
 	end
 
@@ -435,13 +448,20 @@ if CLIENT then
 		else
 			dropPos = g_VR.tracking.hmd.pos + Angle(0, g_VR.tracking.hmd.ang.yaw, 0):Forward() * -10
 			dropPos.z = g_VR.origin.z
-			-- Predict the server's decision so the sound fires exactly when a
-			-- throw actually registers, using the same replicated numbers.
+			-- Predict the server's decision with the same replicated numbers, so the
+			-- sound fires exactly when a throw registers and the coast below flies on
+			-- the velocity the server is about to apply.
+			coastX, coastY, coastZ = 0, 0, 0
 			if launchVel then
-				local scaled = launchVel:Length() * sv_throw:GetFloat()
+				local raw = launchVel:Length()
+				local scaled = raw * sv_throw:GetFloat()
 				local cap = sv_throwmax:GetFloat()
 				if scaled > cap then scaled = cap end
-				if scaled >= sv_throwmin:GetFloat() and scaled > 0 then PlayYeetSound(dropPos) end
+				if raw > 0 and scaled >= sv_throwmin:GetFloat() then
+					PlayYeetSound(dropPos)
+					local k = scaled / raw
+					coastX, coastY, coastZ = launchVel.x * k, launchVel.y * k, launchVel.z * k
+				end
 			end
 		end
 
@@ -468,15 +488,19 @@ if CLIENT then
 			lerpOrigin = Vector(g_VR.origin.x, g_VR.origin.y, g_VR.origin.z)
 			lerpTime = SysTime()
 		else
-			-- Plain release: hand straight to normal locomotion from the current origin. Lerping toward
-			-- the live player entity made the origin chase the engine unsticking the capsule from the
-			-- wall, which read as a backward-then-forward jolt. Gravity/momentum carry the player now.
-			lerpOrigin = nil
-			lerpTarget = nil
-			lerpEndOrigin = nil
-			lerpSpeed = LERP_SPEED
-			hook.Remove("PreRender", "brushclimb")
-			vrmod.StartLocomotion()
+			-- Plain release: hold the origin for a beat instead of handing straight back
+			-- to locomotion. Locomotion's PreRender does `origin.z = ply:GetPos().z`, and
+			-- that Z is one round trip plus one sync interval stale, so an instant handoff
+			-- yanks the view back to the wall and then forward again when the server's
+			-- velocity lands -- barely visible on a listen server, obvious in MP. Flying
+			-- the play space on the velocity the server is about to apply keeps both ends
+			-- in step, then settles the residual out. An earlier attempt lerped toward the
+			-- live player entity instead, which chased the engine unsticking the capsule
+			-- from the wall and read as a backward-then-forward jolt; this integrates the
+			-- launch rather than following the hull, so it has nothing to chase.
+			lastFrameTime = SysTime()
+			coastUntil = lastFrameTime + COAST_TIMEOUT
+			settleStart = 0
 		end
 	end
 
@@ -584,7 +608,7 @@ if CLIENT then
 			-- periodic server sync so other clients see us move
 			if now >= nextSyncTime then
 				nextSyncTime = now + SYNC_INTERVAL
-				SyncPosToServer()
+				SyncPosToServer(_tmpVec)
 			end
 
 			-- stick forward = vault to ledge
@@ -635,6 +659,84 @@ if CLIENT then
 				lerpSpeed = LERP_SPEED
 				hook.Remove("PreRender", "brushclimb")
 				vrmod.StartLocomotion()
+			end
+		elseif coastUntil > 0 then
+			-- Post-throw handoff (see BeginRelease). Two phases: coast while the
+			-- server still has us frozen, then settle the offset that coasting
+			-- built up before locomotion is allowed near the origin again.
+			local ply = LocalPlayer()
+			origin = g_VR.origin
+			local dt = now - lastFrameTime
+			lastFrameTime = now
+			if dt > 0.1 then dt = 0.1 end
+
+			-- Settle target is hull == HMD, which is where locomotion rests: standing
+			-- still it runs vel = -err * FOLLOW_GAIN until the < 15 deadzone catches
+			-- it, so anything past ~0.75u is an error it still owes. Note this is NOT
+			-- the climb's body point (hull = HMD - fwd*10, which puts the model behind
+			-- the head): handing off with that 10u lead leaves followVec at ~200, and
+			-- followVec both subtracts from the origin's velocity and goes into
+			-- cmd:SetForwardMove. Airborne that is harmless because delivered =
+			-- pvel . followDir is large and positive. On landing pvel collapses under
+			-- friction, the mismatch compensation is gated off, and vel = pvel -
+			-- followVec whips the origin back 10u at 200u/s while the hull is shoved
+			-- forward -- the jolt a second into the arc. Shifting the origin shifts the
+			-- HMD one for one, so the origin can absorb the lead here instead, spread
+			-- across the smoothstep at ~40u/s under a throw that is doing ten times it.
+			local hmdPos = g_VR.tracking.hmd.pos
+			local hx, hy = hmdPos.x, hmdPos.y
+
+			if settleStart == 0 then
+				if GetMoveType(ply) ~= MOVETYPE_NONE or now >= coastUntil then
+					-- Server has answered. We started integrating the launch at the
+					-- release, it started one trip later, so we are ahead of it by
+					-- roughly launch speed times latency on every axis. Snapshot that,
+					-- plus the body lead, and ease the whole thing out together.
+					local pos = ply:GetPos()
+					settleStart = now
+					settleX, settleY, settleZ = pos.x - hx, pos.y - hy, pos.z - origin.z
+				else
+					-- Still frozen: integrate the launch ourselves, hull-swept so we
+					-- cannot coast somewhere the capsule will not follow.
+					cv_gravity = cv_gravity or GetConVar("sv_gravity")
+					coastZ = coastZ - cv_gravity:GetFloat() * dt
+					local dx, dy, dz = coastX * dt, coastY * dt, coastZ * dt
+					hullTr.filter = ply
+					hullTr.start:SetUnpacked(origin.x, origin.y, origin.z)
+					hullTr.endpos:SetUnpacked(origin.x + dx, origin.y + dy, origin.z + dz)
+					local f = util.TraceHull(hullTr).Fraction
+					origin.x = origin.x + dx * f
+					origin.y = origin.y + dy * f
+					origin.z = origin.z + dz * f
+					-- keep the body with us so shadows/IK do not lag a round trip
+					-- behind, at the same offset the climb used
+					_tmpAng.p, _tmpAng.y, _tmpAng.r = 0, g_VR.tracking.hmd.ang.yaw, 0
+					local fwd = _tmpAng:Forward()
+					_tmpVec:SetUnpacked(hx - fwd.x * 10 + dx * f, hy - fwd.y * 10 + dy * f, origin.z)
+					ply:SetPos(_tmpVec)
+				end
+			end
+
+			if settleStart ~= 0 then
+				-- Ride the hull exactly -- its motion lands in the error term and is
+				-- taken out the same frame, so there is no chasing a moving target --
+				-- while smoothstepping the snapshot to zero on a fixed schedule. At
+				-- e == 1 the correction is nil (no jump entering the phase); at e == 0
+				-- the origin sits exactly where locomotion rests, followVec inside its
+				-- deadzone and nothing left owed for the landing to collect.
+				local e = (now - settleStart) * SETTLE_RATE
+				if e > 1 then e = 1 end
+				e = 1 - e * e * (3 - 2 * e)
+				local pos = ply:GetPos()
+				origin.x = origin.x + (pos.x - hx) - settleX * e
+				origin.y = origin.y + (pos.y - hy) - settleY * e
+				origin.z = pos.z - settleZ * e
+				if e == 0 or not ply:Alive() then
+					coastUntil = 0
+					settleStart = 0
+					hook.Remove("PreRender", "brushclimb")
+					vrmod.StartLocomotion()
+				end
 			end
 		end
 	end
@@ -792,6 +894,8 @@ if CLIENT then
 		end
 		refHand = nil
 		releaseTime = -1
+		coastUntil = 0
+		settleStart = 0
 		lerpOrigin = nil
 		lerpTarget = nil
 		lerpEndOrigin = nil
@@ -913,7 +1017,7 @@ elseif SERVER then
 	vrmod.NetReceiveLimited("vrmod_brushclimb_state", 10, 256, function(_, ply)
 		if net.ReadBool() then
 			SetMoveType(ply, MOVETYPE_NONE)
-			ply:SetVelocity(-ply:GetVelocity())
+			ply:SetLocalVelocity(vector_origin)
 			return
 		end
 
@@ -925,7 +1029,9 @@ elseif SERVER then
 		SetMoveType(ply, MOVETYPE_WALK)
 
 		-- Authoritative throw: the client reports the raw velocity it measured,
-		-- the server decides what that is worth.
+		-- the server decides what that is worth. SetLocalVelocity, not SetVelocity:
+		-- the latter adds to whatever the player already had, so the launch was not
+		-- reproducible and the client could not predict it during the coast.
 		local speed = vel:Length()
 		if speed ~= speed or speed <= 0 then return end
 		speed = speed * sv_throw:GetFloat()
@@ -934,7 +1040,7 @@ elseif SERVER then
 		if speed < sv_throwmin:GetFloat() then return end
 		vel:Normalize()
 		vel:Mul(speed)
-		ply:SetVelocity(vel)
+		ply:SetLocalVelocity(vel)
 	end)
 
 	vrmod.NetReceiveLimited("vrmod_brushclimb_sync", 45, 128, function(_, ply)

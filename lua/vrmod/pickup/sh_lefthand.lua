@@ -6,7 +6,9 @@
 	ent is consumed). Weapon changes without a grip press reset to right.
 
 	Viewmodels: VMI mirrored grip-preserving (A_L=(p,-y,-r),
-	P_L=R(A_L)·R(A)^-1·P), cached until offsets change.
+	P_L=R(A_L)·R(A)^-1·P), cached until offsets or the mode change.
+	`vrmod_lh_mirror` selects the position rule: 0 none, 1 grip-preserving
+	(original), 2 reflect. See RebuildMirror for what each one costs you.
 
 	Worldmodels: BuildBonePositions bone-shift. The engine bonemerges the wm
 	to the player's RHand and poses it there with every holdtype/grip rule;
@@ -21,8 +23,8 @@
 	The PreRender hook re-registers at VRMod_Start (remove+add) to run LAST,
 	after every wm-positioning hook.
 
-	Correction knob `vrmod_lh_offset x y z p yw r` (default 0 -4 0,
-	persisted). `vrmod_lh_dbg` toggles triage prints. Holster hand match
+	Correction knob `vrmod_lh_offset x y z p yw r` (default 1 -2 0,
+	persisted; measured against mirror mode 1). `vrmod_lh_dbg` toggles triage prints. Holster hand match
 	reads g_VR.gunInLeftHand (sh_holster patched); flag mirrored onto
 	ArcticVR.GunInLeftHand for non-ArcVR weapons. Right-release drop
 	suppressed via g_VR.antiDrop. Server: DropWeapon spawns from the left.
@@ -61,13 +63,19 @@ local pendingLeft, pendingT = false, 0
 local dropenable, cvRange, dbg
 local ourAnti, arcSet = false, false
 
--- Global correction (hand space, pre-VMI), persisted; default 0 -4 0
+-- Global correction (hand space, pre-VMI), persisted; default 1 -2 0.
+-- Measured in-headset against mirror mode 1 across the HL2 and CSS weapon
+-- sets. The old 0 -4 0 was tuned to cancel the mode-1 swing on one weapon,
+-- which cannot work in general: that swing scales with each weapon's grip
+-- yaw, so a constant over-corrects the low-yaw weapons and under-corrects
+-- the high-yaw ones. This pair corrects the hand-space seating instead and
+-- leaves the per-weapon component to the mirror mode.
 local LH_FILE = "vrmod_lh_offset.json"
 local lhPos, lhAng = Vector(), Angle()
 local hasCorr = false
 do
 	local t = util.JSONToTable(file.Read(LH_FILE, "DATA") or "") or {}
-	lhPos:SetUnpacked(t[1] or 0, t[2] or -4, t[3] or 0)
+	lhPos:SetUnpacked(t[1] or 1, t[2] or -2, t[3] or 0)
 	lhAng:SetUnpacked(t[4] or 0, t[5] or 0, t[6] or 0)
 	hasCorr = not (lhPos:IsZero() and lhAng:IsZero())
 end
@@ -217,12 +225,51 @@ hook_Add("VRMod_Tracking", "vrmod_lefthand", function()
 	end
 end)
 
--- Mirrored-VMI cache: rebuilt only when the vmi or its offsets change
+-- Mirrored-VMI cache: rebuilt only when the vmi, its offsets or the mode change
 local _mPos, _mAng = Vector(), Angle()
 local cVmi, c1, c2, c3, c4, c5, c6
+
+-- Position rule. All three reflect the ANGLE the same way -- (p,-y,-r) is the
+-- correct reflection of an orientation across the hand's XZ plane -- and differ
+-- only in what they do with the offset vector:
+--
+--   0 none     offset used verbatim. The gun sits in the left hand exactly
+--              where it sits in the right.
+--   1 grip     original: P_L = R(A_L)*R(A)^-1*P, re-expressing the offset in
+--              the reflected basis. Keeps the offset's relationship to the
+--              weapon's own axes, but it is a ROTATION about the hand origin,
+--              not a reflection, so a weapon with a ~15u lever arm swings
+--              sideways by roughly 0.5u per degree of its grip yaw. Weapons
+--              with near-zero yaw look fine; ones near 10 deg are visibly off.
+--   2 reflect  true reflection: negate the offset's Y as well as yaw and roll.
+--
+-- Measured across 15 weapons, mode 1's left-vs-right difference is a pure
+-- rotation: the translation component is (0.19, -0.32, 0.26) with sd < 0.3,
+-- i.e. nothing. That is why no constant vrmod_lh_offset can correct it -- the
+-- error scales with each weapon's yaw instead of being the same every time.
+local cv_mirror = CreateClientConVar("vrmod_lh_mirror", "1", true, false, "Left-hand grip mirroring: 0 = none, 1 = grip-preserving, 2 = reflect", 0, 2)
+local mirrorMode = cv_mirror:GetInt()
+cvars.AddChangeCallback("vrmod_lh_mirror", function(_, _, v)
+	mirrorMode = tonumber(v) or 1
+	cVmi = nil -- next frame fails the identity compare and rebuilds
+end, "vrmod_lefthand")
+
 local function RebuildMirror(vmi, op, oa)
 	cVmi, c1, c2, c3, c4, c5, c6 = vmi, op.x, op.y, op.z, oa.p, oa.y, oa.r
+
+	if mirrorMode == 0 then
+		_mPos:SetUnpacked(c1, c2, c3)
+		_mAng:SetUnpacked(c4, c5, c6)
+		return
+	end
+
 	_mAng:SetUnpacked(c4, -c5, -c6)
+
+	if mirrorMode == 2 then
+		_mPos:SetUnpacked(c1, -c2, c3)
+		return
+	end
+
 	local F, R, U = oa:Forward(), oa:Right(), oa:Up()
 	local FL, RL, UL = _mAng:Forward(), _mAng:Right(), _mAng:Up()
 	local cx, cy, cz = op:Dot(F), op:Dot(R), op:Dot(U)

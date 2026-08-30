@@ -94,83 +94,134 @@ local ALL_ACTIONS = {
 }
 
 -- Oculus Touch / Meta Quest controllers
-local OCULUS_TOUCH = {
-    profile = "/interaction_profiles/oculus/touch_controller",
-    bindings = {
-        pose_lefthand              = "/user/hand/left/input/grip/pose",
-        pose_righthand             = "/user/hand/right/input/grip/pose",
+-- Mirrors the saved SteamVR/OpenXR Touch action manifest. Path fragments are
+-- hoisted so every shared physical input is written once -- five actions ride
+-- the right trigger, three the left stick click -- which makes the overlaps
+-- visible instead of hiding them in 30+ near-identical string literals.
+local OCULUS_TOUCH
+do
+    local L, R   = "/user/hand/left/input/", "/user/hand/right/input/"
+    local LT, RT = L .. "trigger/value", R .. "trigger/value"
+    local LG, RG = L .. "squeeze/value", R .. "squeeze/value"
+    local LJ, RJ = L .. "thumbstick", R .. "thumbstick"
+    local LJC = LJ .. "/click"
 
-        boolean_primaryfire        = "/user/hand/right/input/trigger/value",
-        vector1_primaryfire        = "/user/hand/right/input/trigger",
-        boolean_secondaryfire      = "/user/hand/left/input/trigger/value",
-        vector1_secondaryfire      = "/user/hand/left/input/trigger",
+    OCULUS_TOUCH = {
+        profile = "/interaction_profiles/oculus/touch_controller",
+        bindings = {
+            pose_lefthand              = L .. "grip/pose",
+            pose_righthand             = R .. "grip/pose",
 
-        -- Vehicle throttle: right trigger = forward/accelerate, left trigger = reverse/brake
-        vector1_forward            = "/user/hand/right/input/trigger",
-        vector1_reverse            = "/user/hand/left/input/trigger",
+            -- Right trigger: primary fire + vehicle throttle
+            boolean_primaryfire        = RT,
+            boolean_right_fire         = RT,
+            vector1_primaryfire        = RT,
+            vector1_forward            = RT,
+            trigger_right_axis         = RT,
 
-        boolean_left_pickup        = "/user/hand/left/input/squeeze/value",
-        boolean_right_pickup       = "/user/hand/right/input/squeeze/value",
-        vector1_left_squeeze       = "/user/hand/left/input/squeeze/value",
-        vector1_right_squeeze      = "/user/hand/right/input/squeeze/value",
+            -- Left trigger: secondary fire + vehicle reverse/brake
+            boolean_secondaryfire      = LT,
+            boolean_left_fire          = LT,
+            vector1_secondaryfire      = LT,
+            vector1_reverse            = LT,
+            trigger_left_axis          = LT,
 
-        boolean_use                = "/user/hand/left/input/x/click",
-        boolean_spawnmenu          = "/user/hand/left/input/y/click",
-        lweaponmenu                = "/user/hand/left/input/y/touch",
-        boolean_jump               = "/user/hand/right/input/a/click",
-        boolean_crouch             = "/user/hand/right/input/b/click",
+            -- Grips: pickup on both hands, +use on the right
+            boolean_left_pickup        = LG,
+            vector1_left_squeeze       = LG,
+            boolean_right_pickup       = RG,
+            vector1_right_squeeze      = RG,
+            boolean_use                = RG,
 
-        vector2_walkdirection      = "/user/hand/left/input/thumbstick",
-        vector2_smoothturn         = "/user/hand/right/input/thumbstick",
-        boolean_sprint             = "/user/hand/left/input/thumbstick/click",
-        boolean_changeweapon       = "/user/hand/right/input/thumbstick/click",
-        boolean_left_thumb_touch   = "/user/hand/left/input/thumbstick/touch",
-        boolean_right_thumb_touch  = "/user/hand/right/input/thumbstick/touch",
+            -- Face buttons
+            boolean_spawnmenu          = L .. "x/click",
+            boolean_flashlight         = L .. "y/click",
+            boolean_jump               = R .. "a/click",
+            boolean_reload             = R .. "b/click",
 
-        vibration_left             = "/user/hand/left/output/haptic",
-        vibration_right            = "/user/hand/right/output/haptic",
-    },
-}
+            -- Sticks
+            vector2_walkdirection      = LJ,
+            vector2_steer              = LJ,
+            analog_left                = LJ,
+            vector2_smoothturn         = RJ,
+            boolean_walk               = LJC,
+            boolean_sprint             = LJC,
+            boolean_handbrake          = LJC,
+            boolean_changeweapon       = RJ .. "/click",
+            boolean_left_thumb_touch   = LJ .. "/touch",
+            boolean_right_thumb_touch  = RJ .. "/touch",
 
--- Valve Index Controllers
-local VALVE_INDEX = {
-    profile = "/interaction_profiles/valve/index_controller",
-    bindings = {
-        pose_lefthand              = "/user/hand/left/input/grip/pose",
-        pose_righthand             = "/user/hand/right/input/grip/pose",
+            -- Haptics: absent from the manifest, required by the module
+            vibration_left             = "/user/hand/left/output/haptic",
+            vibration_right            = "/user/hand/right/output/haptic",
+        },
+    }
+end
 
-        boolean_primaryfire        = "/user/hand/right/input/trigger/click",
-        vector1_primaryfire        = "/user/hand/right/input/trigger/value",
-        boolean_secondaryfire      = "/user/hand/left/input/trigger/click",
-        vector1_secondaryfire      = "/user/hand/left/input/trigger/value",
+-- Valve Index (Knuckles) Controllers
+-- Mirrors the saved SteamVR/OpenXR Knuckles action manifest. Same hoisting as
+-- the Touch block: shared physical inputs are written once, so the overlaps
+-- (five actions on the right trigger, two on each trackpad) stay visible.
+local VALVE_INDEX
+do
+    local L, R     = "/user/hand/left/input/", "/user/hand/right/input/"
+    local LT, RT   = L .. "trigger/value", R .. "trigger/value"
+    local LTC, RTC = L .. "trigger/click", R .. "trigger/click"
+    local LJ, RJ   = L .. "thumbstick", R .. "thumbstick"
 
-        -- Vehicle throttle: right trigger = forward/accelerate, left trigger = reverse/brake
-        vector1_forward            = "/user/hand/right/input/trigger/value",
-        vector1_reverse            = "/user/hand/left/input/trigger/value",
+    VALVE_INDEX = {
+        profile = "/interaction_profiles/valve/index_controller",
+        bindings = {
+            pose_lefthand              = L .. "grip/pose",
+            pose_righthand             = R .. "grip/pose",
 
-        boolean_left_pickup        = "/user/hand/left/input/squeeze/force",
-        boolean_right_pickup       = "/user/hand/right/input/squeeze/force",
-        vector1_left_squeeze       = "/user/hand/left/input/squeeze/force",
-        vector1_right_squeeze      = "/user/hand/right/input/squeeze/force",
+            -- Right trigger: primary fire + vehicle throttle
+            boolean_primaryfire        = RTC,
+            boolean_right_fire         = RTC,
+            vector1_primaryfire        = RT,
+            vector1_forward            = RT,
+            trigger_right_axis         = RT,
 
-        boolean_use                = "/user/hand/left/input/a/click",
-        boolean_spawnmenu          = "/user/hand/left/input/b/click",
-        boolean_jump               = "/user/hand/right/input/a/click",
-        boolean_crouch             = "/user/hand/right/input/b/click",
+            -- Left trigger: secondary fire + vehicle reverse/brake
+            boolean_secondaryfire      = LTC,
+            boolean_left_fire          = LTC,
+            vector1_secondaryfire      = LT,
+            vector1_reverse            = LT,
+            trigger_left_axis          = LT,
 
-        vector2_walkdirection      = "/user/hand/left/input/thumbstick",
-        vector2_smoothturn         = "/user/hand/right/input/thumbstick",
-        boolean_sprint             = "/user/hand/left/input/thumbstick/click",
-        boolean_changeweapon       = "/user/hand/right/input/thumbstick/click",
-        boolean_left_thumb_touch   = "/user/hand/left/input/thumbstick/touch",
-        boolean_right_thumb_touch  = "/user/hand/right/input/thumbstick/touch",
+            -- Grips: force sensor clicks pickup, capacitive axis drives squeeze
+            boolean_left_pickup        = L .. "squeeze/force",
+            boolean_right_pickup       = R .. "squeeze/force",
+            vector1_left_squeeze       = L .. "squeeze/value",
+            vector1_right_squeeze      = R .. "squeeze/value",
 
-        lweaponmenu                = "/user/hand/left/input/b/touch",
+            -- Face buttons
+            boolean_use                = L .. "a/click",
+            boolean_spawnmenu          = L .. "b/click",
+            boolean_crouch             = R .. "a/click",
+            boolean_jump               = R .. "b/click",
 
-        vibration_left             = "/user/hand/left/output/haptic",
-        vibration_right            = "/user/hand/right/output/haptic",
-    },
-}
+            -- Trackpads
+            boolean_reload             = L .. "trackpad/click",
+            lweaponmenu                = R .. "trackpad/click",
+
+            -- Sticks
+            vector2_walkdirection      = LJ,
+            vector2_steer              = LJ,
+            analog_left                = LJ,
+            vector2_smoothturn         = RJ,
+            analog_right               = RJ,
+            boolean_sprint             = LJ .. "/click",
+            boolean_flashlight         = RJ .. "/click",
+            boolean_left_thumb_touch   = LJ .. "/touch",
+            boolean_right_thumb_touch  = RJ .. "/touch",
+
+            -- Haptics: absent from the manifest, required by the module
+            vibration_left             = "/user/hand/left/output/haptic",
+            vibration_right            = "/user/hand/right/output/haptic",
+        },
+    }
+end
 
 -- HTCX Vive Tracker (FBT) — pose-only, no buttons
 local VIVE_TRACKER_HTCX = {
@@ -195,12 +246,21 @@ function vrmod.SetupXRActions()
     -- Merge user binding overrides from the XR bindings editor
     local allOverrides = vrmod.LoadAllBindingOverrides and vrmod.LoadAllBindingOverrides() or {}
     for _, prof in ipairs(profiles) do
-        local bindings = prof.bindings
-        local ov = allOverrides[prof.profile]
+        local bindings, ov = prof.bindings, allOverrides[prof.profile]
         if ov then
             bindings = {}
-            for k, v in pairs(prof.bindings) do bindings[k] = ov[k] or v end
-            for k, v in pairs(ov) do if not bindings[k] and v ~= "" then bindings[k] = v end end
+            -- A binding cleared to "(unbound)" in the editor is saved as "",
+            -- which is truthy in Lua: `ov[k] or v` let it win over the default
+            -- instead of falling back to it. That matters more than one dead
+            -- action, because an empty path fails xrSuggestInteractionProfileBindings
+            -- for the ENTIRE profile -- every binding in the call dies with it.
+            for k, v in pairs(prof.bindings) do
+                local o = ov[k]
+                bindings[k] = (o and o ~= "") and o or v
+            end
+            for k, v in pairs(ov) do
+                if v ~= "" and not bindings[k] then bindings[k] = v end
+            end
         end
         VRMOD_SuggestBindings(prof.profile, bindings)
     end

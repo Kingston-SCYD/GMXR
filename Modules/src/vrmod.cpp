@@ -35,6 +35,13 @@
 #define XRMOD_MODULE_VERSION 1
 
 #define MAX_STR_LEN     256
+// Ceiling on per-eye texture height, applied proportionally so pixels stay
+// square. This is a working resolution dial now that both the reported dims and
+// the swapchain come from the same resolver -- lower it to trade sharpness for
+// frame time. 4096 is a sanity bound, not a limit any current headset reaches:
+// Quest 3 recommends 2064x2208, and the old 1920 here was a Quest 2 panel
+// figure that silently downscaled everything taller.
+#define MAX_EYE_HEIGHT  4096
 #define MAX_ACTIONS     64
 #define MAX_ACTIONSETS  16
 #define PI            3.141592653589793116
@@ -58,6 +65,7 @@ typedef struct action {
 	XrActionType type;
 	class VMatrix* poseMatrix = nullptr; // pose actions: cached pointer into the Matrix userdata held by luaRefs[1]
 	bool poseLinked = false;             // pose table has been assigned into the parent pose table
+	int boundSources = -1;               // haptics: devices the runtime bound this action to (-1 = not yet queried)
 } action;
 
 typedef struct actionSet {
@@ -131,6 +139,10 @@ int                     g_luaRefs[LuaRefIndex_Max];
 int                     g_luaRefCount = 0;
 
 char                    g_createTextureOrigBytes[14];
+char                    g_createTexturePatchBytes[14];  // built once in ShareTextureBegin, reused to re-arm
+bool                    g_createTexturePatched = false;
+uint32_t                g_createTextureSkips = 0;       // non-matching textures seen while armed
+#define                 MAX_CREATETEXTURE_SKIPS 256
 bool                    g_hasTrackerExtension = false;
 
 // XR_EXT_hand_tracking
@@ -157,16 +169,61 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 	bool                    g_eventQueryIssued = false;
 
 	typedef void*           (*CreateInterfaceFn)(const char* pName, int* pReturnCode);
-	HRESULT APIENTRY CreateTextureHook(IDirect3DDevice9* pDevice, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9** tex, HANDLE* shared_handle) {
-		if (WriteProcessMemory(GetCurrentProcess(), (LPVOID)g_createTexture, g_createTextureOrigBytes, 14, NULL) == 0)
-			MessageBoxA(NULL, "WriteProcessMemory from hook failed", "", 0);
 
-		if (g_sharedTexture == NULL) {
+	// The 14-byte patch over IDirect3DDevice9::CreateTexture is armed by
+	// ShareTextureBegin and must be disarmed the instant we stop wanting a
+	// texture. While armed, a matching call gets D3DPOOL_DEFAULT and our shared
+	// handle forced onto it -- so a startup that aborts before the VR render
+	// target exists would otherwise leave the engine's texture allocator
+	// hijacked and corrupt whatever it creates next.
+	bool WriteCreateTextureBytes(const char* bytes) {
+		return g_createTexture != NULL && WriteProcessMemory(GetCurrentProcess(), (LPVOID)g_createTexture, (LPCVOID)bytes, 14, NULL) != 0;
+	}
+
+	void ArmCreateTextureHook() {
+		if (g_createTexturePatched)
+			return;
+		g_createTexturePatched = WriteCreateTextureBytes(g_createTexturePatchBytes);
+	}
+
+	void UnpatchCreateTexture() {
+		if (!g_createTexturePatched)
+			return;
+		WriteCreateTextureBytes(g_createTextureOrigBytes);
+		g_createTexturePatched = false;
+	}
+
+	HRESULT APIENTRY CreateTextureHook(IDirect3DDevice9* pDevice, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9** tex, HANDLE* shared_handle) {
+		// Always restore first: the real call has to run unhooked.
+		if (!WriteCreateTextureBytes(g_createTextureOrigBytes))
+			MessageBoxA(NULL, "WriteProcessMemory from hook failed", "", 0);
+		g_createTexturePatched = false;
+
+		// Only the VR render target may be captured. The old code took whatever
+		// texture came first, so a VGUI font page, an icon or a menu material
+		// created between ShareTextureBegin and GetRenderTargetEx got the shared
+		// handle instead -- then the first submit copied from a 64x64 icon into a
+		// full-size swapchain image. Ours is a render target at least one eye
+		// wide and, being three stacked frame bands, well over one eye tall.
+		bool wanted = g_sharedTexture == NULL
+			&& (usage & D3DUSAGE_RENDERTARGET) != 0
+			&& w >= g_TextureWidth
+			&& h >= g_TextureHeight * 2;
+
+		if (wanted) {
 			shared_handle = &g_sharedTexture;
 			pool = D3DPOOL_DEFAULT;
 		}
 
-		return g_createTexture(pDevice, w, h, levels, usage, format, pool, tex, shared_handle);
+		HRESULT hr = g_createTexture(pDevice, w, h, levels, usage, format, pool, tex, shared_handle);
+
+		// Not ours: keep waiting, but never forever. The render target is created
+		// on the very next call in practice, so hitting the cap means startup
+		// died in between -- self-disarm rather than tax every allocation.
+		if (!wanted && ++g_createTextureSkips < MAX_CREATETEXTURE_SKIPS)
+			ArmCreateTextureHook();
+
+		return hr;
 	};
 
 #else
@@ -194,10 +251,37 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 	GLuint                  g_sharedTexture = GL_INVALID_VALUE;
 	COpenGLEntryPoints*     g_GL = NULL;
 
+	bool WriteCreateTextureBytes(const char* bytes) {
+		if (g_createTexture == NULL)
+			return false;
+		memcpy((void*)g_createTexture, (const void*)bytes, 14);
+		return true;
+	}
+
+	void ArmCreateTextureHook() {
+		if (g_createTexturePatched)
+			return;
+		g_createTexturePatched = WriteCreateTextureBytes(g_createTexturePatchBytes);
+	}
+
+	void UnpatchCreateTexture() {
+		if (!g_createTexturePatched)
+			return;
+		WriteCreateTextureBytes(g_createTextureOrigBytes);
+		g_createTexturePatched = false;
+	}
+
+	// glGenTextures carries no usage or dimensions, so the D3D path's filter has
+	// nothing to test here -- first capture wins, as before. Guarding on
+	// GL_INVALID_VALUE at least stops a second call clobbering a good capture.
 	void CreateTextureHook(GLsizei n, GLuint *textures) {
-		memcpy((void*)g_createTexture, (void*)g_createTextureOrigBytes, 14);
+		WriteCreateTextureBytes(g_createTextureOrigBytes);
+		g_createTexturePatched = false;
+
 		((glGenTextures_t)g_createTexture)(n, textures);
-		g_sharedTexture = textures[0];
+
+		if (g_sharedTexture == GL_INVALID_VALUE)
+			g_sharedTexture = textures[0];
 
 		return;
 	}
@@ -223,8 +307,9 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 #endif
 
 XrPath CreateXrPath(const char* pathString) {
-	XrPath path;
-	xrStringToPath(g_Instance,pathString,&path);
+	XrPath path = XR_NULL_PATH;
+	if(XR_FAILED(xrStringToPath(g_Instance,pathString,&path)))
+		return XR_NULL_PATH;
 	return path;
 }
 
@@ -505,6 +590,9 @@ void DestroyInstance() {
 }
 
 void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
+	// Never leave the engine's texture allocator hooked across a session teardown.
+	UnpatchCreateTexture();
+
 	// Destroy hand trackers before session
 	for(int i = 0; i < 2; i++)
 	{
@@ -583,6 +671,7 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 
 		act->poseMatrix = nullptr;
 		act->poseLinked = false;
+		act->boundSources = -1;
 	}
 	g_actionCount = 0;
 
@@ -1137,9 +1226,20 @@ LUA_FUNCTION(SuggestBindings) {
 				continue;
 			}
 
+			const char* pathString = LUA->GetString(-1);
+			XrPath bindingPath = CreateXrPath(pathString);
+			if(bindingPath == XR_NULL_PATH)
+			{
+				char str[MAX_STR_LEN];
+				snprintf(str, MAX_STR_LEN, "XRMod: Skipping '%s': invalid binding path '%s'", LUA->GetString(-2), pathString);
+				PrintConsoleText(str, LUA);
+				LUA->Pop();
+				continue;
+			}
+
 			XrActionSuggestedBinding binding;
 			binding.action = act->handle;
-			binding.binding = CreateXrPath(LUA->GetString(-1));
+			binding.binding = bindingPath;
 			bindings.push_back(binding);
 
 			suggestedBindings.countSuggestedBindings++;
@@ -1151,7 +1251,14 @@ LUA_FUNCTION(SuggestBindings) {
 
 	XrResult result = xrSuggestInteractionProfileBindings(g_Instance,&suggestedBindings);
 	if(XR_FAILED(result))
-		PrintConsoleText(GetResultString("XRMod: Failed to suggest interaction profile bindings (%s)",result),LUA);
+	{
+		// Names the profile and the count, because this call is all-or-nothing:
+		// when it fails, every binding listed here is dead, not just one.
+		char str[MAX_STR_LEN];
+		snprintf(str, MAX_STR_LEN, "XRMod: Failed to suggest %d bindings for %s", (int) suggestedBindings.countSuggestedBindings, LUA->GetString(-2));
+		PrintConsoleText(str, LUA);
+		PrintConsoleText(GetResultString("XRMod: (%s)",result),LUA);
+	}
 
 	return 0;
 }
@@ -1374,21 +1481,62 @@ void ComposeTransform(XrPosef pose, VMatrix *mtx)
 	mtx->m[3][3] = 1;
 }
 
+// Single source of truth for the per-eye texture dimensions.
+//
+// GetDisplayInfo and ShareTextureBegin used to derive these independently, and
+// only ShareTextureBegin applied the height cap. Lua sizes its render target
+// from GetDisplayInfo's RecommendedWidth/Height, so on any headset recommending
+// more than the cap the render target was TALLER than the swapchain, the
+// composition layer imageRect and every CopySubresourceRegion -- the top
+// g_TextureHeight rows of each band got stretched across the eye's full FOV.
+// That is the "wrong resolution" distortion. Resolve once, in one place, and
+// report the same numbers to everyone.
+//
+// scalePercent: 100 (or <= 0) for native. Values are frozen once the swapchain
+// exists, since its extents and the copy boxes are already sized from them.
+void ResolveTextureDims(GarrysMod::Lua::ILuaBase *LUA, int scalePercent) {
+	if(g_Swapchain != XR_NULL_HANDLE)
+		return;
+
+	std::vector<XrViewConfigurationView> viewConfigs(2, {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr});
+	uint32_t viewCount = 2;
+	if(XR_FAILED(xrEnumerateViewConfigurationViews(g_Instance,g_SystemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,viewCount,&viewCount,viewConfigs.data())) || viewCount < 2)
+		return;
+
+	uint32_t recW = viewConfigs[0].recommendedImageRectWidth;
+	uint32_t recH = viewConfigs[0].recommendedImageRectHeight;
+	uint32_t w = recW, h = recH;
+
+	// Cap proportionally: shrinking height alone would leave non-square pixels
+	// for no reason (the projection comes from the FOV, not the texture).
+	if(h > MAX_EYE_HEIGHT) {
+		w = (uint32_t)(((uint64_t)w * MAX_EYE_HEIGHT) / h);
+		h = MAX_EYE_HEIGHT;
+	}
+
+	if(scalePercent > 0 && scalePercent != 100) {
+		w = (w * scalePercent) / 100;
+		h = (h * scalePercent) / 100;
+	}
+
+	// Even dimensions keep the stereo half-split exact.
+	g_TextureWidth = w & ~1u;
+	g_TextureHeight = h & ~1u;
+	g_ScaledWidth = g_TextureWidth;
+	g_ScaledHeight = g_TextureHeight;
+
+	if(g_TextureWidth != recW || g_TextureHeight != recH) {
+		char str[MAX_STR_LEN];
+		snprintf(str, MAX_STR_LEN, "XRMod: per-eye texture %ux%u (runtime recommended %ux%u)", g_TextureWidth, g_TextureHeight, recW, recH);
+		PrintConsoleText(str, LUA);
+	}
+}
+
 // Done
 LUA_FUNCTION(GetRecommendedDims) {
-	std::vector<XrViewConfigurationView> viewConfigs;
-	viewConfigs.resize(2);
-	viewConfigs[0] = {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr};
-	viewConfigs[1] = {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr};
-	uint32_t viewCount = 2;
-	XrResult result = xrEnumerateViewConfigurationViews(g_Instance,g_SystemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,viewCount,&viewCount,viewConfigs.data());
-	if(XR_FAILED(result) || viewCount < 2) {
-		LUA->PushNumber(0);
-		LUA->PushNumber(0);
-		return 2;
-	}
-	LUA->PushNumber(viewConfigs[0].recommendedImageRectWidth);
-	LUA->PushNumber(viewConfigs[0].recommendedImageRectHeight);
+	ResolveTextureDims(LUA, 100);
+	LUA->PushNumber(g_TextureWidth);
+	LUA->PushNumber(g_TextureHeight);
 	return 2;
 }
 
@@ -1408,8 +1556,9 @@ LUA_FUNCTION(GetDisplayInfo) {
 	if(viewCount != 2 /*|| viewConfigs[0].recommendedImageRectWidth != viewConfigs[1].recommendedImageRectWidth || viewConfigs[0].recommendedImageRectHeight != viewConfigs[1].recommendedImageRectHeight*/)
 		LUA->ThrowError("XRMod Error: View count is not 2");
 
-	// Only set dims if swapchain hasnt been created yet
-	if (g_ScaledWidth == 0) { g_TextureWidth = viewConfigs[0].recommendedImageRectWidth; g_TextureHeight = viewConfigs[0].recommendedImageRectHeight; g_ScaledWidth = g_TextureWidth; g_ScaledHeight = g_TextureHeight; }
+	// Same resolved dims ShareTextureBegin and the swapchain use; a no-op once
+	// the swapchain exists, so the per-frame calls can't reset a render scale.
+	ResolveTextureDims(LUA, 100);
 
 	float fNearZ = LUA->IsType(1, GarrysMod::Lua::Type::NUMBER) ? (float)LUA->GetNumber(1) : 0.01f;
 	float fFarZ = LUA->IsType(2, GarrysMod::Lua::Type::NUMBER) ? (float)LUA->GetNumber(2) : 10000.0f;
@@ -1761,6 +1910,14 @@ LUA_FUNCTION(GetActions) {
 
 // Done
 LUA_FUNCTION(ShareTextureBegin) {
+	// A previous attempt may have died with the hook still armed; restore before
+	// reading the original bytes back, or we would save the patch as "original".
+	UnpatchCreateTexture();
+	g_createTextureSkips = 0;
+
+	if (g_createTexture == NULL)
+		LUA->ThrowError("XRMod Error: CreateTexture address is null (Init did not complete)");
+
 	char patch[] = "\x68\x0\x0\x0\x0\xC3\x44\x24\x04\x0\x0\x0\x0\xC3";
 	*(uint32_t*)(patch + 1) = (uint32_t)((uintptr_t)CreateTextureHook);
 
@@ -1769,12 +1926,11 @@ LUA_FUNCTION(ShareTextureBegin) {
 		*(uint32_t*)(patch + 9) = (uint32_t)((uintptr_t)CreateTextureHook >> 32);
 	#endif
 
+	memcpy(g_createTexturePatchBytes, patch, 14);
+
 	#ifdef _WIN32
 		if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID)g_createTexture, g_createTextureOrigBytes, 14, NULL) == 0)
 			LUA->ThrowError("XRMod Error: ReadProcessMemory failed");
-
-		if (WriteProcessMemory(GetCurrentProcess(), (LPVOID)g_createTexture, patch, 14, NULL) == 0)
-			LUA->ThrowError("XRMod Error: WriteProcessMemory failed");
 	#else
 		uintptr_t alignedAddr = (uintptr_t)g_createTexture & ~(getpagesize()-1);
 
@@ -1782,45 +1938,33 @@ LUA_FUNCTION(ShareTextureBegin) {
 			LUA->ThrowError("XRMod Error: mprotect fail");
 
 		memcpy((void*)g_createTextureOrigBytes, (void*)g_createTexture, 14);
-		memcpy((void*)g_createTexture, (void*)patch, 14);
 	#endif
 
+	// Same resolver GetDisplayInfo uses, so the dimensions Lua sized its render
+	// target from are exactly the ones the swapchain and the copies use.
+	ResolveTextureDims(LUA, LUA->IsType(1, GarrysMod::Lua::Type::NUMBER) ? (int)LUA->GetNumber(1) : 100);
+	LUA->PushNumber(g_TextureWidth);
+	LUA->PushNumber(g_TextureHeight);
 
-	// Query recommended per-eye dimensions from the runtime
-	{
-		std::vector<XrViewConfigurationView> viewConfigs(2);
-		viewConfigs[0] = {XR_TYPE_VIEW_CONFIGURATION_VIEW, nullptr};
-		viewConfigs[1] = {XR_TYPE_VIEW_CONFIGURATION_VIEW, nullptr};
-		uint32_t viewCount = 2;
-		XrResult vr = xrEnumerateViewConfigurationViews(g_Instance, g_SystemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, viewConfigs.data());
-		if (XR_SUCCEEDED(vr) && viewCount >= 2) {
-			g_TextureWidth = viewConfigs[0].recommendedImageRectWidth;
-			g_TextureHeight = viewConfigs[0].recommendedImageRectHeight;
-			if (g_TextureHeight > 1920) g_TextureHeight = 1920; // Quest 2 native display limit
-			g_ScaledWidth = g_TextureWidth;
-			g_ScaledHeight = g_TextureHeight;
-			// Apply scale percentage if arg provided (100 = native)
-			if (LUA->IsType(1, GarrysMod::Lua::Type::NUMBER)) {
-				int scale = (int)LUA->GetNumber(1);
-				if (scale != 100 && scale > 0) {
-					g_TextureWidth = (g_TextureWidth * scale) / 100;
-					g_TextureHeight = (g_TextureHeight * scale) / 100;
-					g_ScaledWidth = g_TextureWidth;
-					g_ScaledHeight = g_TextureHeight;
-				}
-			}
-		}
-		LUA->PushNumber(g_TextureWidth);
-		LUA->PushNumber(g_TextureHeight);
-	}
+	// Armed last: the hook's size filter reads the per-eye dims resolved above,
+	// and nothing between here and the caller's GetRenderTargetEx creates a
+	// texture, so the render target is still the first candidate it sees.
+	ArmCreateTextureHook();
+	if (!g_createTexturePatched)
+		LUA->ThrowError("XRMod Error: Failed to arm CreateTexture hook");
+
 	return 2;
 }
 
 // TODO
 LUA_FUNCTION(ShareTextureFinish) {
+	// The render target exists by now, so any still-armed hook is stale whether
+	// it fired or not -- and every path below can throw.
+	UnpatchCreateTexture();
+
 	#ifdef _WIN32
 		if (g_sharedTexture == NULL)
-			LUA->ThrowError("XRMod Error: g_sharedTexture is null");
+			LUA->ThrowError("XRMod Error: g_sharedTexture is null (render target was not captured)");
 
 		ID3D11Resource* res;
 		if (FAILED(g_d3d11Device->OpenSharedResource(g_sharedTexture, __uuidof(ID3D11Resource), (void**)&res)))
@@ -2334,32 +2478,76 @@ LUA_FUNCTION(Shutdown) {
 }
 
 // Done
+// VRMOD_TriggerHaptic(actionName, delay, durationMs, frequency, amplitude)
+// Returns: bool success, string result, number boundSources
+//
+// Arg 2 (delay) has no XrHapticVibration equivalent -- vibration always starts
+// immediately -- but stays in the signature so existing call sites don't move.
 LUA_FUNCTION(TriggerHaptic) {
-	if(g_Session == XR_NULL_HANDLE)
-		return 0;
-		//LUA->ThrowError("XRMod Error: Session is invalid");
-
 	const char* actionName = LUA->CheckString(1);
+	double ms   = LUA->CheckNumber(3);
+	double freq = LUA->CheckNumber(4);
+	double amp  = LUA->CheckNumber(5);
 
-	for (int i = 0; i < g_actionCount; i++) {
-		if (strcmp(g_actions[i].name, actionName) == 0) {
-			// Currently unused
-			//float _delay = (float)LUA->CheckNumber(2);
-
-			XrHapticActionInfo actionInfo{XR_TYPE_HAPTIC_ACTION_INFO,nullptr};
-			actionInfo.action = g_actions[i].handle;
-
-			XrHapticVibration feedback{XR_TYPE_HAPTIC_VIBRATION,nullptr};
-			feedback.duration = (XrDuration)LUA->CheckNumber(3)*1000000; // Convert to nanoseconds
-			feedback.frequency = (float)LUA->CheckNumber(4);
-			feedback.amplitude = (float)LUA->CheckNumber(5);
-
-			xrApplyHapticFeedback(g_Session,&actionInfo,(const XrHapticBaseHeader *)&feedback);
-			break;
-		}
+	if(g_Session == XR_NULL_HANDLE)
+	{
+		LUA->PushBool(false);
+		LUA->PushString("no session");
+		LUA->PushNumber(-1);
+		return 3;
 	}
 
-	return 0;
+	action* act = GetActionFromName(actionName);
+	if(act == nullptr)
+	{
+		LUA->PushBool(false);
+		LUA->PushString("no such action");
+		LUA->PushNumber(-1);
+		return 3;
+	}
+
+	if(act->type != XR_ACTION_TYPE_VIBRATION_OUTPUT)
+	{
+		LUA->PushBool(false);
+		LUA->PushString("action is not a vibration output");
+		LUA->PushNumber(-1);
+		return 3;
+	}
+
+	// Reported, never enforced. A runtime that doesn't enumerate sources for
+	// vibration outputs looks identical to one that bound nothing, so gating
+	// the pulse on this would turn a reporting gap into silence. Cached once
+	// non-zero so the steady state costs nothing; -1 means the query failed.
+	if(act->boundSources <= 0)
+	{
+		XrBoundSourcesForActionEnumerateInfo enumInfo{XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO,nullptr};
+		enumInfo.action = act->handle;
+
+		uint32_t count = 0;
+		if(XR_SUCCEEDED(xrEnumerateBoundSourcesForAction(g_Session,&enumInfo,0,&count,nullptr)))
+			act->boundSources = (int) count;
+	}
+
+	XrHapticActionInfo actionInfo{XR_TYPE_HAPTIC_ACTION_INFO,nullptr};
+	actionInfo.action = act->handle;
+
+	XrHapticVibration feedback{XR_TYPE_HAPTIC_VIBRATION,nullptr};
+	// Milliseconds in, nanoseconds out. Non-positive falls back to the runtime's
+	// shortest pulse: a negative XrDuration is invalid and gets the whole call
+	// rejected. Capped so a bad caller can't queue a buzz that outlives the map.
+	if(ms > 5000.0) ms = 5000.0;
+	feedback.duration  = ms > 0.0 ? (XrDuration)(ms * 1000000.0) : XR_MIN_HAPTIC_DURATION;
+	// 0 = XR_FREQUENCY_UNSPECIFIED, letting the runtime pick. Quest ignores
+	// frequency entirely; Index uses it.
+	feedback.frequency = freq > 0.0 ? (float) freq : XR_FREQUENCY_UNSPECIFIED;
+	feedback.amplitude = (float)(amp < 0.0 ? 0.0 : (amp > 1.0 ? 1.0 : amp));
+
+	XrResult result = xrApplyHapticFeedback(g_Session,&actionInfo,(const XrHapticBaseHeader *)&feedback);
+
+	LUA->PushBool(XR_SUCCEEDED(result));
+	LUA->PushString(GetResultString("%s",result));
+	LUA->PushNumber(act->boundSources);
+	return 3;
 }
 
 LUA_FUNCTION(GetTrackedDeviceNames) {

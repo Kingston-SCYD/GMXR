@@ -177,6 +177,14 @@ if CLIENT then
 		local predictT = cv_handpredict:GetFloat()
 		local maxPosDeltaSqr = 100
 		local maxPosDelta = 10
+		-- Drain the external tracker socket first. The module refreshes those
+		-- poses in place and links them into the same table GetPoses returns,
+		-- so polling here rather than from a hook after the loop keeps SlimeVR
+		-- and VMC trackers on the same time base as everything else. nil unless
+		-- sh_trackers.lua has the receiver up, so this is one test per frame
+		-- when it is off.
+		local pollTrackers = g_VR.pollExternalTrackers
+		if pollTrackers then pollTrackers() end
 		local ok, rawPoses = pcall(VRMOD_GetPoses)
 		if not ok or not rawPoses then return end
 		for k, v in pairs(rawPoses) do
@@ -261,7 +269,12 @@ local currentAng = v.ang
 				worldPose.pos, worldPose.ang = LocalToWorld(off, HAND_OFF_ANG, worldPose.pos, worldPose.ang)
 			end
 		end
-		g_VR.sixPoints = g_VR.tracking.pose_waist and g_VR.tracking.pose_leftfoot and g_VR.tracking.pose_rightfoot
+		-- Any three FBT-eligible trackers count, whatever their source: a
+		-- SlimeVR rig arrives as pose_osc_* and has none of the HTCX role keys.
+		-- The literal check stays as the fallback for when sh_trackers.lua is
+		-- absent, and keeps its original truthy-value semantics.
+		g_VR.sixPoints = (g_VR.fbtTrackerCount or 0) >= 3
+			or (g_VR.tracking.pose_waist and g_VR.tracking.pose_leftfoot and g_VR.tracking.pose_rightfoot)
 		hook_Call("VRMod_Tracking")
 		local ox = g_VR.origin.x
 		if ox ~= ox then

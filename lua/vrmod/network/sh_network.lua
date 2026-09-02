@@ -371,6 +371,96 @@ local function netReadDeltaFrame(baseFrame)
 	return frame
 end
 
+
+-- =============================================================================
+-- OBJECT TRACKER SYNC
+-- Trackers set to the "object" role in Client > Trackers, addressed by label.
+--
+-- Separate from the frame codec on purpose. The delta mask is a full 6 bits,
+-- ConvertToRelativeFrame keeps only the spatial fields it knows by name,
+-- FramesAreEqual decides whether a frame is sent at all, and LerpFrameInto has
+-- a fixed six-part pool -- an object tracker fits none of that. Two additive
+-- messages instead, which cost nothing at all when no tracker has the role.
+--
+-- Positions travel relative to ply:GetPos(), matching the frame codec; angles
+-- are world. Stored as posRel to keep that visible at the call site. Read
+-- through vrmod.GetPlayerTrackerPose, which does the addition.
+--
+-- Entity-attached objects should ride their entity, not this: the server moves
+-- the entity and the engine replicates and interpolates it for free. This path
+-- exists so the server can drive that entity, and so addons and debug overlays
+-- can see a remote player's raw tracker.
+-- =============================================================================
+local MAX_OBJ_TRACKERS      = 8
+local MAX_OBJ_LABEL         = 24
+local TRK_KEYFRAME_INTERVAL = 30
+
+local TRK_BIT = {}
+for i = 1, MAX_OBJ_TRACKERS do TRK_BIT[i] = 2 ^ (i - 1) end
+
+--- Reads a tracker tick into store, keyed by label. Every set bit is consumed
+--- whether or not its label is known: bailing early would desync the stream for
+--- the fields after it.
+local function netReadTrackerTick(labels, store)
+	local mask = net_ReadUInt(MAX_OBJ_TRACKERS)
+	for i = 1, MAX_OBJ_TRACKERS do
+		if band(mask, TRK_BIT[i]) ~= 0 then
+			local px, py, pz = net_ReadFloat(), net_ReadFloat(), net_ReadFloat()
+			local ap, ay, ar = net_ReadFloat(), net_ReadFloat(), net_ReadFloat()
+			local label = labels and labels[i]
+			if label then
+				local t = store[label]
+				if t then
+					t.posRel:SetUnpacked(px, py, pz)
+					t.ang:SetUnpacked(ap, ay, ar)
+				else
+					store[label] = { posRel = Vector(px, py, pz), ang = Angle(ap, ay, ar) }
+				end
+			end
+		end
+	end
+	return mask
+end
+
+local function netWriteTrackerLabels(labels)
+	local n = #labels
+	if n > MAX_OBJ_TRACKERS then n = MAX_OBJ_TRACKERS end
+	net_WriteUInt(n, 4)
+	for i = 1, n do net.WriteString(labels[i]) end
+end
+
+local function netReadTrackerLabels()
+	local n = net_ReadUInt(4)
+	local labels = {}
+	for i = 1, n do labels[i] = net.ReadString() end
+	return labels
+end
+
+--- World pos, ang for a labelled object tracker on any player. LocalPlayer
+--- reads its own trackers straight from the registry -- full rate, no network
+--- round trip, no interpolation delay.
+function vrmod.GetPlayerTrackerPose(ply, label)
+	if not IsValid(ply) or not label then return end
+	if CLIENT and ply == LocalPlayer() and vrmod.GetTrackerPose then
+		return vrmod.GetTrackerPose(label)
+	end
+	local data = CLIENT and (g_VR.net and g_VR.net[ply:SteamID()])
+		or (SERVER and g_VR[ply:SteamID()])
+	local store = data and data.trackers
+	local t = store and store[label]
+	if not t then return end
+	local p = ply:GetPos()
+	return Vector(t.posRel.x + p.x, t.posRel.y + p.y, t.posRel.z + p.z), t.ang
+end
+
+--- Labels a player currently has assigned to object trackers.
+function vrmod.GetPlayerTrackerLabels(ply)
+	if not IsValid(ply) then return end
+	local data = CLIENT and (g_VR.net and g_VR.net[ply:SteamID()])
+		or (SERVER and g_VR[ply:SteamID()])
+	return data and data.trackerLabels
+end
+
 if CLIENT then
 	vrmod.AddCallbackedConvar("vrmod_net_delay", nil, "0.1", nil, nil, nil, nil, tonumber, nil)
  
@@ -444,6 +534,143 @@ if CLIENT then
 		deltaTickCounter = (deltaTickCounter + 1) % KEYFRAME_INTERVAL
 	end
  
+	-- === OBJECT TRACKER SEND ===
+	-- The registry rebuilds its slot list twice a second, so rescanning for
+	-- object-role trackers any faster than that cannot see anything new. The
+	-- per-tick path only walks the cached array, which is empty for everyone
+	-- who has not labelled a tracker -- in that case nothing is sent at all.
+	local objList = {}          -- { { label =, pose = } }, sorted by label
+	local objLabels = {}        -- label strings, index-aligned with objList
+	local objBase = {}          -- last transmitted world pose per index
+	local objScan = {}          -- scratch for the rebuild
+	local objSeen = {}          -- label dedupe during the rebuild
+	local objCount = 0
+	local objTickCounter = 0
+	local objNextScan = 0
+	local objRegDirty = false
+
+	local function ByLabel(a, b) return a.label < b.label end
+
+	local function SendTrackerRegistration()
+		net.Start("vrmod_trackers_reg", true)
+		netWriteTrackerLabels(objLabels)
+		net.SendToServer()
+		objRegDirty = false
+		-- Indices just moved, so every baseline is meaningless. Force a keyframe.
+		objTickCounter = 0
+	end
+
+	local function ScanObjectTrackers()
+		if not vrmod.GetTrackers then return 0 end
+		local trackers = vrmod.GetTrackers()
+		local n = 0
+		for k in pairs(objSeen) do objSeen[k] = nil end
+		for i = 1, #trackers do
+			local s = trackers[i]
+			if s.role == "object" and s.label and s.label ~= ""
+			   and vrmod.IsTrackerLive(s) and n < MAX_OBJ_TRACKERS then
+				local label = string.sub(s.label, 1, MAX_OBJ_LABEL)
+				-- Two trackers sharing a label would sort nondeterministically
+				-- (table.sort is not stable), so the wire indices would swap
+				-- between scans and whatever is attached would jump between
+				-- them. The registry already collapses duplicate labels, so
+				-- the second one is unreachable anyway -- drop it here too.
+				if not objSeen[label] then
+					objSeen[label] = true
+					n = n + 1
+					local e = objScan[n]
+					if e then e.label, e.pose = label, s.pose
+					else objScan[n] = { label = label, pose = s.pose } end
+				end
+			end
+		end
+		if n > 1 then table.sort(objScan, ByLabel) end
+
+		-- Compare AFTER sorting. Comparing during the gather pass flags a
+		-- change whenever the registry hands the same set back in a different
+		-- hash order, which re-sends the registration and forces a keyframe on
+		-- every single scan.
+		local changed = objCount ~= n
+		if not changed then
+			for i = 1, n do
+				if objLabels[i] ~= objScan[i].label then changed = true break end
+			end
+		end
+
+		for i = 1, n do
+			local e = objScan[i]
+			objLabels[i] = e.label
+			local o = objList[i]
+			if o then o.label, o.pose = e.label, e.pose
+			else objList[i] = { label = e.label, pose = e.pose } end
+		end
+		for i = objCount, n + 1, -1 do
+			objList[i], objLabels[i], objBase[i] = nil, nil, nil
+		end
+		for i = objScan and #objScan or 0, n + 1, -1 do objScan[i] = nil end
+		objCount = n
+		if changed then objRegDirty = true end
+		return n
+	end
+
+	local function SendTrackers()
+		local rt = RealTime()
+		if rt >= objNextScan then
+			objNextScan = rt + 0.5
+			ScanObjectTrackers()
+		end
+		if objCount == 0 then return end
+		if objRegDirty then SendTrackerRegistration() end
+
+		local force = objTickCounter == 0
+		local mask = 0
+		for i = 1, objCount do
+			local p = objList[i].pose
+			if not p or not p.pos then
+				-- Tracker went stale between scans; hold its last value rather
+				-- than sending a zero pose that would snap the attached object.
+			elseif force then
+				mask = bor(mask, TRK_BIT[i])
+			else
+				local b = objBase[i]
+				if not b or deltaPosChanged(p.pos, b.pos) or deltaAngChanged(p.ang, b.ang) then
+					mask = bor(mask, TRK_BIT[i])
+				end
+			end
+		end
+		objTickCounter = (objTickCounter + 1) % TRK_KEYFRAME_INTERVAL
+		if mask == 0 then return end
+
+		local origin = LocalPlayer():GetPos()
+		net.Start("vrmod_trackers_tick", true)
+		net_WriteUInt(mask, MAX_OBJ_TRACKERS)
+		for i = 1, objCount do
+			if band(mask, TRK_BIT[i]) ~= 0 then
+				local p = objList[i].pose
+				local pos, ang = p.pos, p.ang
+				-- Component writes: Vector subtraction would allocate a fresh
+				-- Vector per tracker per tick on a path that runs at tickrate.
+				net.WriteFloat(pos.x - origin.x)
+				net.WriteFloat(pos.y - origin.y)
+				net.WriteFloat(pos.z - origin.z)
+				net.WriteFloat(ang.p)
+				net.WriteFloat(ang.y)
+				net.WriteFloat(ang.r)
+				local b = objBase[i]
+				if b then b.pos:Set(pos) b.ang:Set(ang)
+				else objBase[i] = { pos = Vector(pos), ang = Angle(ang) } end
+			end
+		end
+		net.SendToServer()
+	end
+
+	-- Re-register on demand, so labelling a tracker mid-session takes effect
+	-- without waiting for the next scan.
+	function vrmod.RefreshObjectTrackers()
+		objNextScan = 0
+		objRegDirty = true
+	end
+
 	-- Transmit timer factored out so the rate can change live (see the
 	-- vrmod_net_tickrate callback below). Send rate is clamped to 10..100 Hz
 	-- regardless of the convar's raw value.
@@ -455,6 +682,9 @@ if CLIENT then
 			if not lastSentFrame or not vrmod.utils.FramesAreEqual(frame, lastSentFrame) then
 				SendFrame(frame)
 			end
+			-- Outside the FramesAreEqual gate: a camera on a tripod moves while
+			-- the body that owns it is standing perfectly still.
+			SendTrackers()
 		end)
 	end
 
@@ -706,6 +936,8 @@ if CLIENT then
 			characterIK = prev and prev.characterIK,
 			charEyeHeight = prev and prev.charEyeHeight,
 			charHeadToHmd = prev and prev.charHeadToHmd,
+			trackerLabels = prev and prev.trackerLabels,
+			trackers = prev and prev.trackers,
 			lastFrame = nil,
 			playbackTime = 0,
 			frameBuffer = {},
@@ -738,6 +970,29 @@ if CLIENT then
 			g_VR.net[sid].charEyeHeight = net.ReadFloat()
 			g_VR.net[sid].charHeadToHmd = net.ReadFloat()
 		end
+	end)
+
+	net.Receive("vrmod_trackers_reg", function()
+		local ply = net.ReadEntity()
+		local labels = netReadTrackerLabels()
+		if not IsValid(ply) then return end
+		local tab = g_VR.net[ply:SteamID()]
+		if not tab then RequestVRPlayers() return end
+		tab.trackerLabels = labels
+		-- Indices were just reassigned, so anything held under an old label is
+		-- stale. Drop the store rather than leave a ghost behind.
+		tab.trackers = {}
+	end)
+
+	net.Receive("vrmod_trackers_tick", function()
+		local ply = net.ReadEntity()
+		local tab = IsValid(ply) and g_VR.net[ply:SteamID()]
+		-- Read regardless: an unparsed message is fine, a half-parsed one is
+		-- not, and the labels may simply not have arrived yet.
+		local labels = tab and tab.trackerLabels
+		local store = tab and tab.trackers
+		if tab and not store then store = {} tab.trackers = store end
+		netReadTrackerTick(labels, store or {})
 	end)
 
 	local function SendCharCal()
@@ -923,6 +1178,8 @@ if SERVER then
 	util.AddNetworkString("vrutil_net_exitvehicle")
 	util.AddNetworkString("vrmod_characterik_sync")
 	util.AddNetworkString("vrmod_charcal_sync")
+	util.AddNetworkString("vrmod_trackers_reg")
+	util.AddNetworkString("vrmod_trackers_tick")
 	-- maxLen is in BITS. FBT keyframes run ~1500 bits (hmd+hands+fullbody+
 	-- muzzle); 1200 silently dropped every FBT tick. 210/sec covers 100 Hz
 	-- plus timer catch-up bursts after client hitches.
@@ -1006,6 +1263,46 @@ if SERVER then
 		net.Broadcast()
 	end)
 
+	-- Label list first, then poses by index. Rate 5/s: the client only re-sends
+	-- this when the set of labelled object trackers actually changes.
+	vrmod.NetReceiveLimited("vrmod_trackers_reg", 5, 2048, function(len, ply)
+		local steamid = ply:SteamID()
+		local labels = netReadTrackerLabels()
+		if not g_VR[steamid] then return end
+		g_VR[steamid].trackerLabels = labels
+		g_VR[steamid].trackers = {}
+		net.Start("vrmod_trackers_reg")
+		net.WriteEntity(ply)
+		netWriteTrackerLabels(labels)
+		net.SendOmit(ply)
+	end)
+
+	-- 1600 bits covers a full 8-tracker keyframe; same rate ceiling as the body
+	-- tick, since both ride the one transmit timer.
+	vrmod.NetReceiveLimited("vrmod_trackers_tick", 210, 1600, function(len, ply)
+		local steamid = ply:SteamID()
+		local data = g_VR[steamid]
+		if not data then return end
+		local store = data.trackers
+		if not store then store = {} data.trackers = store end
+		local mask = netReadTrackerTick(data.trackerLabels, store)
+		if mask == 0 then return end
+		net.Start("vrmod_trackers_tick", true)
+		net.WriteEntity(ply)
+		net_WriteUInt(mask, MAX_OBJ_TRACKERS)
+		local labels = data.trackerLabels
+		for i = 1, MAX_OBJ_TRACKERS do
+			if band(mask, TRK_BIT[i]) ~= 0 then
+				local t = labels and store[labels[i]]
+				local p = t and t.posRel or vector_origin
+				local a = t and t.ang or angle_zero
+				net.WriteFloat(p.x) net.WriteFloat(p.y) net.WriteFloat(p.z)
+				net.WriteFloat(a.p) net.WriteFloat(a.y) net.WriteFloat(a.r)
+			end
+		end
+		net.SendOmit(ply)
+	end)
+
 	local function net_exit(steamid)
 		if g_VR[steamid] ~= nil then
 			g_VR[steamid] = nil
@@ -1064,6 +1361,36 @@ if SERVER then
 					end
 
 					SendLatestFrame(vrPly, v, ply)
+					-- Reliable, and labels before poses: a tick whose labels
+					-- have not landed yet is discarded by the client.
+					if v.trackerLabels and #v.trackerLabels > 0 then
+						net.Start("vrmod_trackers_reg")
+						net.WriteEntity(vrPly)
+						netWriteTrackerLabels(v.trackerLabels)
+						net.Send(ply)
+
+						local labels, store = v.trackerLabels, v.trackers or {}
+						local mask, count = 0, 0
+						for i = 1, #labels do
+							if store[labels[i]] then
+								mask = bor(mask, TRK_BIT[i])
+								count = count + 1
+							end
+						end
+						if count > 0 then
+							net.Start("vrmod_trackers_tick")
+							net.WriteEntity(vrPly)
+							net_WriteUInt(mask, MAX_OBJ_TRACKERS)
+							for i = 1, #labels do
+								local t = store[labels[i]]
+								if t then
+									net.WriteFloat(t.posRel.x) net.WriteFloat(t.posRel.y) net.WriteFloat(t.posRel.z)
+									net.WriteFloat(t.ang.p) net.WriteFloat(t.ang.y) net.WriteFloat(t.ang.r)
+								end
+							end
+							net.Send(ply)
+						end
+					end
 				else
 					vrmod.logger.Err("Invalid SteamID \"" .. k .. "\" found in player table")
 				end

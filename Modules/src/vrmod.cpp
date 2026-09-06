@@ -32,7 +32,7 @@
 	#define XR_USE_TIMESPEC
 #endif
 
-#define XRMOD_MODULE_VERSION 1
+#define XRMOD_MODULE_VERSION 2
 
 #define MAX_STR_LEN     256
 // Ceiling on per-eye texture height, applied proportionally so pixels stay
@@ -42,7 +42,7 @@
 // Quest 3 recommends 2064x2208, and the old 1920 here was a Quest 2 panel
 // figure that silently downscaled everything taller.
 #define MAX_EYE_HEIGHT  4096
-#define MAX_ACTIONS     64
+#define MAX_ACTIONS     128
 #define MAX_ACTIONSETS  16
 #define PI            3.141592653589793116
 
@@ -88,6 +88,7 @@ class VMatrix {
 
 VMatrix* PushNewMatrix(GarrysMod::Lua::ILuaBase* LUA);
 VMatrix* InitPoseTableFields(GarrysMod::Lua::ILuaBase* LUA, int* matrixRefOut);
+static void XT_UnlinkFromPoseTable();
 
 const XrPosef XR_IDENTITYPOSE = { {0,0,0,1}, {0,0,0} };
 
@@ -733,6 +734,7 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 	for(int i = 0; i < g_luaRefCount; i++)
 		LUA->ReferenceFree(g_luaRefs[i]);
 	g_luaRefCount = 0;
+	XT_UnlinkFromPoseTable();
 
 	g_ScaledWidth = 0;
 	g_ScaledHeight = 0;
@@ -2845,6 +2847,432 @@ LUA_FUNCTION(FaceTrackingActive) {
 	return 1;
 }
 
+// ============================================================================
+// External Tracker OSC Receiver
+// Accepts SlimeVR (VRChat OSC tracker protocol) and VMC device transforms over
+// UDP, and presents each source as a pose table shaped exactly like the ones
+// GetPoses builds for XR actions. Downstream Lua cannot tell an OSC tracker
+// from a Vive tracker, which is the whole point -- FBT, attachment and
+// networking need no special cases.
+//
+// Reuses the face-tracking block's socket typedefs and OSC primitives; the two
+// receivers are independent sockets polled from the same thread.
+//
+// Wire formats accepted:
+//   /tracking/trackers/<n>/position   ,fff   Unity metres
+//   /tracking/trackers/<n>/rotation   ,fff   Unity euler degrees, ZXY order
+//   /tracking/trackers/head/...       ,fff   (kept, labelled off by default)
+//   /VMC/Ext/Tra/Pos  ,sfffffff  name, pos xyz, quat xyzw
+// ============================================================================
+
+#define XT_MAX_TRACKERS   64
+#define XT_RECV_BUF_SIZE  8192
+#define XT_TIMEOUT_MS     500.0
+#define XT_KEYLEN         48
+
+struct XTTracker {
+	char     key[XT_KEYLEN];
+	XrPosef  pose;
+	double   lastSeen;
+	int      tableRef;
+	int      matrixRef;
+	VMatrix* mtx;
+	bool     hasPos;
+	bool     hasRot;
+	bool     linked;    // present in our own table
+	bool     linkedXr;  // present in the main GetPoses table
+};
+
+// SlimeVR's yaw origin comes from wherever the user last did a full reset, and
+// its floor from its own height calibration -- neither is tied to the OpenXR
+// stage. Correcting the axes gets the trackers into the right frame; these get
+// them onto the right spot in it. Both default to zero and are inert.
+static float       g_xtOriginYawSin = 0.0f;   // full angle, for the position
+static float       g_xtOriginYawCos = 1.0f;
+static float       g_xtOriginHalfSin = 0.0f;  // half angle, for the quaternion
+static float       g_xtOriginHalfCos = 1.0f;
+static float       g_xtOriginHeight = 0.0f;
+
+static ft_socket_t g_xtSocket   = FT_INVALID_SOCKET;
+static XTTracker   g_xtTrackers[XT_MAX_TRACKERS];
+static int         g_xtCount    = 0;
+static uint8_t     g_xtRecvBuf[XT_RECV_BUF_SIZE];
+static bool        g_xtWsaInit  = false;
+static int         g_xtLuaRefTable = -1;
+
+static void XT_UnlinkFromPoseTable() {
+	for (int i = 0; i < g_xtCount; i++)
+		g_xtTrackers[i].linkedXr = false;
+}
+
+static void XT_CloseSocket() {
+	if (g_xtSocket == FT_INVALID_SOCKET) return;
+#ifdef _WIN32
+	closesocket(g_xtSocket);
+#else
+	close(g_xtSocket);
+#endif
+	g_xtSocket = FT_INVALID_SOCKET;
+}
+
+static int XT_FindOrAdd(const char* key) {
+	for (int i = 0; i < g_xtCount; i++) {
+		if (strcmp(g_xtTrackers[i].key, key) == 0)
+			return i;
+	}
+	if (g_xtCount >= XT_MAX_TRACKERS) return -1;
+	int idx = g_xtCount++;
+	XTTracker* t = &g_xtTrackers[idx];
+	strncpy(t->key, key, XT_KEYLEN - 1);
+	t->key[XT_KEYLEN - 1] = '\0';
+	t->pose      = XR_IDENTITYPOSE;
+	t->lastSeen  = 0.0;
+	t->tableRef  = -1;
+	t->matrixRef = -1;
+	t->mtx       = nullptr;
+	t->hasPos = t->hasRot = t->linked = t->linkedXr = false;
+	return idx;
+}
+
+// Unity (SlimeVR and VMC both use it) is left-handed, +X right, +Y up, +Z
+// forward, metres.
+//
+// The target is NOT raw OpenXR. This module creates its stage reference space
+// with poseInReferenceSpace {-0.5, 0.5, 0.5, 0.5}, which pre-rotates every
+// located pose into Source conventions -- +X forward, +Y left, +Z up. So
+// anything handed to ComposeTransform has to already be in that frame, or it
+// lands 90 degrees out from the HMD. Converting to OpenXR instead is exactly
+// the bug where trackers look right in SteamVR and wrong in game.
+//
+// Basis map M: source = (uz, -ux, uy). det(M) = -1, which is the left-to-right
+// handedness flip. Conjugating a rotation by an orientation-reversing basis
+// change negates the quaternion's vector part, so q_src = (-(M*v), w), giving
+// (-vz, vx, -vy, w).
+static void XT_SetPosUnity(XTTracker* t, float x, float y, float z) {
+	t->pose.position.x =  z;
+	t->pose.position.y = -x;
+	t->pose.position.z =  y;
+	t->hasPos = true;
+}
+
+static void XT_SetQuatUnity(XTTracker* t, float x, float y, float z, float w) {
+	t->pose.orientation.x = -z;
+	t->pose.orientation.y =  x;
+	t->pose.orientation.z = -y;
+	t->pose.orientation.w =  w;
+	t->hasRot = true;
+}
+
+// Unity composes Euler angles as qY * qX * qZ. Getting this order wrong looks
+// correct at rest and only diverges once two axes are non-zero at the same
+// time, which is exactly the case you cannot eyeball in a headset.
+static void XT_SetEulerUnity(XTTracker* t, float ex, float ey, float ez) {
+	const float k = (float)(PI / 360.0); // deg -> half-radians
+	float hx = ex * k, hy = ey * k, hz = ez * k;
+	float cx = cosf(hx), sx = sinf(hx);
+	float cy = cosf(hy), sy = sinf(hy);
+	float cz = cosf(hz), sz = sinf(hz);
+	float qw = cy * cx * cz + sy * sx * sz;
+	float qx = cy * sx * cz + sy * cx * sz;
+	float qy = sy * cx * cz - cy * sx * sz;
+	float qz = cy * cx * sz - sy * sx * cz;
+	XT_SetQuatUnity(t, qx, qy, qz, qw);
+}
+
+static int XT_ParseOscMessage(const uint8_t* data, int len) {
+	if (len < 8 || data[0] != '/') return 0;
+
+	int addrLen = (int)strnlen((const char*)data, len);
+	if (addrLen >= len) return 0;
+	int addrPadded = (int)FT_AlignUp4(addrLen + 1);
+	if (addrPadded >= len) return 0;
+
+	const char* address = (const char*)data;
+
+	int tagOffset = addrPadded;
+	if (tagOffset >= len || data[tagOffset] != ',') return 0;
+	const char* tags = (const char*)data + tagOffset;
+	int tagLen    = (int)strnlen(tags, len - tagOffset);
+	int tagPadded = (int)FT_AlignUp4(tagLen + 1);
+	int off       = tagOffset + tagPadded;
+
+	// -- VRChat / SlimeVR tracker protocol ---------------------------------
+	static const char pfx[] = "/tracking/trackers/";
+	if (strncmp(address, pfx, sizeof(pfx) - 1) == 0) {
+		if (strcmp(tags, ",fff") != 0 || off + 12 > len) return 0;
+		const char* rest = address + sizeof(pfx) - 1;
+		const char* slash = strchr(rest, '/');
+		if (!slash) return 0;
+		int klen = (int)(slash - rest);
+		if (klen <= 0 || klen >= XT_KEYLEN) return 0;
+
+		char key[XT_KEYLEN];
+		memcpy(key, rest, klen);
+		key[klen] = '\0';
+
+		int idx = XT_FindOrAdd(key);
+		if (idx < 0) return off + 12;
+		XTTracker* t = &g_xtTrackers[idx];
+
+		float a = FT_ReadBEFloat(data + off);
+		float b = FT_ReadBEFloat(data + off + 4);
+		float c = FT_ReadBEFloat(data + off + 8);
+
+		if (strcmp(slash, "/position") == 0)      XT_SetPosUnity(t, a, b, c);
+		else if (strcmp(slash, "/rotation") == 0) XT_SetEulerUnity(t, a, b, c);
+		else return off + 12;
+
+		t->lastSeen = FT_GetTimeMs();
+		return off + 12;
+	}
+
+	// -- VMC device transforms ---------------------------------------------
+	// One message carries name + position + quaternion, so a VMC source needs
+	// no euler conversion and is not capped at eight trackers.
+	if (strcmp(address, "/VMC/Ext/Tra/Pos") == 0) {
+		if (strcmp(tags, ",sfffffff") != 0) return 0;
+		int nameLen = (int)strnlen((const char*)data + off, len - off);
+		if (off + nameLen >= len) return 0;
+
+		char key[XT_KEYLEN];
+		int klen = nameLen < XT_KEYLEN - 1 ? nameLen : XT_KEYLEN - 1;
+		memcpy(key, data + off, klen);
+		key[klen] = '\0';
+
+		off += (int)FT_AlignUp4(nameLen + 1);
+		if (off + 28 > len) return 0;
+
+		int idx = XT_FindOrAdd(key);
+		if (idx < 0) return off + 28;
+		XTTracker* t = &g_xtTrackers[idx];
+
+		XT_SetPosUnity(t,  FT_ReadBEFloat(data + off),
+		                   FT_ReadBEFloat(data + off + 4),
+		                   FT_ReadBEFloat(data + off + 8));
+		XT_SetQuatUnity(t, FT_ReadBEFloat(data + off + 12),
+		                   FT_ReadBEFloat(data + off + 16),
+		                   FT_ReadBEFloat(data + off + 20),
+		                   FT_ReadBEFloat(data + off + 24));
+		t->lastSeen = FT_GetTimeMs();
+		return off + 28;
+	}
+
+	return 0;
+}
+
+static void XT_ParseOscPacket(const uint8_t* data, int len) {
+	if (len < 4) return;
+	if (len >= 16 && memcmp(data, "#bundle\0", 8) == 0) {
+		int offset = 16;
+		while (offset + 4 <= len) {
+			uint32_t msgSize = FT_ReadBEUint32(data + offset);
+			offset += 4;
+			if (msgSize == 0 || offset + (int)msgSize > len) break;
+			XT_ParseOscPacket(data + offset, (int)msgSize);
+			offset += (int)msgSize;
+		}
+	} else {
+		XT_ParseOscMessage(data, len);
+	}
+}
+
+static void XT_FreeRefs(GarrysMod::Lua::ILuaBase* LUA) {
+	for (int i = 0; i < g_xtCount; i++) {
+		XTTracker* t = &g_xtTrackers[i];
+		if (t->tableRef  != -1) { LUA->ReferenceFree(t->tableRef);  t->tableRef  = -1; }
+		if (t->matrixRef != -1) { LUA->ReferenceFree(t->matrixRef); t->matrixRef = -1; }
+		t->mtx = nullptr;
+		t->linked = t->linkedXr = false;
+	}
+	g_xtCount = 0;
+	if (g_xtLuaRefTable != -1) {
+		LUA->ReferenceFree(g_xtLuaRefTable);
+		g_xtLuaRefTable = -1;
+	}
+}
+
+LUA_FUNCTION(TrackerStart) {
+	int port = 9001;
+	if (LUA->IsType(1, GarrysMod::Lua::Type::NUMBER))
+		port = (int)LUA->GetNumber(1);
+
+	XT_CloseSocket();
+	XT_FreeRefs(LUA);
+
+#ifdef _WIN32
+	if (!g_xtWsaInit) {
+		WSADATA wsaData;
+		if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+			LUA->PushBool(false);
+			return 1;
+		}
+		g_xtWsaInit = true;
+	}
+#endif
+
+	g_xtSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (g_xtSocket == FT_INVALID_SOCKET) {
+		LUA->PushBool(false);
+		return 1;
+	}
+
+#ifdef _WIN32
+	u_long mode = 1;
+	ioctlsocket(g_xtSocket, FIONBIO, &mode);
+#else
+	int flags = fcntl(g_xtSocket, F_GETFL, 0);
+	fcntl(g_xtSocket, F_SETFL, flags | O_NONBLOCK);
+#endif
+
+	struct sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family      = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	addr.sin_port        = htons((unsigned short)port);
+
+	if (bind(g_xtSocket, (struct sockaddr*)&addr, sizeof(addr)) == FT_SOCKET_ERROR) {
+		XT_CloseSocket();
+		LUA->PushBool(false);
+		return 1;
+	}
+
+	LUA->CreateTable();
+	g_xtLuaRefTable = LUA->ReferenceCreate();
+
+	LUA->PushBool(true);
+	return 1;
+}
+
+LUA_FUNCTION(TrackerStop) {
+	XT_CloseSocket();
+	XT_FreeRefs(LUA);
+	return 0;
+}
+
+// Drains the socket, refreshes every tracker's matrix and returns the live
+// count. Pose tables and their Matrix userdata are created once per tracker and
+// mutated in place afterwards, so a steady state frame allocates nothing.
+LUA_FUNCTION(TrackerPoll) {
+	if (g_xtSocket == FT_INVALID_SOCKET || g_xtLuaRefTable == -1) {
+		LUA->PushNumber(0);
+		return 1;
+	}
+
+	for (;;) {
+		int bytes = recv(g_xtSocket, (char*)g_xtRecvBuf, XT_RECV_BUF_SIZE, 0);
+		if (bytes <= 0) break;
+		XT_ParseOscPacket(g_xtRecvBuf, bytes);
+	}
+
+	double now  = FT_GetTimeMs();
+	int    live = 0;
+	bool   xrUp = (g_luaRefCount > 0 && g_Session != XR_NULL_HANDLE);
+
+	for (int i = 0; i < g_xtCount; i++) {
+		XTTracker* t = &g_xtTrackers[i];
+
+		if (t->tableRef == -1) {
+			LUA->CreateTable();
+			t->mtx = InitPoseTableFields(LUA, &t->matrixRef);
+			LUA->PushString(t->key);
+			LUA->SetField(-2, "key");
+			LUA->PushString("osc");
+			LUA->SetField(-2, "source");
+			t->tableRef = LUA->ReferenceCreate();
+		}
+
+		bool active = t->hasPos && t->hasRot && (now - t->lastSeen) < XT_TIMEOUT_MS;
+		if (active) {
+			// Yaw about Source up (+Z) and a height shift, applied on the left
+			// so they act in the stage frame rather than the tracker's own.
+			XrPosef p = t->pose;
+			const float sn = g_xtOriginYawSin, cs = g_xtOriginYawCos;
+			if (sn != 0.0f) {
+				float px = p.position.x, py = p.position.y;
+				p.position.x = px * cs - py * sn;
+				p.position.y = px * sn + py * cs;
+				// qz(yaw) * q. The half angle is stored rather than recovered
+				// from the full one: sin(a/2) = sin a / (2 cos(a/2)) loses most
+				// of its precision as the yaw approaches 180 degrees, and it
+				// costs a sqrt every frame for the privilege.
+				const float hs = g_xtOriginHalfSin, hc = g_xtOriginHalfCos;
+				float qx = p.orientation.x, qy = p.orientation.y;
+				float qz = p.orientation.z, qw = p.orientation.w;
+				p.orientation.x = hc * qx - hs * qy;
+				p.orientation.y = hc * qy + hs * qx;
+				p.orientation.z = hc * qz + hs * qw;
+				p.orientation.w = hc * qw - hs * qz;
+			}
+			p.position.z += g_xtOriginHeight;
+			ComposeTransform(p, t->mtx);
+			live++;
+		}
+
+		LUA->ReferencePush(t->tableRef);
+		LUA->PushBool(active);
+		LUA->SetField(-2, "active");
+		LUA->Pop();
+
+		if (!t->linked) {
+			LUA->ReferencePush(g_xtLuaRefTable);
+			LUA->ReferencePush(t->tableRef);
+			LUA->SetField(-2, t->key);
+			LUA->Pop();
+			t->linked = true;
+		}
+
+		// Mirror into the table GetPoses returns so the existing tracking loop
+		// picks these up with no changes. Deliberately only once a tracker has
+		// been seen: Lua detects availability by entry presence.
+		if (!t->linkedXr && xrUp && active) {
+			char nm[XT_KEYLEN + 16];
+			snprintf(nm, sizeof(nm), "pose_osc_%s", t->key);
+			LUA->ReferencePush(g_luaRefs[LuaRefIndex_PoseTable]);
+			LUA->ReferencePush(t->tableRef);
+			LUA->SetField(-2, nm);
+			LUA->Pop();
+			t->linkedXr = true;
+		}
+	}
+
+	LUA->PushNumber(live);
+	return 1;
+}
+
+LUA_FUNCTION(TrackerGetPoses) {
+	// Deliberately not g_luaRefs[LuaRefIndex_EmptyTable]: that array is only
+	// populated once a session exists, and this is callable before VR starts
+	// so the menu can list trackers on the desktop. A fresh table costs one
+	// allocation on a path that only runs while the receiver is down.
+	if (g_xtLuaRefTable == -1) {
+		LUA->CreateTable();
+		return 1;
+	}
+	LUA->ReferencePush(g_xtLuaRefTable);
+	return 1;
+}
+
+// Yaw in degrees about Source up, height in metres. Applied to every external
+// tracker before it reaches the pose table.
+LUA_FUNCTION(TrackerSetOrigin) {
+	float yaw = 0.0f, height = 0.0f;
+	if (LUA->IsType(1, GarrysMod::Lua::Type::NUMBER)) yaw = (float)LUA->GetNumber(1);
+	if (LUA->IsType(2, GarrysMod::Lua::Type::NUMBER)) height = (float)LUA->GetNumber(2);
+	float r = yaw * (float)(PI / 180.0);
+	g_xtOriginYawSin = sinf(r);
+	g_xtOriginYawCos = cosf(r);
+	g_xtOriginHalfSin = sinf(r * 0.5f);
+	g_xtOriginHalfCos = cosf(r * 0.5f);
+	g_xtOriginHeight = height;
+	return 0;
+}
+
+LUA_FUNCTION(TrackerActive) {
+	LUA->PushBool(g_xtSocket != FT_INVALID_SOCKET);
+	return 1;
+}
+
+
 GMOD_MODULE_OPEN(){
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1, "vrmod");
@@ -2941,6 +3369,24 @@ GMOD_MODULE_OPEN(){
 		LUA->PushCFunction(FaceTrackingActive);
 		LUA->SetField(-2, "FaceTrackingActive");
 
+		LUA->PushCFunction(TrackerStart);
+		LUA->SetField(-2, "TrackerStart");
+
+		LUA->PushCFunction(TrackerStop);
+		LUA->SetField(-2, "TrackerStop");
+
+		LUA->PushCFunction(TrackerPoll);
+		LUA->SetField(-2, "TrackerPoll");
+
+		LUA->PushCFunction(TrackerGetPoses);
+		LUA->SetField(-2, "TrackerGetPoses");
+
+		LUA->PushCFunction(TrackerActive);
+		LUA->SetField(-2, "TrackerActive");
+
+		LUA->PushCFunction(TrackerSetOrigin);
+		LUA->SetField(-2, "TrackerSetOrigin");
+
 		LUA->SetField(-2, "vrmod");
 
 	LUA->Pop();
@@ -2953,6 +3399,11 @@ GMOD_MODULE_OPEN(){
 }
 
 GMOD_MODULE_CLOSE(){
+	XT_CloseSocket();
+	XT_FreeRefs(LUA);
+#ifdef _WIN32
+	if (g_xtWsaInit) { WSACleanup(); g_xtWsaInit = false; }
+#endif
 	FaceTrackingCleanup();
 	if (g_ftLuaRefTable != -1) {
 		LUA->ReferenceFree(g_ftLuaRefTable);

@@ -23,9 +23,7 @@ local ALL_ACTIONS = {
     -- Poses
     pose_lefthand              = { type = "pose",     localizedActionName = "Left Hand Pose" },
     pose_righthand             = { type = "pose",     localizedActionName = "Right Hand Pose" },
-    pose_leftfoot              = { type = "pose",     localizedActionName = "Left Foot Pose" },
-    pose_rightfoot             = { type = "pose",     localizedActionName = "Right Foot Pose" },
-    pose_waist                 = { type = "pose",     localizedActionName = "Waist Pose" },
+    -- Tracker poses are generated from TRACKER_ROLES below.
 
     -- Booleans
     boolean_primaryfire        = { type = "boolean",  localizedActionName = "Primary Fire" },
@@ -223,15 +221,64 @@ do
     }
 end
 
--- HTCX Vive Tracker (FBT) — pose-only, no buttons
+-- HTCX Vive Tracker — pose-only, no buttons.
+--
+-- Every role the extension defines, not just the three FBT ones. Actions cannot
+-- be created after xrAttachSessionActionSets, so anything we might ever want a
+-- tracker on has to be declared here up front; there is no discover-then-bind.
+-- Unconnected roles simply never go active and never appear in the pose table.
+--
+-- The first three names are kept for compatibility with existing calibration
+-- data and the sh_character_fbt.lua reads. /role/camera is the one to assign in
+-- SteamVR for a physical camera rig.
+--
+-- Runtime notes, from SteamVR's OpenXR behaviour:
+--  * xrGetCurrentInteractionProfile on a role path is unreliable -- it reports
+--    the profile as bound even with the tracker switched off. The module keys
+--    off xrGetActionStatePose().isActive instead, which is correct.
+--  * Per-role bindings set in SteamVR's own binding UI override these and will
+--    break them. Clear them there if a role refuses to go active.
+--  * handheld_object was broken in SteamVR for longer than the others; treat it
+--    as the least reliable of the set.
+local TRACKER_ROLES = {
+    { "pose_waist",      "waist",           "Waist"          },
+    { "pose_leftfoot",   "left_foot",       "Left Foot"      },
+    { "pose_rightfoot",  "right_foot",      "Right Foot"     },
+    { "pose_chest",      "chest",           "Chest"          },
+    { "pose_leftknee",   "left_knee",       "Left Knee"      },
+    { "pose_rightknee",  "right_knee",      "Right Knee"     },
+    { "pose_leftelbow",  "left_elbow",      "Left Elbow"     },
+    { "pose_rightelbow", "right_elbow",     "Right Elbow"    },
+    { "pose_leftshldr",  "left_shoulder",   "Left Shoulder"  },
+    { "pose_rightshldr", "right_shoulder",  "Right Shoulder" },
+    { "pose_leftwrist",  "left_wrist",      "Left Wrist"     },
+    { "pose_rightwrist", "right_wrist",     "Right Wrist"    },
+    { "pose_leftankle",  "left_ankle",      "Left Ankle"     },
+    { "pose_rightankle", "right_ankle",     "Right Ankle"    },
+    { "pose_camera",     "camera",          "Camera"         },
+    { "pose_keyboard",   "keyboard",        "Keyboard"       },
+    { "pose_handheld",   "handheld_object", "Handheld Object"},
+}
+
+local TRACKER_PATHS = {}
 local VIVE_TRACKER_HTCX = {
     profile = "/interaction_profiles/htc/vive_tracker_htcx",
-    bindings = {
-        pose_waist     = "/user/vive_tracker_htcx/role/waist/input/grip/pose",
-        pose_leftfoot  = "/user/vive_tracker_htcx/role/left_foot/input/grip/pose",
-        pose_rightfoot = "/user/vive_tracker_htcx/role/right_foot/input/grip/pose",
-    },
+    bindings = {},
 }
+
+for i = 1, #TRACKER_ROLES do
+    local r = TRACKER_ROLES[i]
+    local path = "/user/vive_tracker_htcx/role/" .. r[2] .. "/input/grip/pose"
+    ALL_ACTIONS[r[1]] = { type = "pose", localizedActionName = r[3] .. " Pose" }
+    VIVE_TRACKER_HTCX.bindings[r[1]] = path
+    TRACKER_PATHS[i] = path
+end
+
+--- Action name + role name pairs, for the tracker registry and the menu.
+function vrmod.GetTrackerRoleActions() return TRACKER_ROLES end
+
+--- Bindable paths, for the XR bindings editor's tracker tab.
+function vrmod.GetTrackerRolePaths() return TRACKER_PATHS end
 
 local ALL_PROFILES = { OCULUS_TOUCH, VALVE_INDEX }
 

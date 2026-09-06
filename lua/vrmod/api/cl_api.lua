@@ -1,11 +1,11 @@
 local requiredModuleVersion = nil
 if system.IsLinux() then
-    requiredModuleVersion = 1
+    requiredModuleVersion = 2
 else
-    requiredModuleVersion = 1
+    requiredModuleVersion = 2
 end
 
-local latestModuleVersion = 1
+local latestModuleVersion = 2
 g_VR = g_VR or {}
 vrmod = vrmod or {}
 local convars = vrmod.GetConvars()
@@ -188,112 +188,76 @@ if CLIENT then
         return Vector(), Angle(), Vector()
     end
 
-    -- Waist (often called "hip" in other VR contexts)
-    function vrmod.GetWaistPos(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_waist then return Vector() end
-        return g_VR.tracking.pose_waist.pos or Vector()
-    end
+    -- ── FBT parts: waist + feet ──
+    -- Resolved through the tracker registry (g_VR.fbtPose) so an OSC/SlimeVR
+    -- rig drives these exactly like Vive pucks. g_VR.tracking.pose_waist and
+    -- friends only exist while an HTCX role is bound, so reading them directly
+    -- handed back a zero vector for every external tracker -- which is what
+    -- left GetLeftFootVelocityRelative at 0 and killed the FBT kick. The legacy
+    -- keys stay as the fallback for when sh_trackers.lua is absent.
+    --
+    -- The old g_VR.fbtActive guard is gone on purpose: it is a table keyed by
+    -- steamid, so `not g_VR.fbtActive` was always false and the test never did
+    -- anything. A resolved pose is the real availability signal.
+    local FBT_SLOTS = {
+        {"Waist", "pelvis", "pose_waist"},
+        {"LeftFoot", "leftfoot", "pose_leftfoot"},
+        {"RightFoot", "rightfoot", "pose_rightfoot"},
+    }
 
-    function vrmod.GetWaistAng(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_waist then return Angle() end
-        return g_VR.tracking.pose_waist.ang or Angle()
-    end
+    for i = 1, 3 do
+        local name, slot, legacy = FBT_SLOTS[i][1], FBT_SLOTS[i][2], FBT_SLOTS[i][3]
+        -- Two table indexes on the hit path.
+        local function Pose()
+            local f = g_VR.fbtPose
+            local p = f and f[slot]
+            if p then return p end
+            local t = g_VR.tracking
+            return t and t[legacy]
+        end
 
-    function vrmod.GetWaistPose(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_waist then return Vector(), Angle() end
-        return g_VR.tracking.pose_waist.pos or Vector(), g_VR.tracking.pose_waist.ang or Angle()
-    end
+        vrmod["Get" .. name .. "Pos"] = function(ply)
+            local p = getPlayerVRData(ply) and Pose()
+            return p and p.pos or Vector()
+        end
 
-    -- If velocities are provided on the waist pose (many FBT setups include them)
-    function vrmod.GetWaistVelocity()
-        return g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_waist and g_VR.tracking.pose_waist.vel or Vector()
-    end
+        vrmod["Get" .. name .. "Ang"] = function(ply)
+            local p = getPlayerVRData(ply) and Pose()
+            return p and p.ang or Angle()
+        end
 
-    function vrmod.GetWaistAngularVelocity()
-        return g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_waist and g_VR.tracking.pose_waist.angvel or Angle()
-    end
+        vrmod["Get" .. name .. "Pose"] = function(ply)
+            local p = getPlayerVRData(ply) and Pose()
+            if not p then return Vector(), Angle() end
+            return p.pos or Vector(), p.ang or Angle()
+        end
 
-    -- Optional relative (to HMD)
-    function vrmod.GetWaistVelocityRelative()
-        if not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_waist or not g_VR.tracking.hmd then return Vector() end
-        return (g_VR.tracking.pose_waist.vel or Vector()) - (g_VR.tracking.hmd.vel or Vector())
-    end
+        vrmod["Get" .. name .. "Velocity"] = function()
+            local p = Pose()
+            return p and p.vel or Vector()
+        end
 
-    -- Left Foot
-    function vrmod.GetLeftFootPos(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_leftfoot then return Vector() end
-        return g_VR.tracking.pose_leftfoot.pos or Vector()
-    end
+        vrmod["Get" .. name .. "AngularVelocity"] = function()
+            local p = Pose()
+            return p and p.angvel or Angle()
+        end
 
-    function vrmod.GetLeftFootAng(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_leftfoot then return Angle() end
-        return g_VR.tracking.pose_leftfoot.ang or Angle()
-    end
+        local function Rel()
+            local p = Pose()
+            local h = g_VR.tracking and g_VR.tracking.hmd
+            if not p or not h then return Vector() end
+            return (p.vel or Vector()) - (h.vel or Vector())
+        end
 
-    function vrmod.GetLeftFootPose(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_leftfoot then return Vector(), Angle() end
-        return g_VR.tracking.pose_leftfoot.pos or Vector(), g_VR.tracking.pose_leftfoot.ang or Angle()
-    end
-
-    function vrmod.GetLeftFootVelocity()
-        return g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_leftfoot and g_VR.tracking.pose_leftfoot.vel or Vector()
-    end
-
-    function vrmod.GetLeftFootAngularVelocity()
-        return g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_leftfoot and g_VR.tracking.pose_leftfoot.angvel or Angle()
-    end
-
-    function vrmod.GetLeftFootVelocityRelative()
-        if not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_leftfoot or not g_VR.tracking.hmd then return Vector() end
-        return (g_VR.tracking.pose_leftfoot.vel or Vector()) - (g_VR.tracking.hmd.vel or Vector())
-    end
-
-    function vrmod.GetLeftFootVelocities()
-        if g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_leftfoot then return g_VR.tracking.pose_leftfoot.vel or Vector(), g_VR.tracking.pose_leftfoot.angvel or Angle(), vrmod.GetLeftFootVelocityRelative() end
-        return Vector(), Angle(), Vector()
-    end
-
-    -- Right Foot (symmetric to left)
-    function vrmod.GetRightFootPos(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_rightfoot then return Vector() end
-        return g_VR.tracking.pose_rightfoot.pos or Vector()
-    end
-
-    function vrmod.GetRightFootAng(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_rightfoot then return Angle() end
-        return g_VR.tracking.pose_rightfoot.ang or Angle()
-    end
-
-    function vrmod.GetRightFootPose(ply)
-        local t = getPlayerVRData(ply)
-        if not t or not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_rightfoot then return Vector(), Angle() end
-        return g_VR.tracking.pose_rightfoot.pos or Vector(), g_VR.tracking.pose_rightfoot.ang or Angle()
-    end
-
-    function vrmod.GetRightFootVelocity()
-        return g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_rightfoot and g_VR.tracking.pose_rightfoot.vel or Vector()
-    end
-
-    function vrmod.GetRightFootAngularVelocity()
-        return g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_rightfoot and g_VR.tracking.pose_rightfoot.angvel or Angle()
-    end
-
-    function vrmod.GetRightFootVelocityRelative()
-        if not g_VR.fbtActive or not g_VR.tracking or not g_VR.tracking.pose_rightfoot or not g_VR.tracking.hmd then return Vector() end
-        return (g_VR.tracking.pose_rightfoot.vel or Vector()) - (g_VR.tracking.hmd.vel or Vector())
-    end
-
-    function vrmod.GetRightFootVelocities()
-        if g_VR.fbtActive and g_VR.tracking and g_VR.tracking.pose_rightfoot then return g_VR.tracking.pose_rightfoot.vel or Vector(), g_VR.tracking.pose_rightfoot.angvel or Angle(), vrmod.GetRightFootVelocityRelative() end
-        return Vector(), Angle(), Vector()
+        vrmod["Get" .. name .. "VelocityRelative"] = Rel
+        -- Combined form, feet only, matching the previous surface.
+        if i > 1 then
+            vrmod["Get" .. name .. "Velocities"] = function()
+                local p = Pose()
+                if not p then return Vector(), Angle(), Vector() end
+                return p.vel or Vector(), p.angvel or Angle(), Rel()
+            end
+        end
     end
 
     function vrmod.SetLeftHandPose(pos, ang, smoothing)

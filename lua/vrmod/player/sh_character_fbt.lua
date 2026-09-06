@@ -331,15 +331,26 @@ function vrmod_fbt.CalculateBonePositions(ply)
 	if info.frameNumber == FrameNumber() then return end
 	-- LocalPlayer reads directly from g_VR.tracking (freshest data, no lerpedFrame timing dependency)
 	local frame
-	if ply == LocalPlayer() and g_VR.tracking.pose_waist then
-		local t = g_VR.tracking
+	-- Resolved by sh_trackers.lua on rescan, so this stays three table
+	-- indexes on a path that runs every BuildBonePositions. Falls back to the
+	-- raw HTCX keys when the registry is absent. All three are tested before
+	-- use: the old guard checked only the waist and then indexed both feet
+	-- unconditionally, which errored the bone callback every frame if a foot
+	-- tracker's battery died mid-session.
+	local fbt = g_VR.fbtPose
+	local t = g_VR.tracking
+	local waistPose     = fbt and fbt.pelvis    or t.pose_waist
+	local leftFootPose  = fbt and fbt.leftfoot  or t.pose_leftfoot
+	local rightFootPose = fbt and fbt.rightfoot or t.pose_rightfoot
+	local isLocal = ply == LocalPlayer()
+	if isLocal and waistPose and leftFootPose and rightFootPose then
 		local f = localFrame
 		f.hmdPos = t.hmd.pos; f.hmdAng = t.hmd.ang
 		f.lefthandPos = t.pose_lefthand.pos; f.lefthandAng = t.pose_lefthand.ang
 		f.righthandPos = t.pose_righthand.pos; f.righthandAng = t.pose_righthand.ang
-		f.waistPos = t.pose_waist.pos; f.waistAng = t.pose_waist.ang
-		f.leftfootPos = t.pose_leftfoot.pos; f.leftfootAng = t.pose_leftfoot.ang
-		f.rightfootPos = t.pose_rightfoot.pos; f.rightfootAng = t.pose_rightfoot.ang
+		f.waistPos = waistPose.pos; f.waistAng = waistPose.ang
+		f.leftfootPos = leftFootPose.pos; f.leftfootAng = leftFootPose.ang
+		f.rightfootPos = rightFootPose.pos; f.rightfootAng = rightFootPose.ang
 		local lh, rh = g_VR.input.skeleton_lefthand, g_VR.input.skeleton_righthand
 		for i = 1, 5 do f["finger" .. i] = lh.fingerCurls[i]; f["finger" .. (i + 5)] = rh.fingerCurls[i] end
 		frame = f
@@ -375,7 +386,12 @@ function vrmod_fbt.CalculateBonePositions(ply)
 	-- so walk arm/torso swing doesn't bleed into the FBT-driven shoulders.
 	if GetPlayerCharacterIK(ply) then
 		local skipShoulderAnim = not vrmod_fbt.convarValues.fbtAnimShoulders
+		-- Hidden bones carry the zeroed 3x3 the bone hider wrote last pass;
+		-- reading their angles back here feeds junk relativeAng into their
+		-- whole subtree. Skip them, they drive nothing.
+		local hidden = isLocal and vrmod.boneHider and vrmod.boneHider.hiddenIDs
 		for i = 0, boneCount - 1 do
+			if hidden and hidden[i] then continue end
 			if not skipShoulderAnim or (i ~= boneids.leftClavicle and i ~= boneids.rightClavicle and i ~= boneids.spine and i ~= boneids.spine1 and i ~= boneids.spine2 and i ~= boneids.spine4) then
 				local mtx = ply:GetBoneMatrix(i)
 				if mtx then
@@ -589,13 +605,73 @@ function vrmod_fbt.Calibrate()
 	ply.RenderOverride = function() end
 	calibrationModel:SetPos(Vector(g_VR.tracking.hmd.pos.x, g_VR.tracking.hmd.pos.y, ply:GetPos().z))
 	calibrationModel:SetAngles(Angle(0, g_VR.tracking.hmd.ang.yaw, 0))
-	-- Show tracker boxes
+	-- Live match preview.
+	--
+	-- Which tracker becomes the waist and which become the feet is decided by
+	-- measuring against the model's bones, not by whatever role SteamVR or
+	-- SlimeVR assigned, so any three trackers work and a SlimeVR rig needs no
+	-- role setup at all. The match is recomputed a few times a second and
+	-- cached, so what gets committed on confirm is exactly what was on screen.
+	local MATCH_INTERVAL = 0.1
+	local SLOT_NAMES = { "pelvis", "leftfoot", "rightfoot" }
+	local BOX_MIN, BOX_MAX = Vector(-1, -1, -1), Vector(1, 1, 1)
+	local COL_MATCHED   = Color(60, 220, 90)
+	local COL_UNMATCHED = Color(220, 70, 60)
+	local COL_TARGET    = Color(255, 255, 255, 90)
+	local unmatchedBuf  = {}
+	local boneTargets   = {}
+	local nextMatch     = 0
+
+	local function UpdateMatch()
+		if not vrmod.MatchFBTTrackers then return end
+		if vrmod_fbt.Init(ply) == false then return end
+		local info = vrmod_fbt.characterInfo[ply:SteamID()]
+		if not info or not info.boneids then return end
+		calibrationModel:SetupBones()
+		local match, filled = vrmod.MatchFBTTrackers(calibrationModel, info.boneids)
+		local ac = vrmod_fbt.activeCalibration
+		ac.match, ac.filled, ac.boneids = match, filled, info.boneids
+		boneTargets[1] = info.boneids.pelvis
+		boneTargets[2] = info.boneids.leftFoot
+		boneTargets[3] = info.boneids.rightFoot
+		vrmod.GetUnmatchedFBTTrackers(match, unmatchedBuf)
+	end
+
 	hook.Add("PostDrawTranslucentRenderables", "fbt_showtrackers", function(depth, sky)
-		if depth or sky or not g_VR.tracking.pose_waist or not g_VR.tracking.pose_leftfoot or not g_VR.tracking.pose_rightfoot then return end
+		if depth or sky then return end
+		local rt = RealTime()
+		if rt >= nextMatch then
+			nextMatch = rt + MATCH_INTERVAL
+			UpdateMatch()
+		end
+
+		local match = vrmod_fbt.activeCalibration.match
 		render.SetColorMaterial()
-		render.DrawBox(g_VR.tracking.pose_waist.pos, g_VR.tracking.pose_waist.ang, Vector(-1, -1, -1), Vector(1, 1, 1))
-		render.DrawBox(g_VR.tracking.pose_leftfoot.pos, g_VR.tracking.pose_leftfoot.ang, Vector(-1, -1, -1), Vector(1, 1, 1))
-		render.DrawBox(g_VR.tracking.pose_rightfoot.pos, g_VR.tracking.pose_rightfoot.ang, Vector(-1, -1, -1), Vector(1, 1, 1))
+
+		-- Target bones, with the accept radius drawn around them. Turns
+		-- "nothing happened" into "stand closer".
+		if boneTargets[1] then
+			local radius = vrmod.GetFBTCalRadius and vrmod.GetFBTCalRadius() or 12
+			for i = 1, 3 do
+				local bone = boneTargets[i]
+				local mtx = bone and bone >= 0 and calibrationModel:GetBoneMatrix(bone)
+				if mtx then
+					render.DrawWireframeSphere(mtx:GetTranslation(), radius, 12, 12,
+						(match and match[SLOT_NAMES[i]]) and COL_MATCHED or COL_TARGET, true)
+				end
+			end
+		end
+
+		if match then
+			for i = 1, 3 do
+				local p = match[SLOT_NAMES[i]]
+				if p then render.DrawBox(p.pos, p.ang, BOX_MIN, BOX_MAX, COL_MATCHED) end
+			end
+		end
+		for i = 1, #unmatchedBuf do
+			local p = unmatchedBuf[i].pose
+			if p and p.pos then render.DrawBox(p.pos, p.ang, BOX_MIN, BOX_MAX, COL_UNMATCHED) end
+		end
 	end)
 
 	-- Input hook for finalizing calibration
@@ -604,6 +680,25 @@ function vrmod_fbt.Calibrate()
 		if vrmod_fbt.Init(ply) == false then return end
 		local boneids = vrmod_fbt.characterInfo[ply:SteamID()].boneids
 		calibrationModel:SetupBones()
+
+		-- Re-match with commit so the assignment persists. Bail rather than
+		-- send a partial calibration: the server stores all four transforms as
+		-- one record and a missing foot would poison it until the next run.
+		local match, filled
+		if vrmod.MatchFBTTrackers then
+			match, filled = vrmod.MatchFBTTrackers(calibrationModel, boneids, nil, true)
+			if filled < 3 then
+				vrmod.logger.Warn(string.format(
+					"FBT calibration: matched %d/3 trackers within %s units -- stand with feet apart and try again",
+					filled, tostring(vrmod.GetFBTCalRadius())))
+				return
+			end
+		else
+			local t = g_VR.tracking
+			match = { pelvis = t.pose_waist, leftfoot = t.pose_leftfoot, rightfoot = t.pose_rightfoot }
+			if not (match.pelvis and match.leftfoot and match.rightfoot) then return end
+		end
+
 		net.Start("vrmod_fbt_cal")
 		net.WriteBool(false)
 		local function sendBone(bone, tracker)
@@ -613,9 +708,9 @@ function vrmod_fbt.Calibrate()
 		end
 
 		sendBone(boneids.head, g_VR.tracking.hmd)
-		sendBone(boneids.pelvis, g_VR.tracking.pose_waist)
-		sendBone(boneids.leftFoot, g_VR.tracking.pose_leftfoot)
-		sendBone(boneids.rightFoot, g_VR.tracking.pose_rightfoot)
+		sendBone(boneids.pelvis, match.pelvis)
+		sendBone(boneids.leftFoot, match.leftfoot)
+		sendBone(boneids.rightFoot, match.rightfoot)
 		net.SendToServer()
 		-- Cleanup calibration session
 		calibrationModel:Remove()
@@ -652,24 +747,36 @@ function vrmod_fbt.Start(ply)
 	g_VR.fbtActive = g_VR.fbtActive or {}
 	g_VR.fbtActive[steamid] = true
 	if info.fbtBoneCallback then ply:RemoveCallback("BuildBonePositions", info.fbtBoneCallback) end
+	-- Hoisted: the callback fires once per SetupBones pass, and PAC3 / weapon
+	-- bonemerges add several of those per frame.
+	local isLocal = ply == LocalPlayer()
+	local zeroVec = vrmod_fbt.zeroVec
 	info.fbtBoneCallback = ply:AddCallback("BuildBonePositions", function(ent, numbones)
 		vrmod_fbt.CalculateBonePositions(ply)
 		local boneinfo = info.boneinfo
 		for i = 0, info.boneCount - 1 do
 			if ply:GetBoneMatrix(i) then ply:SetBoneMatrix(i, boneinfo[i].targetMatrix) end
 		end
-		if ply == LocalPlayer() and vrmod.boneScaler then vrmod.boneScaler.ApplyToBones(ply) end
-		if ply == LocalPlayer() and vrmod.boneHider then vrmod.boneHider.ApplyToBones(ply) end
+		if not isLocal then return end
+		-- First-person head hide, as a matrix scale-zero. It CANNOT be
+		-- ManipulateBoneScale here: the loop above writes SetBoneMatrix on every
+		-- bone including the head, and SetBoneMatrix overrides ManipulateBoneScale
+		-- outright, so the old PrePlayerDraw hook hid nothing the moment FBT owned
+		-- the bones. Same method, same reason, as cl_character's head hide.
+		local ep = EyePos()
+		if (ep == g_VR.eyePosLeft or ep == g_VR.eyePosRight) and ply:GetViewEntity() == ply then
+			local hb = info.boneids.head
+			local hmtx = hb ~= -1 and ply:GetBoneMatrix(hb)
+			if hmtx then
+				hmtx:Scale(zeroVec)
+				ply:SetBoneMatrix(hb, hmtx)
+			end
+		end
+		local bs = vrmod.boneScaler
+		if bs then bs.ApplyToBones(ply) end
+		local bh = vrmod.boneHider
+		if bh then bh.ApplyToBones(ply) end
 	end)
-
-	if ply == LocalPlayer() then
-		hook.Add("PrePlayerDraw", "fbt_hide_head", function(player)
-			if player ~= ply then return end
-			local eyePos = EyePos()
-			local hide = (eyePos == g_VR.eyePosLeft or eyePos == g_VR.eyePosRight) and ply:GetViewEntity() == ply
-			ply:ManipulateBoneScale(info.boneids.head, hide and vrmod_fbt.zeroVec or vrmod_fbt.oneVec)
-		end)
-	end
 
 	vrmod.logger.Info("FBT started for %s", steamid)
 end

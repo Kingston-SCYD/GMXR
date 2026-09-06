@@ -932,6 +932,13 @@ function VRUtilOpenMenu()
 		end
 	end
 
+	-- ─────────────── Client > Trackers ───────────────
+	if vrmod.BuildTrackerPanel then
+		local t = vgui.Create("DScrollPanel", clientSheet)
+		clientSheet:AddSheet("Trackers", t, "icon16/transmit.png")
+		vrmod.BuildTrackerPanel(t)
+	end
+
 	-- ─────────────── Client > Holster ───────────────
 	do
 		local POUCH_SLOTS = 4

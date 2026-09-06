@@ -18,6 +18,7 @@ local CV_CHILDREN = CreateClientConVar("vrmod_bonehider_children", "1", true, fa
 
 local saved = {}     -- [modelPath] = { [boneName] = true }
 local hiddenIDs = {} -- [boneID] = true, resolved for current model (incl. subtree)
+BH.hiddenIDs = hiddenIDs -- stable ref for sh_character_fbt; cleared in place, never reassigned
 local hasHidden      -- hiddenIDs non-empty
 local curModel       -- last model we resolved for
 local panelRef       -- weak ref to open DFrame
@@ -62,7 +63,7 @@ local function Resolve()
 	local ply = LocalPlayer()
 	if not IsValid(ply) then return end
 	SetFallback(ply, false)
-	hiddenIDs = {}
+	for k in pairs(hiddenIDs) do hiddenIDs[k] = nil end
 	hasHidden = false
 	curModel = ply:GetModel()
 	local hidden = saved[curModel]
@@ -173,7 +174,7 @@ end)
 hook.Add("VRMod_Exit", "vrmod_bonehider", function(ply)
 	if ply ~= LocalPlayer() then return end
 	if IsValid(ply) then SetFallback(ply, false) end
-	hiddenIDs = {}
+	for k in pairs(hiddenIDs) do hiddenIDs[k] = nil end
 	hasHidden = false
 	curModel = nil
 end)

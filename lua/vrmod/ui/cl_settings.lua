@@ -24,7 +24,8 @@ local CLIENT_CVARS = {
 	"vrmod_perf_no_pspatch", "vrmod_perf_no_motionblur", "vrmod_perf_reduce_particles",
 	"vrmod_perf_no_rtt_shadows", "vrmod_perf_threaded_particles", "vrmod_perf_queued_ropes",
 	-- Character
-	"vrmod_floatinghands", "vrmod_characterik", "vrmod_armstretcher", "vrmod_characteryawblend",
+	"vrmod_floatinghands", "vrmod_floatinghands_chands", "vrmod_floatinghands_stub",
+	"vrmod_characterik", "vrmod_armstretcher", "vrmod_characteryawblend",
 	"vrmod_fbt_leginfluence", "vrmod_fbt_animshoulders",
 	"vrmod_sitheight", "vrmod_sitheadtohmddist", "vrmod_proneheight", "vrmod_proneheadtohmddist",
 	"vrmod_charactereyeheight", "vrmod_characterheadtohmddist", "vrmod_smallhull", "vrmod_hullscale", "vrmod_anticlip", "vrmod_scale",
@@ -211,7 +212,8 @@ do
 		vrmod_perf_no_bloom = "1", vrmod_perf_no_fancyblend = "1", vrmod_perf_no_lightwarp = "1",
 		vrmod_perf_no_pspatch = "1", vrmod_perf_no_motionblur = "1", vrmod_perf_reduce_particles = "1",
 		vrmod_perf_no_rtt_shadows = "1", vrmod_perf_threaded_particles = "1", vrmod_perf_queued_ropes = "1",
-		vrmod_floatinghands = "0", vrmod_characterik = "1", vrmod_armstretcher = "1",
+		vrmod_floatinghands = "0", vrmod_floatinghands_chands = "0", vrmod_floatinghands_stub = "1",
+		vrmod_characterik = "1", vrmod_armstretcher = "1",
 		vrmod_characteryawblend = "1.5", vrmod_fbt_leginfluence = "0.33",
 		vrmod_fbt_animshoulders = "1", vrmod_charactereyeheight = "55.6",
 		vrmod_characterheadtohmddist = "7.7", vrmod_smallhull = "1", vrmod_hullscale = "0.625", vrmod_anticlip = "1", vrmod_scale = "41.669140",
@@ -789,6 +791,12 @@ function VRUtilOpenMenu()
 		charForm.Paint = nil
 		charForm:CheckBox("Use floating hands", "vrmod_floatinghands")
 		charForm:ControlHelp("Use floating hand models instead of the full player body.")
+		charForm:CheckBox("Floating hands: use playermodel c_hands", "vrmod_floatinghands_chands")
+		charForm:ControlHelp("Draws your playermodel's registered viewmodel hands instead of the generic hand model, and follows playermodel changes. Rigs without ValveBiped hand bones fall back to the generic model.")
+		charForm:CheckBox("Floating hands: forearm stub", "vrmod_floatinghands_stub")
+		charForm:ControlHelp("Keeps the forearm as a rigid stub ending at the elbow. Off collapses everything above the wrist.")
+		charForm:NumSlider("Open-hand finger extend", "vrmod_finger_openextend", 0, 1, 2)
+		charForm:ControlHelp("How far the fingers straighten past the model's rest pose when open, as a fraction of the fist curl. Saved per floating-hands model, so set it once for each and it comes back with that model.")
 
 		local animSection = vgui.Create("DForm", t)
 		animSection:SetName("Animations")
@@ -1243,6 +1251,8 @@ function VRUtilOpenMenu()
 		form.Header:SetVisible(false)
 		form.Paint = nil
 
+		form:CheckBox("Weapon menu equips to left hand", "vrmod_weaponmenu_lefthand")
+		form:ControlHelp("Off = right hand (default). A grip press after the menu closes still picks the hand.")
 		form:CheckBox("Disable Pickup", "vr_pickup_disable_client")
 		form:CheckBox("Enable wall collisions", "vrmod_collisions")
 		form:CheckBox("Drop weapon on grip release", "vrmod_weapondrop_enable")
@@ -1488,7 +1498,7 @@ function VRUtilOpenMenu()
 		pickupForm:CheckBox("Weight limit", "vrmod_pickup_limit")
 		pickupForm:CheckBox("Pickup NPCs", "vrmod_pickup_npcs")
 		pickupForm:CheckBox("Disable prop physics", "vrmod_pickup_no_phys")
-		pickupForm:NumSlider("Pickup weight", "vrmod_pickup_weight", 1, 10000, 0)
+		pickupForm:NumSlider("Pickup weight", "vrmod_pickup_weight", 1, 100, 0)
 		pickupForm:NumSlider("Pickup range", "vrmod_pickup_range", 0.0, 10.0, 1)
 		pickupForm:CheckBox("Hand physics props", "vrmod_hand_physics")
 		pickupForm:ControlHelp("Spawns solid physics props on VR players' hands so they can shove objects around. Off despawns them, which also stops hands blocking bullets and movement. Applies live, no rejoin needed.")
@@ -1522,7 +1532,7 @@ function VRUtilOpenMenu()
 			local defs = {
 				vrmod_allow_teleport = "1", vrmod_teleport_maxdist = "500",
 				vrmod_pickup_limit = "1", vrmod_pickup_npcs = "1", vrmod_pickup_no_phys = "0",
-				vrmod_pickup_weight = "150", vrmod_pickup_range = "3.5", vrmod_selfdamage = "1",
+				vrmod_pickup_weight = "100", vrmod_pickup_range = "3.5", vrmod_selfdamage = "1",
 				vrmod_pickup_players = "0", vrmod_pickup_players_adminprotect = "1",
 				vrmod_hand_physics = "1",
 				sv_vrmod_melee = "1", vrmod_melee_damage = "3", vrmod_melee_velthreshold = "1.5",

@@ -1189,8 +1189,8 @@ if SERVER then
 	-- maxLen is in BITS. FBT keyframes run ~1500 bits (hmd+hands+fullbody+
 	-- muzzle); 1200 silently dropped every FBT tick. 210/sec covers 100 Hz
 	-- plus timer catch-up bursts after client hitches.
+	local _voZ = Vector()
 	vrmod.NetReceiveLimited("vrutil_net_tick", 210, 2400, function(len, ply)
-		vrmod.logger.Debug("received net_tick, len: " .. len)
 		local steamid = ply:SteamID()
 		if g_VR[steamid] == nil then return end
 		local viewHackPos = Vector(net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
@@ -1203,9 +1203,17 @@ if SERVER then
 		local frame = netReadDeltaFrame(baseFrame)
 		g_VR[steamid].latestFrame = frame
 		if not viewHackPos:IsZero() and util.IsInWorld(viewHackPos) then
-			ply.viewOffset = viewHackPos - ply:EyePos() + ply.viewOffset
-			ply:SetCurrentViewOffset(ply.viewOffset)
-			ply:SetViewOffset(Vector(0, 0, ply.viewOffset.z))
+			-- ABSOLUTE, not a running sum. The old form self-corrected only
+			-- while EyePos() == GetPos() + viewOffset; seated, EyePos() is the
+			-- VEHICLE view origin and ignores the offset entirely, so every
+			-- tick spent driving added (muzzle - vehicle eye) again. That
+			-- accumulated offset is what the gun inherited on the way out.
+			local vo, pp = ply.viewOffset, ply:GetPos()
+			if not vo then vo = Vector() ply.viewOffset = vo end
+			vo.x, vo.y, vo.z = viewHackPos.x - pp.x, viewHackPos.y - pp.y, viewHackPos.z - pp.z
+			ply:SetCurrentViewOffset(vo)
+			_voZ.z = vo.z
+			ply:SetViewOffset(_voZ)
 		else
 			ply:SetCurrentViewOffset(ply.originalViewOffset)
 			ply:SetViewOffset(ply.originalViewOffset)

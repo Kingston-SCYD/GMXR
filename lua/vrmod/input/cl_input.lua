@@ -240,27 +240,40 @@ end
 --    break them. Clear them there if a role refuses to go active.
 --  * handheld_object was broken in SteamVR for longer than the others; treat it
 --    as the least reliable of the set.
+-- Fourth column: the tier a role is suggested in. 1 = the three FBT roles,
+-- 2 = the rest of the extension's original (revision 1) role set, 3 = the
+-- wrist and ankle roles revision 3 added.
+--
+-- The tiers exist because of how SteamVR validates the suggestion. Every path
+-- for a profile goes into ONE xrSuggestInteractionProfileBindings call, and
+-- the runtime rejects the whole call (XR_ERROR_PATH_UNSUPPORTED) on the first
+-- path it does not recognise -- one unknown role silently unbinds the waist
+-- and both feet with it. SteamVR advertised revision 3 but rejected its wrist
+-- paths until late 2024 (ValveSoftware/openvr#1769), and a regression of the
+-- same shape can ship in any runtime update. Tier 3 is therefore opt-in via
+-- vrmod_trackers_htcx_rev3, and SuggestTrackerBindings steps down a tier
+-- whenever the module reports the call failed.
 local TRACKER_ROLES = {
-    { "pose_waist",      "waist",           "Waist"          },
-    { "pose_leftfoot",   "left_foot",       "Left Foot"      },
-    { "pose_rightfoot",  "right_foot",      "Right Foot"     },
-    { "pose_chest",      "chest",           "Chest"          },
-    { "pose_leftknee",   "left_knee",       "Left Knee"      },
-    { "pose_rightknee",  "right_knee",      "Right Knee"     },
-    { "pose_leftelbow",  "left_elbow",      "Left Elbow"     },
-    { "pose_rightelbow", "right_elbow",     "Right Elbow"    },
-    { "pose_leftshldr",  "left_shoulder",   "Left Shoulder"  },
-    { "pose_rightshldr", "right_shoulder",  "Right Shoulder" },
-    { "pose_leftwrist",  "left_wrist",      "Left Wrist"     },
-    { "pose_rightwrist", "right_wrist",     "Right Wrist"    },
-    { "pose_leftankle",  "left_ankle",      "Left Ankle"     },
-    { "pose_rightankle", "right_ankle",     "Right Ankle"    },
-    { "pose_camera",     "camera",          "Camera"         },
-    { "pose_keyboard",   "keyboard",        "Keyboard"       },
-    { "pose_handheld",   "handheld_object", "Handheld Object"},
+    { "pose_waist",      "waist",           "Waist", 1 },
+    { "pose_leftfoot",   "left_foot",       "Left Foot", 1 },
+    { "pose_rightfoot",  "right_foot",      "Right Foot", 1 },
+    { "pose_chest",      "chest",           "Chest", 2 },
+    { "pose_leftknee",   "left_knee",       "Left Knee", 2 },
+    { "pose_rightknee",  "right_knee",      "Right Knee", 2 },
+    { "pose_leftelbow",  "left_elbow",      "Left Elbow", 2 },
+    { "pose_rightelbow", "right_elbow",     "Right Elbow", 2 },
+    { "pose_leftshldr",  "left_shoulder",   "Left Shoulder", 2 },
+    { "pose_rightshldr", "right_shoulder",  "Right Shoulder", 2 },
+    { "pose_leftwrist",  "left_wrist",      "Left Wrist", 3 },
+    { "pose_rightwrist", "right_wrist",     "Right Wrist", 3 },
+    { "pose_leftankle",  "left_ankle",      "Left Ankle", 3 },
+    { "pose_rightankle", "right_ankle",     "Right Ankle", 3 },
+    { "pose_camera",     "camera",          "Camera", 2 },
+    { "pose_keyboard",   "keyboard",        "Keyboard", 2 },
+    { "pose_handheld",   "handheld_object", "Handheld Object", 2 },
 }
 
-local TRACKER_PATHS = {}
+local TRACKER_PATHS, TRACKER_TIER = {}, {}
 local VIVE_TRACKER_HTCX = {
     profile = "/interaction_profiles/htc/vive_tracker_htcx",
     bindings = {},
@@ -272,6 +285,7 @@ for i = 1, #TRACKER_ROLES do
     ALL_ACTIONS[r[1]] = { type = "pose", localizedActionName = r[3] .. " Pose" }
     VIVE_TRACKER_HTCX.bindings[r[1]] = path
     TRACKER_PATHS[i] = path
+    TRACKER_TIER[r[1]] = r[4]
 end
 
 --- Action name + role name pairs, for the tracker registry and the menu.
@@ -279,6 +293,36 @@ function vrmod.GetTrackerRoleActions() return TRACKER_ROLES end
 
 --- Bindable paths, for the XR bindings editor's tracker tab.
 function vrmod.GetTrackerRolePaths() return TRACKER_PATHS end
+
+-- Wrist/ankle roles (extension revision 3). Off by default; see TRACKER_ROLES.
+local cv_htcxRev3 = CreateClientConVar("vrmod_trackers_htcx_rev3", "0", true, false,
+    "Also bind the wrist and ankle Vive tracker roles. Needs SteamVR 2.8+; older runtimes reject the whole tracker profile", 0, 1)
+
+--- Suggests the HTCX profile largest tier first and steps down on failure. A
+--- rejected call stores nothing and a successful one replaces whatever the
+--- profile had before, so walking down is safe. The module's return counts
+--- as failure only when it says so (false, or a non-zero XrResult); a build
+--- that returns nothing makes the first call the only call, which is why the
+--- default tier has to stand on its own and tier 3 is opt-in.
+---
+--- An action the role table does not know about can only have come from a
+--- binding override, so it rides along in tiers 2 and 3 rather than being
+--- dropped -- but never in tier 1, which is the last resort and carries
+--- nothing but the three paths every revision of the extension defines.
+local function SuggestTrackerBindings(bindings)
+    for tier = cv_htcxRev3:GetBool() and 3 or 2, 1, -1 do
+        local sub, n = {}, 0
+        for k, v in pairs(bindings) do
+            local t = TRACKER_TIER[k] or (tier > 1 and tier or nil)
+            if t and t <= tier then sub[k] = v; n = n + 1 end
+        end
+        if n == 0 then return end
+        local r = VRMOD_SuggestBindings(VIVE_TRACKER_HTCX.profile, sub)
+        if r == nil or r == true or r == 0 then return tier end
+        vrmod.logger.Warn("[Trackers] HTCX binding tier " .. tier .. " rejected by the runtime ("
+            .. tostring(r) .. "), retrying with fewer roles")
+    end
+end
 
 local ALL_PROFILES = { OCULUS_TOUCH, VALVE_INDEX }
 
@@ -309,7 +353,11 @@ function vrmod.SetupXRActions()
                 if v ~= "" and not bindings[k] then bindings[k] = v end
             end
         end
-        VRMOD_SuggestBindings(prof.profile, bindings)
+        if prof == VIVE_TRACKER_HTCX then
+            SuggestTrackerBindings(bindings)
+        else
+            VRMOD_SuggestBindings(prof.profile, bindings)
+        end
     end
     VRMOD_SetActiveActionSets("base")
     VRMOD_AttachActionSets()

@@ -7,9 +7,8 @@ scripted_ents.Register({
 
 vrmod.AddCallbackedConvar("vrmod_pickup_limit", nil, 1, FCVAR_REPLICATED + FCVAR_NOTIFY + FCVAR_ARCHIVE, "", 0, 3, tonumber)
 vrmod.AddCallbackedConvar("vrmod_pickup_range", nil, 3.5, FCVAR_REPLICATED + FCVAR_ARCHIVE, "", 0.0, 999.0, tonumber)
-vrmod.AddCallbackedConvar("vrmod_pickup_weight", nil, 150, FCVAR_REPLICATED + FCVAR_ARCHIVE, "", 0, 10000, tonumber)
+vrmod.AddCallbackedConvar("vrmod_pickup_weight", nil, 100, FCVAR_REPLICATED + FCVAR_ARCHIVE, "", 0, 100, tonumber)
 vrmod.AddCallbackedConvar("vrmod_pickup_npcs", nil, 1, FCVAR_REPLICATED + FCVAR_NOTIFY + FCVAR_ARCHIVE, "", 0, 3, tonumber)
-vrmod.AddCallbackedConvar("vrmod_pickup_limit", nil, "1", FCVAR_REPLICATED + FCVAR_NOTIFY + FCVAR_ARCHIVE, "", 0, 3, tonumber)
 vrmod.AddCallbackedConvar("vrmod_pickup_no_phys", nil, 0, FCVAR_REPLICATED + FCVAR_NOTIFY + FCVAR_ARCHIVE, "", 0, 3, tonumber)
 if CLIENT then
 	if g_VR then
@@ -491,24 +490,22 @@ if SERVER then
 		end
 	end)
 
+	local _pickupCv = {}
 	local function UpdatePickupFlags()
 		vrmod.logger.Debug("Updating pickup flags for all players")
+		local cv = _pickupCv
+		cv.vrmod_pickup_npcs = GetConVar("vrmod_pickup_npcs"):GetInt()
+		cv.vrmod_pickup_limit = GetConVar("vrmod_pickup_limit"):GetInt()
+		cv.vrmod_pickup_weight = GetConVar("vrmod_pickup_weight"):GetFloat()
+		local CanPickup, IsImportant = vrmod.utils.CanPickupEntity, vrmod.utils.IsImportantPickup
 		for _, ply in ipairs(player.GetAll()) do
 			local nearbyEntities = ents.FindInSphere(ply:GetPos(), 300)
-			local cv = {
-				vrmod_pickup_npcs = GetConVar("vrmod_pickup_npcs"):GetInt(),
-				vrmod_pickup_limit = GetConVar("vrmod_pickup_limit"):GetInt(),
-				vrmod_pickup_weight = GetConVar("vrmod_pickup_weight"):GetFloat()
-			}
-
-			vrmod.logger.Debug("Convar values: npcs=" .. cv.vrmod_pickup_npcs .. ", limit=" .. cv.vrmod_pickup_limit .. ", weight=" .. cv.vrmod_pickup_weight)
-			for _, ent in ipairs(nearbyEntities) do
-				local canPickup = vrmod.utils.CanPickupEntity(ent, ply, cv)
+			local key = "vrmod_pickup_valid_for_" .. ply:SteamID()
+			for i = 1, #nearbyEntities do
+				local ent = nearbyEntities[i]
 				-- Weapons don't need physics to be pickable (ManualWeaponPickupHook
 				-- handles them via Give/SelectWeapon, not physics shadow)
-				if not canPickup and vrmod.utils.IsImportantPickup(ent) then canPickup = true end
-				vrmod.logger.Debug("Setting pickup flag for entity: " .. tostring(ent) .. ", player: " .. ply:SteamID() .. ", canPickup: " .. tostring(canPickup))
-				ent:SetNWBool("vrmod_pickup_valid_for_" .. ply:SteamID(), canPickup)
+				ent:SetNWBool(key, (CanPickup(ent, ply, cv) or IsImportant(ent)) and true or false)
 			end
 		end
 

@@ -291,6 +291,17 @@ elseif SERVER then
         return _sdDmgCache[at]
     end
 
+    -- Seated, Weapon_ShootPosition() is the vehicle view origin rather than
+    -- the gun, so bullets leave your head. EntityFireBullets hook order is
+    -- undefined, so each consumer resolves the real source itself instead of
+    -- relying on another hook having already corrected data.Src.
+    local function BulletSrc(ply, data)
+        if not ply:InVehicle() then return data.Src end
+        local vrd = g_VR[ply:SteamID()]
+        local mz = vrd and vrd.muzzlePos
+        return mz and not mz:IsZero() and mz or data.Src
+    end
+
     -- Self-damage: DistanceToLine against body spheres from VR tracking frame.
     -- Does NOT modify bullet data — won't eat other EntityFireBullets hooks.
     hook.Add("EntityFireBullets", "VRMod_SelfDamage", function(ent, data)
@@ -313,7 +324,7 @@ elseif SERVER then
         if spH < 10 then return end
         -- Per-player local size: userinfo client convar, read server-side.
         local sdScale = math.Clamp(ply:GetInfoNum("vrmod_selfdamage_scale", 1), 0.1, 4)
-        local src, dir, maxD = data.Src, data.Dir, data.Distance or 56756
+        local src, dir, maxD = BulletSrc(ply, data), data.Dir, data.Distance or 56756
         _sdEnd.x = src.x + dir.x * maxD; _sdEnd.y = src.y + dir.y * maxD; _sdEnd.z = src.z + dir.z * maxD
         _sdPt.x = (pp.x + hx) * 0.5; _sdPt.y = (pp.y + hy) * 0.5
         for i = 1, 3 do
@@ -345,7 +356,7 @@ elseif SERVER then
             or IsValid(data.Attacker) and data.Attacker:IsPlayer() and data.Attacker
             or ent.GetOwner and ent:GetOwner()
         if not IsValid(ply) or not ply:IsPlayer() then return end
-        local src, dir, maxD = data.Src, data.Dir, data.Distance or 56756
+        local src, dir, maxD = BulletSrc(ply, data), data.Dir, data.Distance or 56756
         _hbEnd.x = src.x + dir.x * maxD; _hbEnd.y = src.y + dir.y * maxD; _hbEnd.z = src.z + dir.z * maxD
         local headR = SD_BODY[SD_HEAD][2] * cv_vrhbScale:GetFloat()
         local best, bestFrac, bestPt
@@ -390,6 +401,9 @@ elseif SERVER then
         if not ply:IsPlayer() or not ply:InVehicle() then return end
         local veh = ply:GetVehicle()
         if not IsValid(veh) then return end
+        -- This hook already returns true, so it is the one that commits the
+        -- corrected source to the engine.
+        data.Src = BulletSrc(ply, data)
         while IsValid(veh:GetParent()) do veh = veh:GetParent() end
         local ignore = {veh}
         for _, c in ipairs(veh:GetChildren()) do ignore[#ignore + 1] = c end

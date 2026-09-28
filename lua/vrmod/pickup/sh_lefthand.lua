@@ -4,6 +4,9 @@
 	Attribution: grip press arms; equip within 0.6s commits. Direct
 	vrmod_pickup send for ground SWEPs (server rejects duplicates once the
 	ent is consumed). Weapon changes without a grip press reset to right.
+	`vrmod_weaponmenu_lefthand 1` makes an equip within 0.6s of the weapon
+	menu closing count as a left-hand grab too (a grip press after the menu
+	closed still wins).
 
 	Viewmodels: VMI mirrored grip-preserving (A_L=(p,-y,-r),
 	P_L=R(A_L)·R(A)^-1·P), cached until offsets or the mode change.
@@ -62,6 +65,15 @@ local IsValid, CurTime, LocalPlayer, LocalToWorld, hook_Add = IsValid, CurTime, 
 local pendingLeft, pendingT = false, 0
 local dropenable, cvRange, dbg
 local ourAnti, arcSet = false, false
+
+-- Weapon-menu attribution. Off by default: menu equips land in the right
+-- hand as they always have. On, the equip that follows a weapon-menu close
+-- is treated like a left-grip grab. menuT is the last close time, tracked
+-- from g_VR.menuFocus in the tracking pass (one compare per frame); the
+-- menu selects via input.SelectWeapon, so the switch lands a tick or two
+-- after focus is gone and a timestamp is the only thing left to test.
+local cv_menuLeft = CreateClientConVar("vrmod_weaponmenu_lefthand", "0", true, false, "Weapons taken from the weapon menu go to the left hand", 0, 1)
+local menuOpen, menuT = false, 0
 
 -- Global correction (hand space, pre-VMI), persisted; default 1 -2 0.
 -- Measured in-headset against mirror mode 1 across the HL2 and CSS weapon
@@ -178,14 +190,26 @@ local function RestoreOverride()
 end
 
 -- Commit on the frame the equip lands; weapon changes without a recent
--- grip press reset to right. 1 GetActiveWeapon + 1 compare per frame.
+-- grip press (or, with the option on, a recent weapon-menu close) reset to
+-- right. 1 GetActiveWeapon + 2 compares per frame.
 local lastWep, lastSent = NULL, false
 hook_Add("VRMod_Tracking", "vrmod_lefthand", function()
+	local mf = g_VR.menuFocus == "weaponmenu"
+	if mf ~= menuOpen then
+		menuOpen = mf
+		if not mf then menuT = CurTime() end
+	end
+
 	local wep = LocalPlayer():GetActiveWeapon()
 	if wep == lastWep then return end
 	lastWep = wep
 	local left = false
-	if pendingLeft and CurTime() - pendingT <= 0.6 and IsValid(wep) then
+	local now = CurTime()
+	-- A grip press after the menu closed (pendingT > menuT) overrides the
+	-- menu, whichever hand it was.
+	local armed = pendingLeft and now - pendingT <= 0.6
+		or pendingT < menuT and now - menuT <= 0.6 and cv_menuLeft:GetBool()
+	if armed and IsValid(wep) then
 		-- wm-rendered weapons can have no viewmodel; accept them too
 		if vrmod.utils.IsValidWep(wep) or wep.IsWMBase then
 			left = true
@@ -336,6 +360,7 @@ end
 InstallActionSwap()
 hook_Add("VRMod_Start", "vrmod_lefthand", function()
 	InstallActionSwap()
+	menuOpen, menuT = false, 0
 	-- move our PreRender to the END of the hook order (Add-in-place keeps
 	-- position; Remove+Add appends) so measurement sees the final transform
 	hook.Remove("VRMod_PreRender", "vrmod_lefthand")

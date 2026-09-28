@@ -58,6 +58,12 @@ local VALID_ROLES = {
 local FBT_SLOTS   = { "pelvis", "leftfoot", "rightfoot" }
 local FBT_BONEKEY = { pelvis = "pelvis", leftfoot = "leftFoot", rightfoot = "rightFoot" }
 local FBT_LEGACY  = { pelvis = "pose_waist", leftfoot = "pose_leftfoot", rightfoot = "pose_rightfoot" }
+-- HTCX role -> FBT slot for a fresh XR tracker. A tracker only appears under a
+-- role path because the user assigned that role in SteamVR, so it is pinned
+-- by default: a 3-puck rig then calibrates exactly as it did before the
+-- registry existed, with no proximity match to miss. The menu can still set
+-- it to auto, object or off, and that choice is what gets saved.
+local XR_PIN = { waist = "pelvis", left_foot = "leftfoot", right_foot = "rightfoot" }
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Convars
@@ -148,7 +154,7 @@ local function AddSlot(id, key, source, trackingKey)
 		key         = key,
 		source      = source,
 		trackingKey = trackingKey,
-		role        = rec and VALID_ROLES[rec.role] and rec.role or "auto",
+		role        = rec and VALID_ROLES[rec.role] and rec.role or source == "xr" and XR_PIN[key] or "auto",
 		label       = rec and rec.label or key,
 	}
 	slots[id] = s
@@ -603,8 +609,11 @@ function vrmod.MatchFBTTrackers(mdl, boneids, radius, commit)
 	-- Feet swap when the player calibrates with ankles close together, and the
 	-- result is a body that walks with its legs crossed. Model +Y is the
 	-- character's left, so the left foot must have the greater local Y.
+	-- Pinned feet are never swapped: the pin decides which is which at
+	-- runtime, so swapping only the calibration would offset each foot
+	-- from the other's tracker.
 	local lf, rf = out.leftfoot, out.rightfoot
-	if lf and rf then
+	if lf and rf and lf.role == "auto" and rf.role == "auto" then
 		local mpos, mang = mdl:GetPos(), mdl:GetAngles()
 		if WorldToLocal(lf.pose.pos, angle_zero, mpos, mang).y
 		 < WorldToLocal(rf.pose.pos, angle_zero, mpos, mang).y then

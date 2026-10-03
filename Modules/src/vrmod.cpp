@@ -145,6 +145,9 @@ bool                    g_createTexturePatched = false;
 uint32_t                g_createTextureSkips = 0;       // non-matching textures seen while armed
 #define                 MAX_CREATETEXTURE_SKIPS 256
 bool                    g_hasTrackerExtension = false;
+// XR_VALVE_frame_controller_interaction: not in older openxr.h, so the name is local
+#define                 XR_VALVE_FRAME_CONTROLLER_EXT_NAME "XR_VALVE_frame_controller_interaction"
+bool                    g_hasFrameController = false;
 
 // XR_EXT_hand_tracking
 bool                    g_hasHandTracking = false;
@@ -428,6 +431,7 @@ XrResult RefreshInstance() {
 	// Enumerate available extensions and conditionally enable tracker support
 	g_hasTrackerExtension = false;
 	g_hasHandTracking = false;
+	g_hasFrameController = false;
 	uint32_t extCount = 0;
 	if(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr) == XR_SUCCESS && extCount > 0)
 	{
@@ -445,6 +449,11 @@ XrResult RefreshInstance() {
 				{
 					extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 					g_hasHandTracking = true;
+				}
+				else if(strcmp(extProps[i].extensionName, XR_VALVE_FRAME_CONTROLLER_EXT_NAME) == 0)
+				{
+					extensions.push_back(XR_VALVE_FRAME_CONTROLLER_EXT_NAME);
+					g_hasFrameController = true;
 				}
 			}
 		}
@@ -773,6 +782,11 @@ LUA_FUNCTION(GetVersion) {
 
 LUA_FUNCTION(HasTrackerSupport) {
 	LUA->PushBool(g_hasTrackerExtension);
+	return 1;
+}
+
+LUA_FUNCTION(HasFrameControllerSupport) {
+	LUA->PushBool(g_hasFrameController);
 	return 1;
 }
 
@@ -1209,46 +1223,60 @@ LUA_FUNCTION(SuggestBindings) {
 	LUA->CheckType(-1,GarrysMod::Lua::Type::TABLE);
 
 	XrInteractionProfileSuggestedBinding suggestedBindings{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,nullptr};
-	suggestedBindings.countSuggestedBindings = 0;
 	suggestedBindings.interactionProfile = CreateXrPath(LUA->GetString(-2));
 
 	std::vector<XrActionSuggestedBinding> bindings = {};
 
+	// A value is one path string, or an array of them for an action fed by
+	// several inputs (Frame trigger + bumper). The runtime ORs booleans and
+	// takes the largest float across an action's bindings.
 	LUA->PushNil();
 	while(LUA->Next(-2) != 0) {
-		if(LUA->GetType(-1) == GarrysMod::Lua::Type::STRING && LUA->GetType(-2) == GarrysMod::Lua::Type::STRING)
+		int valueType = LUA->GetType(-1);
+		if(LUA->GetType(-2) == GarrysMod::Lua::Type::STRING
+			&& (valueType == GarrysMod::Lua::Type::STRING || valueType == GarrysMod::Lua::Type::TABLE))
 		{
-			action* act = GetActionFromName(LUA->GetString(-2));
+			const char* actionName = LUA->GetString(-2);
+			action* act = GetActionFromName(actionName);
 			if(act == nullptr)
 			{
 				char str[MAX_STR_LEN];
-				snprintf(str, MAX_STR_LEN, "XRMod: Failed to find action to bind '%s'", LUA->GetString(-2));
+				snprintf(str, MAX_STR_LEN, "XRMod: Failed to find action to bind '%s'", actionName);
 				PrintConsoleText(str, LUA);
 				LUA->Pop();
 				continue;
 			}
 
-			const char* pathString = LUA->GetString(-1);
-			XrPath bindingPath = CreateXrPath(pathString);
-			if(bindingPath == XR_NULL_PATH)
-			{
-				char str[MAX_STR_LEN];
-				snprintf(str, MAX_STR_LEN, "XRMod: Skipping '%s': invalid binding path '%s'", LUA->GetString(-2), pathString);
-				PrintConsoleText(str, LUA);
-				LUA->Pop();
-				continue;
-			}
+			// Path string must be on top of the stack
+			auto addPath = [&]() {
+				const char* pathString = LUA->GetString(-1);
+				XrPath bindingPath = CreateXrPath(pathString);
+				if(bindingPath == XR_NULL_PATH)
+				{
+					char str[MAX_STR_LEN];
+					snprintf(str, MAX_STR_LEN, "XRMod: Skipping '%s': invalid binding path '%s'", actionName, pathString);
+					PrintConsoleText(str, LUA);
+					return;
+				}
+				bindings.push_back({act->handle, bindingPath});
+			};
 
-			XrActionSuggestedBinding binding;
-			binding.action = act->handle;
-			binding.binding = bindingPath;
-			bindings.push_back(binding);
-
-			suggestedBindings.countSuggestedBindings++;
+			if(valueType == GarrysMod::Lua::Type::STRING)
+				addPath();
+			else
+				for(int i = 1;; i++)
+				{
+					LUA->PushNumber(i);
+					LUA->GetTable(-2);
+					if(LUA->GetType(-1) != GarrysMod::Lua::Type::STRING) { LUA->Pop(); break; }
+					addPath();
+					LUA->Pop();
+				}
 		}
 
 		LUA->Pop();
 	}
+	suggestedBindings.countSuggestedBindings = (uint32_t) bindings.size();
 	suggestedBindings.suggestedBindings = bindings.data();
 
 	XrResult result = xrSuggestInteractionProfileBindings(g_Instance,&suggestedBindings);
@@ -1262,7 +1290,9 @@ LUA_FUNCTION(SuggestBindings) {
 		PrintConsoleText(GetResultString("XRMod: (%s)",result),LUA);
 	}
 
-	return 0;
+	// 0 on success, the XrResult otherwise: cl_input's HTCX tier fallback keys off this
+	LUA->PushNumber(XR_SUCCEEDED(result) ? 0 : (double) result);
+	return 1;
 }
 
 LUA_FUNCTION(SetActiveActionSets) {
@@ -3287,6 +3317,9 @@ GMOD_MODULE_OPEN(){
 
 		LUA->PushCFunction(HasTrackerSupport);
 		LUA->SetField(-2, "HasTrackerSupport");
+
+		LUA->PushCFunction(HasFrameControllerSupport);
+		LUA->SetField(-2, "HasFrameControllerSupport");
 
 		LUA->PushCFunction(HasHandTracking);
 		LUA->SetField(-2, "HasHandTracking");

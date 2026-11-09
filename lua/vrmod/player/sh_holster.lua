@@ -6,14 +6,15 @@ AddCSLuaFile()
 -- ===================== CONVARS =====================
 if CLIENT then
     CreateClientConVar("vrmod_pouch_enabled",            1,                      true, FCVAR_ARCHIVE, nil, 0, 1)
-    CreateClientConVar("vrmod_pouch_visiblename",        1,                      true, FCVAR_ARCHIVE, nil, 0, 1)
-    CreateClientConVar("vrmod_pouch_visiblename_hud",    1,                      true, FCVAR_ARCHIVE, nil, 0, 1)
-    CreateClientConVar("vrmod_pouch_lefthandwep_enable", "0",                    true, FCVAR_ARCHIVE)
+    CreateClientConVar("vrmod_pouch_visiblename",        0,                      true, FCVAR_ARCHIVE, nil, 0, 1)
+    CreateClientConVar("vrmod_pouch_visiblename_hud",    0,                      true, FCVAR_ARCHIVE, nil, 0, 1)
+    CreateClientConVar("vrmod_pouch_lefthandwep_enable", "1",                    true, FCVAR_ARCHIVE)
     CreateClientConVar("vrmod_holster_showmodels",       1,                      true, FCVAR_ARCHIVE, "Show holstered weapon world models", 0, 1)
     CreateClientConVar("vrmod_holster_prop_maxvolume",   5750,                   true, FCVAR_ARCHIVE, "Max OBB volume for holsterable props (0=no limit)", 0, 999999)
-    CreateClientConVar("vrmod_holster_ragdolls",         1,                      true, FCVAR_ARCHIVE, "Allow holstering ragdolls", 0, 1)
+    CreateClientConVar("vrmod_holster_ragdolls",         0,                      true, FCVAR_ARCHIVE, "Allow holstering ragdolls", 0, 1)
     CreateClientConVar("vrmod_holster_ragdoll_models",   1,                      true, FCVAR_ARCHIVE, "Show ragdoll models on holster slots", 0, 1)
     CreateClientConVar("vrmod_holster_persist",         1,                      true, FCVAR_ARCHIVE, "Persist holstered weapons across map changes", 0, 1)
+    CreateClientConVar("vrmod_holster_follow_body",     0,                      true, true, "Holsters turn with your body instead of your head", 0, 1)
     -- The pouch itself, drawn at each grip centre. Default is the CS:S holster,
     -- which ships with GMod's mounted CS:S content. The on/off switch is kept
     -- separate from the path so turning it off does not make you retype the model.
@@ -28,12 +29,12 @@ if CLIENT then
     -- Per-slot, because the head/shoulder pair reads very differently from the
     -- hip pair: a holster on your hip looks right, one by your ear does not.
     for i = 1, 4 do
-        CreateClientConVar("vrmod_holster_model_slot" .. i, "1", true, false, "Draw the holster model on slot " .. i, 0, 1)
+        CreateClientConVar("vrmod_holster_model_slot" .. i, i > 2 and "1" or "0", true, false, "Draw the holster model on slot " .. i, 0, 1)
     end
 
     for i = 1, 4 do
         CreateClientConVar("vrmod_pouch_weapon_" .. i, "", true, FCVAR_ARCHIVE)
-        CreateClientConVar("vrmod_pouch_size_"   .. i, 12, true, FCVAR_ARCHIVE)
+        CreateClientConVar("vrmod_pouch_size_"   .. i, i > 2 and 6 or 9, true, false)
     end
 end
 
@@ -292,12 +293,21 @@ if SERVER then
             if not hipPos then continue end
             local headPos = ply:EyePos()
             local headAng = ply:EyeAngles()
+            -- Body mode: characterYaw off the client's frame. Floating hands
+            -- (dontHideBullets) sends 0 and vehicle frames are seat-relative,
+            -- so both keep the head.
+            if ply:GetInfoNum("vrmod_holster_follow_body", 0) ~= 0 and not ply:InVehicle() then
+                local pt = g_VR[ply:SteamID()]
+                local lf = pt and not pt.dontHideBullets and pt.latestFrame
+                if lf and lf.characterYaw then headAng = Angle(0, lf.characterYaw, 0) end
+            end
             local bodyFwd = headAng:Forward()
+            local headRight = headAng:Right()
             local hipRight = hipAng:Right()
 
             local positions = {
-                headPos + headAng:Right() * 7,
-                headPos - headAng:Right() * 7,
+                headPos + headRight * 7,
+                headPos - headRight * 7,
                 hipPos  + hipRight * 16,
                 hipPos  - hipRight * 16,
             }
@@ -374,24 +384,9 @@ if SERVER then
         local cached = ply._holster_ammo[slot]
         ply._holster_ammo[slot] = nil
 
-
-
-
-
-
-        net.Send(ply)
-
         -- ── DW entry: active ArcVR weapon + grabbing with the other hand ──
         local activeWep = ply:GetActiveWeapon()
-        local activeInLeft = false
-        if IsValid(activeWep) and activeWep.ArcticVR
-           and ArcticVR and ArcticVR.InterceptPickup
-           and isLeftHand ~= (not isLeftHand and activeInLeft or activeInLeft) then
-        end
-
-        local prevActiveInLeft = false
         if IsValid(activeWep) and activeWep.ArcticVR then
-            prevActiveInLeft = not isLeftHand
             ply._avr_pickupHand = isLeftHand
             local awDef = weapons.GetStored(activeWep:GetClass())
             ply._dw_ammoCache = {
@@ -439,7 +434,18 @@ if SERVER then
 
         -- ── Fast path: weapon in inventory, no DW ──
         if ply:HasWeapon(entClass) then
-            ply:SelectWeapon(entClass)
+            -- Still active right after a store: a delayed-holster base
+            -- (TacRP/ARC9/ArcCW) is mid holster anim and switches to empty by
+            -- itself when it ends, after this. SelectWeapon would be a no-op,
+            -- so re-draw on that switch instead (HolsterSystem_Redraw).
+            if IsValid(activeWep) and activeWep:GetClass() == entClass then
+                local now = CurTime()
+                if now - (ply._holster_emptyT or 0) < 2 then
+                    ply._holster_redraw, ply._holster_redrawT = entClass, now + 2
+                end
+            else
+                ply:SelectWeapon(entClass)
+            end
             if cached then
                 local wep = ply:GetWeapon(entClass)
                 if IsValid(wep) and wep.ArcticVR then
@@ -466,6 +472,24 @@ if SERVER then
                     if wep.SendWeapon then wep:SendWeapon(true, true) end
                 end
             end
+        end)
+    end)
+
+    -- Fires for refused switches too, which is what stamps the store's empty
+    -- request before a fast re-grab's draw arrives.
+    hook.Add("PlayerSwitchWeapon", "HolsterSystem_Redraw", function(ply, _, new)
+        if not IsValid(new) or new:GetClass() ~= "weapon_vrmod_empty" then return end
+        local now = CurTime()
+        ply._holster_emptyT = now
+        local cls = ply._holster_redraw
+        if not cls then return end
+        if now > ply._holster_redrawT then ply._holster_redraw = nil return end
+        timer.Simple(0, function()
+            if not IsValid(ply) or ply._holster_redraw ~= cls then return end
+            local aw = ply:GetActiveWeapon()
+            if IsValid(aw) and aw:GetClass() == cls then return end -- refused (anim start); wait for the final one
+            ply._holster_redraw = nil
+            ply:SelectWeapon(cls)
         end)
     end)
 
@@ -552,6 +576,7 @@ if CLIENT then
     local cv_ragdolls    = GetConVar("vrmod_holster_ragdolls")
     local cv_ragmodels   = GetConVar("vrmod_holster_ragdoll_models")
     local cv_persist     = GetConVar("vrmod_holster_persist")
+    local cv_followbody  = GetConVar("vrmod_holster_follow_body")
     local cv_hm_on       = GetConVar("vrmod_holster_model_enabled")
     local cv_hmodel      = GetConVar("vrmod_holster_model")
     local cv_hm_x        = GetConVar("vrmod_holster_model_x")
@@ -579,7 +604,6 @@ if CLIENT then
     -- ── Holster Map Persistence ──────────────────────────────────────────
     local PERSIST_PATH = "vrmod/holster_persist.json"
     local _holsterShuttingDown = false
-    local _holsterRestoreGrace = 0
 
     hook.Add("ShutDown", "vrmod_holster_persist_save", function()
         _holsterShuttingDown = true
@@ -610,7 +634,6 @@ if CLIENT then
         if not raw or raw == "" then return end
         local t = util.JSONToTable(raw)
         if not t then return end
-        _holsterRestoreGrace = CurTime() + 10
         timer.Simple(1, function()
             for i = 1, POUCH_SLOTS do
                 local v = t[tostring(i)]
@@ -737,23 +760,40 @@ if CLIENT then
     end)
 
     -- ---- Tracking: update holster world positions ----
+    -- Yaw and its basis are computed once here and reused by the draw pass
+    -- (which runs per eye), instead of rebuilding an Angle there.
+    local followBody = cv_followbody:GetBool()
+    cvars.AddChangeCallback("vrmod_holster_follow_body", function(_, _, new) followBody = new ~= "0" end, "vrmod_holster_follow_body_cb")
+    local sin, cos, rad = math.sin, math.cos, math.rad
+    local pouchYaw = 0
+    local bodyFwd, bodyRight = Vector(1, 0, 0), Vector(0, -1, 0)
+
     hook.Add("VRMod_Tracking", "vrmod_holster_follow_player", function()
         if not cv_enabled:GetBool() then return end
         if not IsVRReady() then return end
         local ply = LocalPlayer()
         if not IsValid(ply) or not ply:Alive() then return end
-        if not g_VR.tracking.hmd then return end
+        local hmd = g_VR.tracking.hmd
+        if not hmd then return end
 
-        local headPos = g_VR.tracking.hmd.pos
-        local bodyRight = Angle(0, g_VR.tracking.hmd.ang.yaw, 0):Right()
-        local hh = headPos.z - ply:GetPos().z
-        local hipZ = headPos.z - hh * 0.45
-        local hx, hy = headPos.x, headPos.y
-        local rx, ry = bodyRight.x, bodyRight.y
-        pouch_positions[1] = Vector(hx + rx * 7,  hy + ry * 7,  headPos.z)
-        pouch_positions[2] = Vector(hx - rx * 7,  hy - ry * 7,  headPos.z)
-        pouch_positions[3] = Vector(hx + rx * 16, hy + ry * 16, hipZ)
-        pouch_positions[4] = Vector(hx - rx * 16, hy - ry * 16, hipZ)
+        -- Body mode follows characterYaw, the yaw the playermodel renders at.
+        -- Floating hands pins characterYaw to 0, so the head stands in there.
+        -- The slots keep the same head-anchored offsets either way: the body
+        -- is placed behind the head along characterYaw, so they stay rigid
+        -- in the body's frame.
+        local yaw = followBody and not g_VR.handsPrime and g_VR.characterYaw or hmd.ang.yaw
+        pouchYaw = yaw
+        yaw = rad(yaw)
+        local rx, ry = sin(yaw), -cos(yaw) -- yaw-only Right()
+        bodyRight:SetUnpacked(rx, ry, 0)
+        bodyFwd:SetUnpacked(-ry, rx, 0)
+        local headPos = hmd.pos
+        local hx, hy, hz = headPos.x, headPos.y, headPos.z
+        local hipZ = hz - (hz - ply:GetPos().z) * 0.45
+        pouch_positions[1]:SetUnpacked(hx + rx * 7,  hy + ry * 7,  hz)
+        pouch_positions[2]:SetUnpacked(hx - rx * 7,  hy - ry * 7,  hz)
+        pouch_positions[3]:SetUnpacked(hx + rx * 16, hy + ry * 16, hipZ)
+        pouch_positions[4]:SetUnpacked(hx - rx * 16, hy - ry * 16, hipZ)
     end)
 
     -- ---- Equip from holster ----
@@ -857,18 +897,10 @@ if CLIENT then
                     local isLeft = g_VR.gunInLeftHand or (ArcticVR and ArcticVR.GunInLeftHand) or false
                     if (leftHand and isLeft) or (not leftHand and not isLeft) then
                         if slotOccupied then
-                            local cls = activeWeapon:GetClass()
-                            local getVel = isLeft and vrmod.GetLeftHandVelocity or vrmod.GetRightHandVelocity
-                            local getAng = isLeft and vrmod.GetLeftHandAngularVelocity or vrmod.GetRightHandAngularVelocity
-                            net.Start("DropWeapon")
-                            net.WriteBool(true)
-                            net.WriteVector(getVel() * 2.5)
-                            net.WriteVector(getAng() * 2.5)
-                            net.WriteBool(vrmod_holster.CountWeapon(cls) <= 1)
-                            net.SendToServer()
+                            vrmod.SendWeaponDrop(isLeft)
                             vrmod_holster.ClearHand(leftHand)
                         else
-                            LocalPlayer():ConCommand("vrmod_pouch_weapon_" .. i .. " " .. activeWeapon:GetClass())
+                            RunConsoleCommand("vrmod_pouch_weapon_" .. i, activeWeapon:GetClass())
                             storeActiveGuard = CurTime() + 0.5
                             if activeWeapon.ArcticVR then
                                 net.Start("vrmod_holster_cache_ammo")
@@ -879,7 +911,11 @@ if CLIENT then
                                 net.SendToServer()
                             end
                             surface.PlaySound("holster/uni_weapon_holster.wav")
-                            LocalPlayer():ConCommand("use weapon_vrmod_empty")
+                            -- Net, not `use`: `use` rides the next usercmd, which is
+                            -- unordered against net, so a quick re-grab's draw could
+                            -- land first and the late switch emptied the hand.
+                            net.Start("SelectEmptyWeapon")
+                            net.SendToServer()
                             vrmod_holster.ClearHand(leftHand)
                         end
                         return
@@ -1038,13 +1074,13 @@ if CLIENT then
         end
     end)
 
-    -- ---- Cleanup stale pending entries + stale holster slots ----
-    local lastStaleCheck = 0
+    -- ---- Cleanup stale pending entries + wipe on death ----
+    -- Slots are virtual: the draw path re-Gives a class the inventory lacks,
+    -- so a slot must never be cleared just because HasWeapon is false.
     hook.Add("Think", "HolsterSystem_CleanupPending", function()
+        local now = CurTime()
         for cls, data in pairs(holster_pickup_pending) do
-            if CurTime() - data.time >= 5.0 then
-                holster_pickup_pending[cls] = nil
-            end
+            if now - data.time >= 5 then holster_pickup_pending[cls] = nil end
         end
 
         local ply = LocalPlayer()
@@ -1061,23 +1097,6 @@ if CLIENT then
             vrmod_holster.hands.right = ""
         end
         vrmod_holster._wasAlive = alive
-
-        if CurTime() - lastStaleCheck < 5.0 then return end
-        lastStaleCheck = CurTime()
-        if not IsVRReady() then return end
-        if not alive then return end
-        if CurTime() < _holsterRestoreGrace then return end
-        for i = 1, POUCH_SLOTS do
-            local raw = cv_slots[i]:GetString()
-            if raw ~= "" then
-                local cls, mdl = vrmod_holster.ParseSlot(raw)
-                if not mdl then
-                    if not weapons.GetStored(cls) or not ply:HasWeapon(cls) then
-                        RunConsoleCommand("vrmod_pouch_weapon_" .. i, "")
-                    end
-                end
-            end
-        end
     end)
 
     -- ---- HUD: holster slot names ----
@@ -1227,6 +1246,8 @@ if CLIENT then
 
     local slotOffsets  = { -21, -21, 11, 11 }
     local slotVertical = { -10, -10, 0, 0 }
+    local slotAng = Angle()
+    local sphereCol, labelCol = Color(255, 255, 255, 128), Color(108, 81, 0)
 
     local function ComputeRemotePositions(ply, frame)
         local positions = {}
@@ -1255,9 +1276,9 @@ if CLIENT then
         -- ── Local player ──
         if cv_enabled:GetBool() and g_VR.threePoints then
             local showSpheres = cv_visname:GetBool()
-            local bodyYaw = g_VR.tracking.hmd and g_VR.tracking.hmd.ang.yaw or 0
-            local bodyAng = Angle(0, bodyYaw, 0)
-            local bodyFwd, bodyRight = bodyAng:Forward(), bodyAng:Right()
+            local bodyYaw = pouchYaw
+            local fx, fy = bodyFwd.x, bodyFwd.y
+            slotAng:SetUnpacked(90, bodyYaw, 0)
             local body = EnsureHolsterBody()
 
             for i = 1, POUCH_SLOTS do
@@ -1267,14 +1288,14 @@ if CLIENT then
 
                 if showSpheres then
                     render.SetColorMaterial()
-                    render.DrawSphere(pos, size, 16, 50, Color(255, 255, 255, 128))
+                    render.DrawSphere(pos, size, 16, 50, sphereCol)
                     if cls ~= "" then
                         local eyeAng = EyeAngles()
                         eyeAng:RotateAroundAxis(eyeAng:Right(), 60)
                         cam.Start3D2D(pos, eyeAng, 0.1)
                         local labelCls, labelMdl = vrmod_holster.ParseSlot(cls)
                         local labelText = labelMdl and string.GetFileFromFilename(labelMdl):StripExtension() or labelCls
-                        draw.SimpleText(labelText, "CloseCaption_Normal", 0, 0, Color(108, 81, 0), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+                        draw.SimpleText(labelText, "CloseCaption_Normal", 0, 0, labelCol, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
                         cam.End3D2D()
                     end
                 end
@@ -1283,8 +1304,10 @@ if CLIENT then
                 if showModels and not IsSlotRagdoll(cls) then
                     local csm = EnsureModel(holster_models, holster_classes, i, cls)
                     if IsValid(csm) then
-                        csm:SetPos(pos + bodyFwd * slotOffsets[i] + Vector(0, 0, slotVertical[i]))
-                        csm:SetAngles(Angle(90, bodyYaw, 0))
+                        local o = slotOffsets[i]
+                        hbPos:SetUnpacked(pos.x + fx * o, pos.y + fy * o, pos.z + slotVertical[i])
+                        csm:SetPos(hbPos)
+                        csm:SetAngles(slotAng)
                         csm:SetupBones()
                         csm:DrawModel()
                     end

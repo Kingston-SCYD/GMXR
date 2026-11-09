@@ -28,28 +28,49 @@ if SERVER then
     end)
 
     net.Receive("SelectEmptyWeapon", function(_, ply) ply:SelectWeapon("weapon_vrmod_empty") end)
+    -- The dropped worldmodel goes where the gun was drawn. The client sends
+    -- the pose of the gun's R_Hand bone as it drew it (GripPose, below);
+    -- the server rebuilds the model origin around it the way Source's own
+    -- Weapon_Drop does: bone pose * inverse(the bone's pose in the model).
+    -- The old spawn came off the server's hand -- a network frame late and
+    -- extrapolated a frame ahead, so a throw landed well out -- pushed along
+    -- the server's R_Hand bone, which on the server is the idle animation's,
+    -- not the VR hand's. A left-hand gun got the right bone's offset, and
+    -- in worldmodel mode is bone-shifted client-side where the server can't
+    -- follow at all. Trusted within 72u of the server's hand, and never
+    -- past a wall between the eyes and the grip.
+    local R_HAND, DROP_R2 = "ValveBiped.Bip01_R_Hand", 72 * 72
+    local trOut = {}
+    local trD = {mask = MASK_SOLID_BRUSHONLY, output = trOut}
+    local WorldToLocal, LocalToWorld = WorldToLocal, LocalToWorld
     net.Receive("DropWeapon", function(_, ply)
-        local dropAsWeapon = net.ReadBool()
-        local rhandvel = net.ReadVector()
-        local rhandangvel = net.ReadVector()
+        local left = net.ReadBool()
+        local rp, ra = net.ReadVector(), net.ReadAngle()
+        local rhandvel, rhandangvel = net.ReadVector(), net.ReadVector()
         local shouldStrip = net.ReadBool()
         local wep = ply:GetActiveWeapon()
-        if not IsValid(wep) or wep.undroppable or ply:InVehicle() or InBlackList(wep:GetClass()) then return end
-        local modelname = wep:GetModel()
-        local guninhandpos, guninhandang
-        if false then
-            guninhandpos = vrmod.GetLeftHandPos(ply)
-            guninhandang = vrmod.GetLeftHandAng(ply)
-        else
-            guninhandpos = vrmod.GetRightHandPos(ply)
-            guninhandang = vrmod.GetRightHandAng(ply)
+        if not IsValid(wep) or wep.undroppable or ply:InVehicle() then return end
+        local class = wep:GetClass()
+        if InBlackList(class) then return end
+        local hp, ha = vrmod.utils.GetHandTransform(ply, left)
+        if not (hp and rp:DistToSqr(hp) <= DROP_R2) then -- NaN fails too
+            if not hp then return end
+            rp, ra = hp, Angle(ha.p, ha.y, ha.r + 180) -- R_Hand = hand rolled 180
         end
-        local dropEnt
-        if dropAsWeapon then
-            dropEnt = ents.Create(wep:GetClass())
-        else
-            dropEnt = ents.Create("prop_physics")
+        trD.start, trD.endpos = ply:EyePos(), rp
+        util.TraceLine(trD)
+        local shift = trOut.Hit and trOut.HitPos + trOut.HitNormal * 2 - rp
+        local dropEnt = ents.Create(class)
+        if not IsValid(dropEnt) then return end
+        dropEnt:SetModel(wep:GetModel())
+        local pos, ang = rp, ra
+        local m = dropEnt:GetBoneMatrix(dropEnt:LookupBone(R_HAND) or 0)
+        if m then
+            local lp, la = WorldToLocal(m:GetTranslation(), m:GetAngles(), dropEnt:GetPos(), dropEnt:GetAngles())
+            lp, la = WorldToLocal(vector_origin, angle_zero, lp, la)
+            pos, ang = LocalToWorld(lp, la, rp, ra)
         end
+        if shift then pos = pos + shift end -- rp may be the hand's live pose
 
         -- Restore some ammo into dropped weapon if applicable
         local ammoType = wep:GetPrimaryAmmoType()
@@ -57,22 +78,21 @@ if SERVER then
         local clipSize = wep:GetMaxClip1()
         local currentClip = wep:Clip1()
         if ammoCount > 0 and currentClip < clipSize then
-            local ammoNeeded = clipSize - currentClip
-            local ammoToGive = math.min(ammoNeeded, ammoCount)
+            local ammoToGive = math.min(clipSize - currentClip, ammoCount)
             wep:SetClip1(currentClip + ammoToGive)
             ply:RemoveAmmo(ammoToGive, ammoType)
         end
 
         -- ── ArcticVR ammo stasis ─────────────────────────────────────────────
         local avrSnapshot = nil
-        if dropAsWeapon and wep.ArcticVR then
+        if wep.ArcticVR then
             avrSnapshot = {
                 LoadedRounds = wep.LoadedRounds or 0,
                 Chambered = wep.Chambered or 0,
                 Magazine = wep.Magazine, -- may be nil (no mag inserted)
             }
             if debug_arcvr:GetBool() then
-                print("[VRMod ArcVR Debug] Dropping weapon: " .. wep:GetClass())
+                print("[VRMod ArcVR Debug] Dropping weapon: " .. class)
                 print("[VRMod ArcVR Debug] Stamping - LoadedRounds: " .. tostring(avrSnapshot.LoadedRounds) .. " Chambered: " .. tostring(avrSnapshot.Chambered) .. " Mag: " .. tostring(avrSnapshot.Magazine))
             end
 
@@ -83,18 +103,16 @@ if SERVER then
         end
 
         -- ─────────────────────────────────────────────────────────────────────
-        ply:Give("weapon_vrmod_empty")
+        local empty = ply:GetWeapon("weapon_vrmod_empty")
+        if not IsValid(empty) then empty = ply:Give("weapon_vrmod_empty") end
         ply:SelectWeapon("weapon_vrmod_empty")
-        local boneID = ply:LookupBone("ValveBiped.Bip01_R_Hand")
-        local boneAng = boneID and select(2, ply:GetBonePosition(boneID)) or guninhandang
-        dropEnt:SetModel(modelname)
-        dropEnt:SetPos(guninhandpos + boneAng:Forward() * 10 + boneAng:Right() * 4)
-        dropEnt:SetAngles(guninhandang)
+        dropEnt:SetPos(pos)
+        dropEnt:SetAngles(ang)
         dropEnt:Spawn()
         -- Carry the clip across: without this the spawned entity keeps the SWEP
         -- default (-1 on anything never deployed), so picking your own gun back
         -- up as a duplicate handed back no ammo at all.
-        if dropAsWeapon then dropEnt:SetClip1(wep:Clip1()) end
+        dropEnt:SetClip1(wep:Clip1())
         -- Block touch pickup on what we just threw. It spawns inside the
         -- player's hull and PlayerCanPickupWeapon exempts anything younger than
         -- a tick as a scripted give, so it was grabbed straight back.
@@ -115,10 +133,22 @@ if SERVER then
             dropEnt.AVR_Magazine       = avrSnapshot.Magazine
         end
 
-        if dropAsWeapon and shouldStrip then
+        if shouldStrip then
             -- Double-check: don't strip if a DW ghost of the same class exists.
-            local dwSafe = not (ply._dw and ply._dw.active and ply._dw.class == wep:GetClass())
-            if dwSafe then ply:StripWeapon(wep:GetClass()) end
+            local dw = ply._dw
+            if not (dw and dw.active and dw.class == class) then
+                -- Delayed-holster bases (ArcCW/ARC9/TacRP) are still active
+                -- here, mid holster anim. Stripping the active weapon makes
+                -- the engine switch to the next best one, so the empty hand
+                -- takes over first; SetActiveWeapon skips Deploy, so the
+                -- viewmodel is pointed at it too.
+                if IsValid(empty) and ply:GetActiveWeapon() ~= empty then
+                    ply:SetActiveWeapon(empty)
+                    local vm = ply:GetViewModel()
+                    if IsValid(vm) then vm:SetWeaponModel(empty:GetWeaponViewModel(), empty) end
+                end
+                ply:StripWeapon(class)
+            end
         elseif avrSnapshot and IsValid(wep) then
             -- Not stripping — weapon stays in inventory for other copies (holster/DW).
             -- Restore the snapshot so the inventory entity isn't left zeroed.
@@ -126,7 +156,6 @@ if SERVER then
             wep.Chambered    = avrSnapshot.Chambered
             wep.Magazine     = avrSnapshot.Magazine
         end
-        timer.Simple(3, function() if IsValid(dropEnt) and dropEnt:GetClass() == "prop_physics" then dropEnt:Remove() end end)
     end)
 
     concommand.Add("vrmod_toggle_blacklist", function(ply)
@@ -185,14 +214,45 @@ if CLIENT then
     local dropenable = CreateClientConVar("vrmod_weapondrop_enable", 1, true, FCVAR_ARCHIVE, "", 0, 1)
     local droprelease = CreateClientConVar("vrmod_weapondrop_release", 40, true, FCVAR_ARCHIVE, "Grip % below which the held weapon drops (5 = must let go almost fully, 90 = hair trigger)", 5, 90)
 
-    -- Only strip from inventory if no other copy exists (holster slot or other hand).
-    local function ShouldStripOnDrop()
+    -- Where the held gun's R_Hand bone is as drawn: the server rebuilds the
+    -- dropped worldmodel around it. Worldmodel mode: the weapon's own
+    -- bonemerged bone, after sh_lefthand's left-hand shift. Viewmodel mode:
+    -- the viewmodel is hand * vmi offset in either hand (mirrored for the
+    -- left), so undoing the offset gives the hand the gun sits in, and
+    -- cl_character's R_Hand is that hand rolled 180.
+    local R180, R_HAND = Angle(0, 0, 180), "ValveBiped.Bip01_R_Hand"
+    local WorldToLocal, LocalToWorld = WorldToLocal, LocalToWorld
+    local function GripPose(left)
+        local vm = g_VR.viewModel
+        if g_VR.wmActive and IsValid(vm) then
+            local m = vm:GetBoneMatrix(vm:LookupBone(R_HAND) or 0)
+            if m then return m:GetTranslation(), m:GetAngles() end
+        end
+        local pos, ang = g_VR.viewModelPos, g_VR.viewModelAng
+        local vmi = g_VR.currentvmi
+        if vmi then
+            local ip, ia = WorldToLocal(vector_origin, angle_zero, vmi.offsetPos, vmi.offsetAng)
+            pos, ang = LocalToWorld(ip, ia, pos, ang)
+        end
+        return LocalToWorld(vector_origin, R180, pos, ang)
+    end
+
+    -- Every weapon drop (release, left release, full holster slot). Strips
+    -- the class only when no other copy exists (holster slot or other hand).
+    function vrmod.SendWeaponDrop(left)
         local ply = LocalPlayer()
-        if not IsValid(ply) then return true end
         local wpn = ply:GetActiveWeapon()
-        if not IsValid(wpn) then return true end
-        if not vrmod_holster or not vrmod_holster.CountWeapon then return true end
-        return vrmod_holster.CountWeapon(wpn:GetClass()) <= 1
+        if not IsValid(wpn) then return end
+        local hs = vrmod_holster
+        local p, a = GripPose(left)
+        net.Start("DropWeapon")
+        net.WriteBool(left)
+        net.WriteVector(p)
+        net.WriteAngle(a)
+        net.WriteVector((left and vrmod.GetLeftHandVelocity or vrmod.GetRightHandVelocity)() * 2.5)
+        net.WriteVector((left and vrmod.GetLeftHandAngularVelocity or vrmod.GetRightHandAngularVelocity)() * 2.5)
+        net.WriteBool(not (hs and hs.CountWeapon) or hs.CountWeapon(wpn:GetClass()) <= 1)
+        net.SendToServer()
     end
 
     local function DoDrop()
@@ -203,12 +263,7 @@ if CLIENT then
         -- will handle storage; do not send the drop net message.
         local hs = vrmod_holster
         if hs and (hs.IsHandInHolster(false) or hs.IsStoreSuppressed and hs.IsStoreSuppressed(false)) then return end
-        net.Start("DropWeapon")
-        net.WriteBool(true)
-        net.WriteVector(vrmod.GetRightHandVelocity() * 2.5)
-        net.WriteVector(vrmod.GetRightHandAngularVelocity() * 2.5)
-        net.WriteBool(ShouldStripOnDrop())
-        net.SendToServer()
+        vrmod.SendWeaponDrop(false)
     end
 
     -- Analog release threshold: while squeeze data exists, this owns dropping.

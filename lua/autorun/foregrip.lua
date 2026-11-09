@@ -8,6 +8,16 @@ Zone resolution order:
   * wep.VRGripPos -- weapon-defined grip point in dominant-hand-local space
     (tacvr's LHandPos equivalent); zone is a 3.5u sphere around it
   * otherwise the shared box/sphere zone in front of the dominant hand
+
+Two modes:
+  1 SNAP  -- every right-handed viewmodel weapon, manual reload on or off.
+            The zone and the hand pose come from vrmod.manualreload: the
+            viewmodel's own left hand, the pump, or the right hand mirrored.
+            The hand is placed ON that pose (lerped in), not pinned where it
+            grabbed.
+  2 FREE  -- everything else (worldmodels, left-handed): unchanged.
+            Always on for worldmodels (no viewmodel to snap to); left-handed
+            viewmodels need vrmod_foregrip_free 1.
 ]]
 
 if SERVER then return end
@@ -47,6 +57,11 @@ local gripPending = false
 local gripWM = false
 
 local ohHeld = false     -- offhand pickup button currently held
+-- Mode 2 (free grip) is off by default: only viewmodel weapons get a foregrip.
+local cv_free = CreateClientConVar("vrmod_foregrip_free", "0", true, false,
+	"Mode 2: free foregrip for left-handed viewmodels (worldmodels always have it)", 0, 1)
+local snap = false       -- mode 1: hand is placed on the provider's grip pose
+
 local pressT = 0         -- press time for the grace-window latch
 
 -- Hand lerp state
@@ -72,11 +87,26 @@ local math_NormalizeAngle = math.NormalizeAngle
 local RealFrameTime = RealFrameTime
 local Vector = Vector
 local Angle = Angle
+local vector_origin = vector_origin
+local angle_zero = angle_zero
 
 -- Two-hand aim state (reset on grab)
 local smX, smY, smZ = 0, 0, 0   -- smoothed unit aim direction
 local smValid = false
 local stockRamp = 0             -- virtual stock engage ramp, 0..1 at 5/sec
+
+-- Grip line: the gun-hand -> offhand direction in the gun hand's own frame,
+-- frozen at grab. GetTwoHandedAngle turns the hand so this line lands on the
+-- tracked gun-hand -> offhand direction: the gun keeps the angle to your
+-- hands it had when you grabbed it, and grabbing doesn't move it at all.
+-- Steering the MUZZLE onto that line, as before, leaned every gun toward the
+-- foregrip hand: neither hand's tracked origin is on the barrel axis (gun
+-- palm right of it, support palm left of and under the handguard), so their
+-- line runs ~10deg off the barrel. It also made the whole hand->muzzle chain
+-- (vmi offset, left-hand mirror, worldmodel bone, muzzlefix) matter; with the
+-- gun rigid on the hand it cancels out, so measuring it is gone too.
+local _lineOff, _lineInv = Angle(), Angle() -- hand -> grip line, and its inverse
+local _aim = Angle()                        -- scratch: target grip-line angle
 
 local _recoilPivot = Angle(0, 0, 0)  -- reused each frame for offhand recoil orbit
 
@@ -111,6 +141,12 @@ end
 -- hand already holding it.
 local function WepLeft()
 	return g_VR.gunInLeftHand or (ArcticVR and ArcticVR.GunInLeftHand) or false
+end
+
+-- Mode-1 provider (vrmod_manualreload); nil/inactive -> mode 2.
+local function Snap()
+	local m = vrmod and vrmod.manualreload
+	if m and not WepLeft() and m.GripActive() then return m end
 end
 
 -- One writer for the two-hand flag. vrmod_wmrecoil halves recoil while it is
@@ -162,21 +198,24 @@ local function IsValidForegrip(wep)
 end
 
 local function CalcGripOffsets(wepPos, wepAng, offPos, offAng)
-	-- Left-hand weapons skip the bone path -- which this comment has always
-	-- claimed, but the condition below never actually tested for.
-	--
-	-- sh_lefthand redirects a left-handed gun by rewriting g_VR.viewModelPos
-	-- and viewModelAng. It never moves the viewmodel ENTITY, and core VRMod
-	-- re-parks that entity at the right hand every frame via
-	-- UpdateViewModelPos(rightPos, rightAng). So vm:GetBoneMatrix() returns a
-	-- hand bone sitting at the RIGHT hand -- which, left-handed, is also the
-	-- offhand. Pinning the support hand to that bone anchors it to its own
-	-- motion instead of to the gun, which is why the aim reads correct (it is
-	-- computed from the real hand positions) while the hand still swings
-	-- opposite to the grab. The viewModelPos fallback is where the gun is.
+	-- Left-handed: anchor to the gun HAND, not to the gun. Neither of the
+	-- frames below is the gun when it is in the left hand: the viewmodel
+	-- entity is re-parked at the right hand every frame (so its hand bone is
+	-- the offhand itself), and g_VR.viewModelPos is only rewritten to the
+	-- left hand by sh_lefthand's own PreRender (viewmodels -- hook-order
+	-- dependent) or not at all (worldmodels -- it returns before writing, so
+	-- the value is still the right-hand pose from UpdateViewModelPos). Both
+	-- pin the offhand relative to itself, so it wanders off the gun. The gun
+	-- is a rigid LocalToWorld off pose_lefthand on both paths, so the hand
+	-- frame IS the gun frame and needs no ordering guarantee.
 	gripWM = g_VR.wmActive or false
+	gripBone = nil
+	if WepLeft() then
+		gripOffset, gripAngOffset = WorldToLocal(offPos, offAng, wepPos, wepAng)
+		return
+	end
 	local vm = LocalPlayer():GetViewModel()
-	if not g_VR.wmActive and not WepLeft() and IsValid(vm) then
+	if not g_VR.wmActive and IsValid(vm) then
 		gripBone = vm:LookupBone("ValveBiped.Bip01_R_Hand")
 		if not gripBone or gripBone < 0 then
 			gripBone = vm:LookupBone("weapon_root")
@@ -192,7 +231,6 @@ local function CalcGripOffsets(wepPos, wepAng, offPos, offAng)
 		end
 	end
 	-- Fallback: use last rendered VM position (consistent across all offset chains)
-	gripBone = nil
 	local wPos = g_VR.viewModelPos or wepPos
 	local wAng = g_VR.viewModelAng or wepAng
 	gripOffset, gripAngOffset = WorldToLocal(offPos, offAng, wPos, wAng)
@@ -206,7 +244,12 @@ local function TryGrab(wh, oh)
 
 	local lp = WorldToLocal(oh.pos, angle_zero, wh.pos, wh.ang)
 	local gp = wep.VRGripPos
-	if gp then
+	local m = Snap()
+	snap = m ~= nil
+	if not m and not (g_VR.wmActive or cv_free:GetBool()) then return false end -- mode 2 off
+	if m then
+		if not m.GripZone(oh.pos) then return false end
+	elseif gp then
 		-- Weapon-defined grip point: sphere around it (tacvr: dist < 3.5)
 		local r = GRIP_POINT_RADIUS * cv_scale:GetFloat()
 		if lp:DistToSqr(gp) > r * r then return false end
@@ -224,6 +267,12 @@ local function TryGrab(wh, oh)
 	lerpStart = SysTime()
 	smValid = false      -- fresh grab: drop stale smoothed aim
 	stockRamp = 0        -- and re-detect the shoulder from scratch
+	-- Grip line for this grab. Hands stacked inside 3u give no usable
+	-- direction (the aim's own guard), so the hand's forward stands in.
+	local la = lp:LengthSqr() >= 9 and lp:Angle() or angle_zero
+	_lineOff:Set(la)
+	local _, li = WorldToLocal(vector_origin, angle_zero, vector_origin, la)
+	_lineInv:Set(li)
 	handStartPos = Vector(oh.pos)
 	handStartAng = Angle(oh.ang)
 	-- Capture deferred to ForegripRender. Measuring here reads the
@@ -231,12 +280,13 @@ local function TryGrab(wh, oh)
 	-- frame's VRMod_Tracking has moved the viewmodel -- while the
 	-- apply reads them after. Capturing at the same point in the
 	-- frame that the apply runs makes the two agree by construction.
-	gripPending = true
+	gripPending = not snap
+	if m then m.OnGrip(true) end
 	return true
 end
 
--- Two-hand aim: gun-hand -> offhand direction becomes the weapon's forward
--- axis; roll stays on the dominant hand. On top of the plain LookAt
+-- Two-hand aim: gun-hand -> offhand direction becomes the GRIP LINE's
+-- forward axis (see _lineOff); roll stays on the dominant hand. On top of the plain LookAt
 -- (Quake VR / HL2VRU model):
 --   * virtual stock -- while the gun hand is shouldered, the aim blends
 --     toward the shoulder->offhand ray (H3VR-style pivot), on its own 5/sec
@@ -245,8 +295,11 @@ end
 --     that the short hand-to-hand baseline amplifies
 --   * stacked-hands guard -- inside 3 units the direction is pure noise, so
 --     hold the last stable aim instead of producing garbage yaw
--- No per-frame allocations except the returned Angle: the netframe takes
--- ownership of it, so it must be a unique object (never a reused one).
+-- Returns the HAND angle that puts the grip line on that direction: aim
+-- composed with the inverse of the hand->grip-line rotation.
+-- No per-frame allocations except the returned Angle (and the Vector the
+-- native hands back with it): the netframe takes ownership of the Angle, so
+-- it must be a unique object (never a reused one).
 local function GetTwoHandedAngle(wepAng, offPos, wepPos, fraction, wepLeft)
 	local dt = RealFrameTime()
 
@@ -310,14 +363,21 @@ local function GetTwoHandedAngle(wepAng, offPos, wepPos, fraction, wepLeft)
 	end
 	smX, smY, smZ, smValid = dx, dy, dz, true
 
-	-- Direction -> pitch/yaw; roll stays on the dominant hand
+	-- Direction -> pitch/yaw
 	local pitch = math_deg(math_atan2(-dz, math_sqrt(dx * dx + dy * dy)))
 	local yaw = math_deg(math_atan2(dy, dx))
-	if fraction >= 1 then return Angle(pitch, yaw, wepAng.r) end
-	return Angle(
-		wepAng.p + math_NormalizeAngle(pitch - wepAng.p) * fraction,
-		wepAng.y + math_NormalizeAngle(yaw - wepAng.y) * fraction,
-		wepAng.r)
+
+	-- Where the grip line points right now, off the raw hand: the blend
+	-- starts from here and its roll is kept, so the hand never twists on grab.
+	local _, m = LocalToWorld(vector_origin, _lineOff, vector_origin, wepAng)
+	if fraction < 1 then
+		pitch = m.p + math_NormalizeAngle(pitch - m.p) * fraction
+		yaw = m.y + math_NormalizeAngle(yaw - m.y) * fraction
+	end
+	_aim:SetUnpacked(pitch, yaw, m.r)
+	-- hand = aim * (hand->line)^-1
+	_, m = LocalToWorld(vector_origin, _lineInv, vector_origin, _aim)
+	return m
 end
 
 hook.Add("VRMod_Input", "Foregrip", function(action, pressed)
@@ -341,6 +401,8 @@ hook.Add("VRMod_Input", "Foregrip", function(action, pressed)
 			isGripping = false
 			gripPending = false
 			lerpStart = SysTime()
+			local m = snap and vrmod.manualreload
+			if m then m.OnGrip(false) end
 		end
 	end
 end)
@@ -359,7 +421,9 @@ hook.Add("VRMod_Tracking", "ForegripTracking", function()
 	local wep = LocalPlayer():GetActiveWeapon()
 	if not IsValid(wep) or NO_ROTATE_HOLD[wep:GetHoldType()] then return end
 	local WA = vrmod.weaponadapter
-	if visualOnlyWeapons[wep:GetClass()] or (WA and WA.IsVisualOnly(wep)) then
+	local mr = snap and vrmod.manualreload
+	-- Mode-1 slide grabs pin the hand to the slide but never steer the gun.
+	if visualOnlyWeapons[wep:GetClass()] or (WA and WA.IsVisualOnly(wep)) or (mr and mr.GripNoAim()) then
 		if isReleasing then isReleasing = false; lerpStart = nil end
 		return
 	end
@@ -429,9 +493,19 @@ local function ForegripRender()
 		return
 	end
 
+	-- Mode 1 needs the provider to still own this weapon; if it stopped
+	-- (weapon switch, worldmodel flip) the grip ends rather than switching mode.
+	local m = snap and Snap()
+	if snap and not m then
+		isGripping, snap = false, false
+		local mr = vrmod and vrmod.manualreload
+		if mr then mr.OnGrip(false) end
+		return
+	end
+
 	-- Capture on the first gripping frame, and re-capture if worldmodel mode
 	-- flipped underneath us (the two modes resolve against different frames).
-	if gripPending or gripWM ~= (g_VR.wmActive or false) then
+	if not snap and (gripPending or gripWM ~= (g_VR.wmActive or false)) then
 		gripPending = false
 		-- Capture the pose the hand was actually grabbed at. Snapping it to a
 		-- rail point instead would visibly teleport and re-orient the hand
@@ -449,7 +523,18 @@ local function ForegripRender()
 	-- last frame's hand for one frame is invisible, landing it a grip offset
 	-- away is not.
 	local aPos, aAng
-	if gripBone and not g_VR.wmActive and not wepLeft then
+	if snap then
+		-- Grip pose straight off the viewmodel bones, built this frame.
+		local vm = LocalPlayer():GetViewModel()
+		if not IsValid(vm) then return end
+		vm:SetupBones()
+		aPos, aAng = m.GripTarget()
+		if not aPos then return end
+	elseif wepLeft then
+		-- Hand frame (see CalcGripOffsets). wh.ang already carries this
+		-- frame's recoil kick, so the offhand orbits with it for free.
+		aPos, aAng = LocalToWorld(gripOffset, gripAngOffset, wh.pos, wh.ang)
+	elseif gripBone and not g_VR.wmActive then
 		local vm = LocalPlayer():GetViewModel()
 		if not IsValid(vm) then return end
 		-- RefreshViewModelMuzzle invalidates this cache on every call and, on
@@ -477,7 +562,7 @@ local function ForegripRender()
 	-- built from the un-pitched weapon/viewmodel position. Re-anchor the
 	-- offhand from the raw dominant frame into the recoiled one so it follows
 	-- the gun. wh.ang currently = raw - kick, so raw pitch = wh.ang.p + kick.
-	local kick = vrmod_wmrecoil and vrmod_wmrecoil.kick or 0
+	local kick = (not wepLeft and vrmod_wmrecoil) and vrmod_wmrecoil.kick or 0
 	if kick > 0 then
 		_recoilPivot.p, _recoilPivot.y, _recoilPivot.r = wh.ang.p + kick, wh.ang.y, wh.ang.r
 		local lp, la = WorldToLocal(aPos, aAng, wh.pos, _recoilPivot)
@@ -488,12 +573,6 @@ local function ForegripRender()
 	-- and netFrame (other players see this via character model).
 	oh.pos = aPos
 	oh.ang = aAng
-
-	if wepLeft then
-		vrmod.SetRightHandPose(aPos, aAng)
-	else
-		vrmod.SetLeftHandPose(aPos, aAng)
-	end
 
 	local nf = cachedSID and g_VR.net and g_VR.net[cachedSID] and g_VR.net[cachedSID].lerpedFrame
 	if nf then
@@ -518,29 +597,13 @@ hook.Add("VRMod_Exit", "ForegripExit", function(ply)
 	gripPending = false
 	ohHeld = false
 	SetGripping(false)
+	if snap and vrmod and vrmod.manualreload then vrmod.manualreload.OnGrip(false) end
+	snap = false
 end)
 
 hook.Add("VRMod_Start", "ForegripCacheSID", function(ply)
 	if ply ~= LocalPlayer() then return end
 	cachedSID = ply:SteamID()
-
-	-- Pin the offhand AFTER the weapon has been placed for this frame.
-	-- Right-handed that is already true: g_VR.viewModelPos is written during
-	-- the tracking phase, before any PreRender runs. Left-handed it is not --
-	-- sh_lefthand moves the gun from the right hand to the left in its own
-	-- VRMod_PreRender, which re-appends itself at VRMod_Start to run last. So
-	-- this pass was anchoring the offhand to the right-hand weapon pose while
-	-- the gun was drawn at the left hand.
-	--
-	-- Deferred by a zero timer rather than re-appending inline: both files
-	-- re-append during VRMod_Start and only the later one wins, so doing it
-	-- once every handler has returned lands us behind sh_lefthand no matter
-	-- what order the addons loaded in. Remove+Add appends; Add alone would
-	-- keep the existing position.
-	timer.Simple(0, function()
-		hook.Remove("VRMod_PreRender", "ForegripRender")
-		hook.Add("VRMod_PreRender", "ForegripRender", ForegripRender)
-	end)
 end)
 
 -- ── Debug: draw the grab zone ───────────────────────────────────────────────
@@ -611,13 +674,12 @@ hook.Add("PostDrawTranslucentRenderables", "ForegripDebug", function()
 	render.DrawWireframeBox(wh.pos, wh.ang, DBG_HMIN, DBG_HMAX, DBG_HAND, true)
 	render.DrawLine(wh.pos, oh.pos, col, true)
 
-	-- Aim basis, only while actually gripping. GetTwoHandedAngle sets the
-	-- weapon HAND's angle so its forward runs along the gun-hand -> offhand
-	-- vector (magenta). The gun's forward is that composed with the viewmodel
-	-- offset angle, which sh_lefthand mirrors in left-hand mode (white).
-	-- If the two rays agree, the aim is right and the complaint is about the
-	-- body swinging on its lever arm; if white mirrors magenta about the hand,
-	-- the mirrored offset angle is the culprit, not this file.
+	-- Aim basis, only while actually gripping. Magenta is the gun-hand ->
+	-- offhand line GetTwoHandedAngle steers the grip line onto; white is the
+	-- muzzle the render pass produced. White should hold whatever angle to
+	-- magenta it had at grab. If that angle drifts during a grip, something
+	-- between tracking and render is moving the gun after this file has
+	-- spoken (check hook order), not the aim math.
 	local muz = g_VR.viewModelMuzzle
 	if isGripping and dbgValid and muz then
 		local d = _dbgOff - _dbgWep
@@ -640,6 +702,7 @@ concommand.Add("vrmod_foregrip_test", function()
 	      " Rotation:", IsValid(wep) and not NO_ROTATE_HOLD[wep:GetHoldType() or ""] or false,
 	      " VisualOnly:", IsValid(wep) and visualOnlyWeapons[wep:GetClass()] or false)
 	print("  GripZone:", IsValid(wep) and wep.VRGripPos and tostring(wep.VRGripPos) or "default zone")
+	print(string.format("  GripLine: p %.1f y %.1f (hand frame, from grab)", _lineOff.p, _lineOff.y))
 	local lh = g_VR.tracking.pose_lefthand
 	local rh = g_VR.tracking.pose_righthand
 	if lh and rh then

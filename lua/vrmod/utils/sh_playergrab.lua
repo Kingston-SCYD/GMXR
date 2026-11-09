@@ -1,19 +1,17 @@
 -- sh_playergrab.lua
--- Grabbing live players, mirroring the NPC path in sh_npc2rag.lua: a prop_ragdoll
--- stands in as the visible body while the real player is hidden, frozen and
--- dragged along by SetPos so their PVS, audio and hitboxes stay with the body.
+-- Grabbing live players. The player is carried by the hand that took hold,
+-- translation only: the hand's offset at the grab is kept in world axes, so
+-- turning the wrist doesn't swing them round it. No stand-in body -- they
+-- stay themselves (hitboxes, weapon, damage), held still (MOVETYPE_NONE)
+-- and set where the hand carries them each tick, swept with their own hull
+-- so they can't be shoved into walls. Letting go hands them the hand's
+-- velocity.
 --
--- Everything hooks in by wrapping the existing pickup predicates rather than
--- editing them, so sh_pickup_util.lua is untouched and this file can be deleted
--- to remove the feature entirely.
+-- Hooks in by wrapping the pickup predicates, the NPC->ragdoll step (a
+-- player grab ends the normal pickup there) and vrmod.Drop, so sh_pickup and
+-- sh_pickup_util are untouched; delete this file to remove the feature.
 
-AddCSLuaFile()
-
-g_VR  = g_VR or {}
-vrmod = vrmod or {}
-vrmod.utils = vrmod.utils or {}
-
-local PELVIS_BONE = "ValveBiped.Bip01_Pelvis"
+local U = vrmod.utils
 
 -- Server-authoritative, so the client's targeting and halo code agrees with what
 -- the server will actually permit.
@@ -38,8 +36,7 @@ local function Outranks(target, grabber)
         if tg == gg then return false end
         -- Target outranks the grabber when the target's group inherits from the
         -- grabber's but not the other way round.
-        if CAMI.UsergroupInherits(tg, gg) and not CAMI.UsergroupInherits(gg, tg) then return true end
-        return false
+        return CAMI.UsergroupInherits(tg, gg) and not CAMI.UsergroupInherits(gg, tg)
     end
     return RankOf(target) > RankOf(grabber)
 end
@@ -49,332 +46,246 @@ end
 --=======================================================================
 local cv_players = GetConVar("vrmod_pickup_players")
 local cv_protect = GetConVar("vrmod_pickup_players_adminprotect")
+local pOn, pProt = cv_players:GetBool(), cv_protect:GetBool()
+cvars.AddChangeCallback("vrmod_pickup_players", function() pOn = cv_players:GetBool() end, "vrmod_playergrab_cv")
+cvars.AddChangeCallback("vrmod_pickup_players_adminprotect", function() pProt = cv_protect:GetBool() end, "vrmod_playergrab_cv")
 
 -- Shared so the client greys out targets the server would refuse anyway.
-function vrmod.utils.CanGrabPlayer(grabber, target)
-    if not cv_players:GetBool() then return false end
+function U.CanGrabPlayer(grabber, target)
+    if not pOn then return false end
     if not IsValid(grabber) or not IsValid(target) then return false end
     if target == grabber or not target:IsPlayer() then return false end
     if not target:Alive() or target:InVehicle() then return false end
-    if target:GetNWBool("vrmod_grabbed", false) then return false end
-    if cv_protect:GetBool() and Outranks(target, grabber) then return false end
+    if IsValid(target:GetNW2Entity("vrmod_grabber")) then return false end
+    -- Nobody carries someone carrying them, however far up: each would
+    -- chase the other's hand
+    local up = grabber
+    for _ = 1, 8 do
+        up = up:GetNW2Entity("vrmod_grabber")
+        if not IsValid(up) then break end
+        if up == target then return false end
+    end
+    if pProt and Outranks(target, grabber) then return false end
     -- Addon override, same shape as VRMod_Pickup: return false to refuse.
-    if hook.Run("VRMod_CanGrabPlayer", grabber, target) == false then return false end
+    if hook.Call("VRMod_CanGrabPlayer", nil, grabber, target) == false then return false end
     return true
 end
 
--- Wrap rather than edit. Deferred a tick because load order between this file
--- and sh_pickup_util.lua is not guaranteed and we must wrap the real function,
--- not be overwritten by it.
-timer.Simple(0, function()
-    local canPickup = vrmod.utils.CanPickupEntity
-    if canPickup then
-        function vrmod.utils.CanPickupEntity(v, ply, cv)
-            if IsValid(v) and v:IsPlayer() then return vrmod.utils.CanGrabPlayer(ply, v) end
-            return canPickup(v, ply, cv)
-        end
-    end
-
-    local validTarget = vrmod.utils.IsValidPickupTarget
-    if validTarget then
-        function vrmod.utils.IsValidPickupTarget(ent, ply, bLeftHand)
-            if IsValid(ent) and ent:IsPlayer() then return vrmod.utils.CanGrabPlayer(ply, ent) end
-            return validTarget(ent, ply, bLeftHand)
-        end
-    end
-
-    -- The pickup path funnels NPCs through here to swap in a ragdoll; players
-    -- take the same route so every downstream prop_ragdoll branch (bone grabs,
-    -- two-hand, throw velocity) works with no further changes.
-    if SERVER then
-        local handleNPC = vrmod.utils.HandleNPCRagdoll
-        if handleNPC then
-            function vrmod.utils.HandleNPCRagdoll(ply, ent)
-                if IsValid(ent) and ent:IsPlayer() then return vrmod.utils.SpawnPlayerRagdoll(ply, ent) end
-                return handleNPC(ply, ent)
-            end
-        end
-    end
-end)
-
 --=======================================================================
--- Server: ragdoll stand-in
+-- Server: carry
 --=======================================================================
+local grabs = {} -- [target] = {by, sid, left, off, mt, cg, filter}; server only
+local Release
 if SERVER then
     util.AddNetworkString("vrmod_playergrab_state")
 
-    local grabbed = {}   -- ragdoll -> player
-    local ragdollOf = {} -- player  -> ragdoll
+    -- Past this between where the hand would put them and where the sweep
+    -- left them (a wall in between), the grip is lost
+    local GAP2 = 96 * 96
+    local _out = {}
+    local _tr = {mask = MASK_PLAYERSOLID, output = _out}
 
-    local function PelvisPos(rag)
-        local bone = rag:LookupBone(PELVIS_BONE)
-        if bone then
-            local pos = rag:GetBonePosition(bone)
-            if pos and pos ~= rag:GetPos() then return pos end
-        end
-        return rag:GetPos()
-    end
-
-    -- Snap the ragdoll's physics bones onto the player's current animation pose,
-    -- otherwise it spawns T-posed and snaps a frame later.
-    local function CopyPose(ply, rag)
-        local plyPos = ply:GetPos()
-        for i = 0, rag:GetPhysicsObjectCount() - 1 do
-            local phys = rag:GetPhysicsObjectNum(i)
-            if not IsValid(phys) then continue end
-            local bone = rag:TranslatePhysBoneToBone(i)
-            if not bone or bone < 0 then continue end
-            local pos, ang = ply:GetBonePosition(bone)
-            if not pos or pos == plyPos then continue end
-            phys:EnableMotion(false)
-            phys:SetPos(pos)
-            phys:SetAngles(ang)
-            phys:EnableMotion(true)
-            phys:Wake()
-        end
-    end
-
-    local function CopyAppearance(ply, rag)
-        rag:SetSkin(ply:GetSkin())
-        for i = 0, ply:GetNumBodyGroups() - 1 do
-            rag:SetBodygroup(i, ply:GetBodygroup(i))
-        end
-        for i = 0, 31 do
-            local mat = ply:GetSubMaterial(i)
-            if mat ~= "" then rag:SetSubMaterial(i, mat) end
-        end
-        local col = ply:GetColor()
-        if col.r ~= 255 or col.g ~= 255 or col.b ~= 255 or col.a ~= 255 then
-            rag:SetColor(col)
-            rag:SetRenderMode(ply:GetRenderMode())
-        end
-    end
-
-    -- Tell the grabbed client to stop driving its own locomotion. Without this a
-    -- VR player's origin integrates velocity against a hull the server is
-    -- teleporting every tick, and the view tears away from the body.
-    local function SendState(target, rag)
+    -- Tells the carried client to ride the carrier's hand instead of its own
+    -- locomotion: its origin would integrate against a player that is set
+    -- somewhere else every tick.
+    local function SendState(target, g)
         net.Start("vrmod_playergrab_state")
-        net.WriteBool(IsValid(rag))
-        net.WriteEntity(rag or NULL)
+        net.WriteBool(g ~= nil)
+        if g then
+            net.WriteEntity(g.by)
+            net.WriteBool(g.left)
+            net.WriteVector(g.off)
+        end
         net.Send(target)
     end
 
-    function vrmod.utils.ReleasePlayerRagdoll(rag)
-        local target = grabbed[rag]
-        grabbed[rag] = nil
-        if not IsValid(target) then
-            if IsValid(rag) then rag:Remove() end
-            return
+    local function Carry()
+        for target, g in pairs(grabs) do
+            local by = g.by
+            if not (IsValid(target) and target:Alive() and IsValid(by) and by:Alive() and g_VR[g.sid]) then
+                Release(target)
+            else
+                local hp = U.GetHandTransform(by, g.left)
+                if hp then
+                    local to = hp + g.off
+                    _tr.start, _tr.endpos, _tr.filter = target:GetPos(), to, g.filter
+                    _tr.mins, _tr.maxs = target:OBBMins(), target:OBBMaxs()
+                    util.TraceHull(_tr)
+                    if _out.StartSolid then
+                        -- Already overlapping something: take the target if it's clear
+                        _tr.start = to
+                        util.TraceHull(_tr)
+                        if not _out.StartSolid then target:SetPos(to) end
+                    else
+                        target:SetPos(_out.HitPos)
+                        if _out.HitPos:DistToSqr(to) > GAP2 then Release(target) end
+                    end
+                end
+            end
         end
-        ragdollOf[target] = nil
+    end
 
-        local restorePos = IsValid(rag) and PelvisPos(rag) or target:GetPos()
-        -- Read before the ragdoll goes away. The pickup system has already put
-        -- the throw velocity on it by the time VRMod_Drop fires, so this is the
-        -- hand's throw and it should carry over to the player.
-        local vel
-        if IsValid(rag) then
-            local bone = rag:LookupBone(PELVIS_BONE)
-            local phys = bone and rag:GetPhysicsObjectNum(rag:TranslateBoneToPhysBone(bone) or 0)
-            if not IsValid(phys) then phys = rag:GetPhysicsObject() end
-            if IsValid(phys) then vel = phys:GetVelocity() end
+    -- vel: the carrying hand's, on a let-go. SetVelocity adds on players, so
+    -- whatever they had going in is cancelled with it.
+    function Release(target, vel)
+        local g = grabs[target]
+        if not g then return end
+        grabs[target] = nil
+        if not next(grabs) then hook.Remove("Tick", "vrmod_playergrab") end
+        if not IsValid(target) then return end
+        target:SetNW2Entity("vrmod_grabber", NULL)
+        target:SetMoveType(g.mt)
+        target:SetCollisionGroup(g.cg)
+        if not (vel and vel:LengthSqr() > 400) then
+            vel = vector_origin
+        elseif vel:LengthSqr() > 2250000 then
+            vel = vel:GetNormalized() * 1500
         end
-        target:SetNWBool("vrmod_grabbed", false)
-        target:Freeze(false)
-        target:SetMoveType(target._vrgrab_movetype or MOVETYPE_WALK)
-        target:SetCollisionGroup(target._vrgrab_group or COLLISION_GROUP_PLAYER)
-        target:SetNotSolid(false)
-        target:SetNoDraw(false)
-        local wep = target._vrgrab_wep
-        if IsValid(wep) then wep:SetNoDraw(target._vrgrab_wep_nodraw == true) end
-        target._vrgrab_movetype, target._vrgrab_group = nil, nil
-        target._vrgrab_wep, target._vrgrab_wep_nodraw = nil, nil
-        target:SetPos(restorePos)
-        -- Player:SetVelocity is additive, which is fine here: they were frozen,
-        -- so they are starting from zero. DropToFloor would eat the throw, so it
-        -- only runs when they were set down rather than launched.
-        if vel and vel:LengthSqr() > 400 then
-            target:SetVelocity(vel)
-        else
-            target:DropToFloor()
-        end
+        target:SetVelocity(vel - target:GetVelocity())
         SendState(target, nil)
-        if IsValid(rag) then rag:Remove() end
     end
+    U.ReleasePlayer = Release
 
-    function vrmod.utils.SpawnPlayerRagdoll(ply, target)
-        if not vrmod.utils.CanGrabPlayer(ply, target) then return target end
-
-        local existing = ragdollOf[target]
-        if IsValid(existing) then return existing end
-
-        -- First grab of a given playermodel used to come out wrong: nothing had
-        -- spawned a prop_ragdoll of it yet, so SetModel landed before the model
-        -- was ready and GetPhysicsObjectCount was 0 when CopyPose ran, leaving a
-        -- T-posed body. Precaching costs nothing once it is already loaded.
-        local mdl = target:GetModel()
-        util.PrecacheModel(mdl)
-
-        local rag = ents.Create("prop_ragdoll")
-        if not IsValid(rag) then return target end
-        rag:SetModel(mdl)
-        rag:SetPos(target:GetPos())
-        rag:SetAngles(target:GetAngles())
-        -- Reuses the existing ragdoll release path (throw velocity, mass, the
-        -- flag being cleared on drop), so no new drop handling is needed.
-        rag:SetNWBool("is_npc_ragdoll", true)
-        rag:SetNWBool("vrmod_is_player_ragdoll", true)
-        rag:Spawn()
-        rag:Activate()
-        rag:SetSaveValue("m_takedamage", 2)
-        rag:SetHealth(99999)
-        CopyPose(target, rag)
-        CopyAppearance(target, rag)
-
-        if IsValid(ply) then
-            rag:SetOwner(ply)
-            cleanup.Add(ply, "props", rag)
+    function U.GrabPlayer(ply, target, left)
+        if not U.CanGrabPlayer(ply, target) then return end
+        left = left == true
+        for t, g in pairs(grabs) do
+            if g.by == ply and g.left == left then Release(t) end -- one per hand
         end
-
-        target._vrgrab_movetype = target:GetMoveType()
-        target._vrgrab_group    = target:GetCollisionGroup()
-        target:SetNWBool("vrmod_grabbed", true)
+        local hp = U.GetHandTransform(ply, left)
+        if not hp then return end
+        local g = {by = ply, sid = ply:SteamID(), left = left, off = target:GetPos() - hp, mt = target:GetMoveType(), cg = target:GetCollisionGroup()}
+        -- The sweep skips both players and every VR hand prop (sv_physhands):
+        -- the carrier's sits right at the grip
+        g.filter = function(e) return e ~= target and e ~= ply and e.vrOwner == nil end
+        if not next(grabs) then hook.Add("Tick", "vrmod_playergrab", Carry) end
+        grabs[target] = g
         target:SetMoveType(MOVETYPE_NONE)
-        target:SetNotSolid(true)
-        target:SetNoDraw(true)
-        -- IN_VEHICLE on top of NotSolid: the player keeps a physics shadow that
-        -- shoves nearby props, and the ragdoll is the nearest prop there is.
-        -- That shove was the grabbed body kicking itself out of the hand.
-        target:SetCollisionGroup(COLLISION_GROUP_IN_VEHICLE)
-        target:Freeze(true)
-
-        -- NoDraw on the player does not hide the weapon: the worldmodel is its
-        -- own entity and keeps rendering at the old position.
-        local wep = target:GetActiveWeapon()
-        if IsValid(wep) then
-            target._vrgrab_wep = wep
-            target._vrgrab_wep_nodraw = wep:GetNoDraw()
-            wep:SetNoDraw(true)
-        end
-
-        grabbed[rag] = target
-        ragdollOf[target] = rag
-        SendState(target, rag)
-
-        rag:CallOnRemove("vrmod_playergrab_" .. rag:EntIndex(), function(self)
-            if grabbed[self] then vrmod.utils.ReleasePlayerRagdoll(self) end
-        end)
-
-        return rag
+        -- Other players, the carrier first, walk through them; shots still land
+        target:SetCollisionGroup(COLLISION_GROUP_PASSABLE_DOOR)
+        target:SetNW2Entity("vrmod_grabber", ply)
+        SendState(target, g)
     end
 
-    -- The player entity deliberately stays put while held. Teleporting it onto
-    -- the pelvis every tick is what made the body jolt out of the hand, and it
-    -- is not needed: the only thing the position was buying was network
-    -- visibility, which AddOriginToPVS gives for free. Position is reconciled
-    -- once, on release.
-    hook.Add("SetupPlayerVisibility", "vrmod_playergrab_pvs", function(ply)
-        local rag = ragdollOf[ply]
-        if IsValid(rag) then AddOriginToPVS(PelvisPos(rag)) end
-    end)
-
-    -- Real damage lands on the ragdoll while the player is non-solid, so it is
-    -- forwarded on. Physics-impact types are dropped: those are the carrier
-    -- bumping the body into walls, not someone attacking it.
-    hook.Add("EntityTakeDamage", "vrmod_playergrab_damage", function(ent, dmg)
-        local victim = grabbed[ent]
-        if not IsValid(victim) then return end
-        if dmg:IsDamageType(DMG_CRUSH) or dmg:IsDamageType(DMG_FALL) or dmg:IsDamageType(DMG_VEHICLE) then return true end
-        victim:TakeDamageInfo(dmg)
-        ent:SetHealth(99999)
-        return true
-    end)
-
-    -- Rummaging through weapons mid-carry would leave a visible worldmodel we
-    -- are not tracking. Simpler to refuse the switch than to chase it.
-    hook.Add("PlayerSwitchWeapon", "vrmod_playergrab_noswitch", function(ply)
-        if ragdollOf[ply] then return true end
-    end)
-
-    hook.Add("VRMod_Drop", "vrmod_playergrab_drop", function(_, ent)
-        if IsValid(ent) and grabbed[ent] then vrmod.utils.ReleasePlayerRagdoll(ent) end
-    end)
-
-    hook.Add("PlayerDeath", "vrmod_playergrab_death", function(ply)
-        local rag = ragdollOf[ply]
-        if IsValid(rag) then vrmod.utils.ReleasePlayerRagdoll(rag) end
-    end)
-
-    -- Warm the ragdoll model for every playermodel in play, so the cold path
-    -- above is never hit during an actual grab.
-    hook.Add("PlayerSpawn", "vrmod_playergrab_precache", function(ply)
-        timer.Simple(0, function()
-            if IsValid(ply) then util.PrecacheModel(ply:GetModel()) end
-        end)
-    end)
-
-    hook.Add("PlayerDisconnected", "vrmod_playergrab_disconnect", function(ply)
-        local rag = ragdollOf[ply]
-        if IsValid(rag) then vrmod.utils.ReleasePlayerRagdoll(rag) end
-    end)
-
-    hook.Add("PreCleanupMap", "vrmod_playergrab_cleanup", function()
-        for rag in pairs(grabbed) do vrmod.utils.ReleasePlayerRagdoll(rag) end
-    end)
+    local function ReleaseInvolving(ply)
+        for t, g in pairs(grabs) do
+            if t == ply or g.by == ply then Release(t) end
+        end
+    end
+    hook.Add("PlayerDeath", "vrmod_playergrab", ReleaseInvolving)
+    hook.Add("PlayerDisconnected", "vrmod_playergrab", ReleaseInvolving)
+    hook.Add("VRMod_Exit", "vrmod_playergrab", ReleaseInvolving)
+    -- Noclip or a seat would leave a carried player's state behind
+    hook.Add("PlayerNoClip", "vrmod_playergrab", function(ply) if grabs[ply] then return false end end)
+    hook.Add("CanPlayerEnterVehicle", "vrmod_playergrab", function(ply) if grabs[ply] then return false end end)
 
     -- Turning the feature off mid-round has to let go of anyone already held.
     cvars.AddChangeCallback("vrmod_pickup_players", function(_, _, new)
         if tonumber(new) ~= 0 then return end
-        for rag in pairs(grabbed) do vrmod.utils.ReleasePlayerRagdoll(rag) end
+        for t in pairs(grabs) do Release(t) end
     end, "vrmod_playergrab")
+end
 
---=======================================================================
--- Client: ride the ragdoll instead of driving locomotion
---=======================================================================
-else
-    local heldBy = nil
-
-    local VIEW_LIFT = Vector(0, 0, 8)
-
-    local function StopRiding()
-        heldBy = nil
-        hook.Remove("VRMod_Tracking", "vrmod_playergrab_ride")
-        hook.Remove("CalcView", "vrmod_playergrab_view")
-        if g_VR.active then vrmod.StartLocomotion() end
+-- Wrap rather than edit. Deferred a tick because the pickup files load after
+-- this one and we must wrap the real functions, not be overwritten by them.
+timer.Simple(0, function()
+    local canPickup = U.CanPickupEntity
+    if canPickup then
+        function U.CanPickupEntity(v, ply, cv)
+            if IsValid(v) and v:IsPlayer() then return U.CanGrabPlayer(ply, v) end
+            return canPickup(v, ply, cv)
+        end
     end
 
-    net.Receive("vrmod_playergrab_state", function()
-        local held = net.ReadBool()
-        local rag = net.ReadEntity()
-        if not held then return StopRiding() end
-
-        heldBy = rag
-        if not g_VR.active then
-            -- Desktop players have no origin override, and the player entity no
-            -- longer moves, so the camera has to be pointed at the body.
-            hook.Add("CalcView", "vrmod_playergrab_view", function(_, _, ang, fov)
-                if not IsValid(heldBy) then
-                    hook.Remove("CalcView", "vrmod_playergrab_view")
-                    return
-                end
-                return { origin = heldBy:GetPos() + VIEW_LIFT, angles = ang, fov = fov }
-            end)
-            return
+    local validTarget = U.IsValidPickupTarget
+    if validTarget then
+        function U.IsValidPickupTarget(ent, ply, bLeftHand)
+            if IsValid(ent) and ent:IsPlayer() then return U.CanGrabPlayer(ply, ent) end
+            return validTarget(ent, ply, bLeftHand)
         end
-        -- Locomotion owns g_VR.origin and would fight the server's SetPos.
-        vrmod.StopLocomotion()
-        hook.Add("VRMod_Tracking", "vrmod_playergrab_ride", function()
-            if not IsValid(heldBy) then return StopRiding() end
-            -- g_VR.origin is a live reference other systems reassign, so it is
-            -- re-fetched and written in place rather than cached across frames.
-            local o = g_VR.origin
-            local p = heldBy:GetPos()
-            o.x, o.y, o.z = p.x, p.y, p.z
-        end)
-    end)
+    end
 
-    hook.Add("VRMod_Exit", "vrmod_playergrab_exit", function(ply)
-        if ply == LocalPlayer() then hook.Remove("VRMod_Tracking", "vrmod_playergrab_ride") end
-    end)
+    if not SERVER then return end
+    -- vrmod.Pickup runs every grab through here after validation; a player
+    -- is carried instead, and the nil ends the prop pickup there.
+    local handleNPC = U.HandleNPCRagdoll
+    if handleNPC then
+        function U.HandleNPCRagdoll(ply, ent)
+            if IsValid(ent) and ent:IsPlayer() then return U.GrabPlayer(ply, ent, ply.vrmod_pickup_left_hand) end
+            return handleNPC(ply, ent)
+        end
+    end
+
+    -- The carrier's client never holds an entity here, so its grip release
+    -- arrives as a drop with no pickup entry: let go of the carried player.
+    local drop = vrmod.Drop
+    if drop then
+        function vrmod.Drop(steamid, bLeft)
+            for t, g in pairs(grabs) do
+                local by = g.by
+                if g.left == bLeft and IsValid(by) and by:SteamID() == steamid then
+                    Release(t, bLeft and vrmod.GetLeftHandVelocity(by) or vrmod.GetRightHandVelocity(by))
+                end
+            end
+            return drop(steamid, bLeft)
+        end
+    end
+end)
+
+if SERVER then return end
+
+--=======================================================================
+-- Client: ride the carrier's hand instead of driving locomotion
+--=======================================================================
+-- The server sets the player on the hand at tick rate; the view rides the
+-- carrier's interpolated network hand at frame rate instead, by the same
+-- offset. lift keeps the playspace origin where it sat against the player.
+local by, left, sid, rode
+-- off + lift, and lift alone, as numbers: both fixed for the ride
+local ox, oy, oz, lx, ly, lz = 0, 0, 0, 0, 0, 0
+local VUnpack, VSetU = FindMetaTable("Vector").Unpack, FindMetaTable("Vector").SetUnpacked
+
+local function Stop()
+    hook.Remove("VRMod_Tracking", "vrmod_playergrab_ride")
+    if rode and g_VR.active then vrmod.StartLocomotion() end
+    by, rode = nil, false
 end
+
+local function Ride()
+    if not IsValid(by) then return Stop() end
+    sid = sid or by:SteamID()
+    local nd = g_VR.net[sid]
+    local f = nd and nd.lerpedFrame
+    local hp = f and (left and f.lefthandPos or f.righthandPos)
+    -- g_VR.origin is a live reference other systems reassign: written in place
+    if hp then
+        local x, y, z = VUnpack(hp)
+        VSetU(g_VR.origin, x + ox, y + oy, z + oz)
+    else
+        local x, y, z = VUnpack(LocalPlayer():GetPos())
+        VSetU(g_VR.origin, x + lx, y + ly, z + lz)
+    end
+end
+
+net.Receive("vrmod_playergrab_state", function()
+    if not net.ReadBool() then return Stop() end
+    local off
+    by, left, off = net.ReadEntity(), net.ReadBool(), net.ReadVector()
+    -- Desktop players need nothing: their camera rides the player entity
+    if not g_VR.active then return end
+    if not rode then
+        vrmod.StopLocomotion()
+        rode = true
+    end
+    sid = nil -- resolved on the first ride frame, once by is valid
+    lx, ly, lz = VUnpack(g_VR.origin - LocalPlayer():GetPos())
+    local x, y, z = VUnpack(off)
+    ox, oy, oz = x + lx, y + ly, z + lz
+    hook.Add("VRMod_Tracking", "vrmod_playergrab_ride", Ride)
+end)
+
+hook.Add("VRMod_Exit", "vrmod_playergrab_exit", function(ply)
+    if ply ~= LocalPlayer() then return end
+    hook.Remove("VRMod_Tracking", "vrmod_playergrab_ride")
+    by, rode = nil, false
+end)

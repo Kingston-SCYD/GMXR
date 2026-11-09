@@ -2,7 +2,7 @@
 -- Addon-conflict detection, hook suppression and stall reporting.
 --
 -- Three jobs:
---   1. Warn about addons known to break VR rendering (gShader and friends).
+--   1. Warn about addons known to break VR rendering.
 --   2. Detect and optionally suppress foreign ShouldDrawLocalPlayer hooks,
 --      which silently win over VRMod's and kill the body/hands.
 --   3. Tell the user WHY the headset went blank instead of leaving them to
@@ -27,15 +27,9 @@ local cv_stallwarn = CreateClientConVar("vrmod_compat_stallwarn", "1", true, fal
 -- Matched on workshop/legacy addon title, global table or convar -- whichever
 -- the addon happens to expose. Any single hit counts.
 ------------------------------------------------------------------------
-local INCOMPATIBLE = {
-	{
-		label = "gShader",
-		why = "replaces the scene render pipeline; VR eyes render black, single-eye or heavily ghosted.",
-		titles = { "gshader" },
-		globals = { "gShader", "GShader", "gshader", "gShaderMod" },
-		convars = { "gshader_enabled", "gshader_toggle", "gshader_quality", "mat_gshader" },
-	},
-}
+-- GShader used to be listed here; it renders now (see the bridge below,
+-- switched by vrmod_postprocess).
+local INCOMPATIBLE = {}
 
 local function AddonTitles()
 	local out, add = {}, nil
@@ -157,6 +151,7 @@ function C.GetStallReason()
 end
 
 local stallStart
+local COL_BANNER = Color(20, 20, 20, 230)
 hook.Add("PostRenderVGUI", "vrmod_compat_stallbanner", function()
 	if not cv_stallwarn:GetBool() or not started then
 		stallStart = nil
@@ -174,11 +169,98 @@ hook.Add("PostRenderVGUI", "vrmod_compat_stallbanner", function()
 
 	local w = math.min(ScrW() - 40, 720)
 	local x, y = (ScrW() - w) * 0.5, 24
-	draw.RoundedBox(6, x, y, w, 64, Color(20, 20, 20, 230))
-	draw.RoundedBox(6, x, y, 5, 64, COL_WARN)
-	draw.SimpleText("VR rendering is stalled - the headset is not updating", "DermaLarge", x + 18, y + 10, COL_WARN)
-	draw.SimpleText(reason .. ". Close it and refocus the game to resume.", "DermaDefaultBold", x + 18, y + 42, COL_TEXT)
+	draw.RoundedBox(6, x, y, w, 32, COL_BANNER)
+	draw.RoundedBox(6, x, y, 5, 32, COL_WARN)
+	draw.SimpleText(reason .. ". Close it and refocus the game to resume.", "DermaDefaultBold", x + 18, y + 16, COL_TEXT, TEXT_ALIGN_LEFT, TEXT_ALIGN_CENTER)
 end)
+
+------------------------------------------------------------------------
+-- GShader bridge
+--
+-- shaderlib builds its 3D screen quad (Draw3DScreenQuad and
+-- DrawVertexScreenQuad, the MRT path) once per frame in RenderScene, from
+-- the desktop view -- and VRMod's RenderScene returns true, so whether it
+-- even runs depends on hook order. Either way every VR eye drew its effects
+-- on a quad framing the wrong view. PreDrawReconstruction fires inside each
+-- eye's own RenderView ahead of every effect, so the quad is rebuilt there
+-- from that eye's view setup. Extents come from shaderlib's own projection
+-- (GetProjMatrix: x = cot(fov/2), y = cot(fov/2) * aspect), so the quad is
+-- exactly the near plane its reconstruction assumes.
+------------------------------------------------------------------------
+do
+	local tan, rad = math.tan, math.rad
+
+	-- Engine postprocessing is GShader's VR switch: off, CanDrawEffects says
+	-- no in VR (DrawReconstruction asks it first and every effect hangs off
+	-- its hooks), so nothing of GShader's runs per eye.
+	--
+	-- Eye size is free: the engine's depth pass stretches to the full-frame
+	-- texture whatever the view size (measured in-eye), and so do the colour
+	-- copy and GShader's own full-target passes. What doesn't is
+	-- DrawScreenQuad: a render.DrawQuad in cam.Start2D (for MRT) with corners
+	-- cached at the desktop size, which in a headset-sized eye covers only
+	-- the top-left. In VR the corners come from the current target instead
+	-- (ScrW/ScrH report it mid-render), so it fits the eye and GShader's own
+	-- framebuffer-sized targets alike. Wrapped once; desktop is untouched.
+	local q1, q2, q3, q4 = Vector(), Vector(), Vector(), Vector()
+	function C.WrapGShader()
+		local sl = shaderlib
+		local orig = sl and sl.CanDrawEffects
+		if not orig or sl.vrmodWrapped then return end
+		sl.vrmodWrapped = true
+		sl.CanDrawEffects = function(...)
+			if started and not (g_VR.view and g_VR.view.dopostprocess) then return false end
+			return orig(...)
+		end
+		local quad = sl.DrawScreenQuad
+		if quad then
+			sl.DrawScreenQuad = function()
+				if not started then return quad() end
+				local w, h = ScrW(), ScrH()
+				q2:SetUnpacked(w, 0, 0)
+				q3:SetUnpacked(w, h, 0)
+				q4:SetUnpacked(0, h, 0)
+				cam.Start2D()
+				render.SetWriteDepthToDestAlpha(false)
+				cam.IgnoreZ(true)
+				render.DrawQuad(q1, q2, q3, q4)
+				cam.IgnoreZ(false)
+				render.SetWriteDepthToDestAlpha(true)
+				cam.End2D()
+			end
+		end
+	end
+
+	-- Engine postprocessing is GShader's VR switch. Callback, not the settings
+	-- checkbox, so the console path says it too.
+	local COL_W = Color(255, 190, 60)
+	cvars.AddChangeCallback("vrmod_postprocess", function(_, _, new)
+		if new == "0" or not shaderlib then return end
+		if started then C.WrapGShader() end
+		chat.AddText(COL_W, "[VRMod] ", color_white, "GShader now renders in VR. The scene stays at full headset resolution, but GShader's buffers are fixed to the game window, so its effects are computed at your game resolution and stretched over each eye: expect them softer than the scene. It also runs twice a frame, once per eye.")
+	end, "vrmod_gshader_notice")
+
+	hook.Add("PreDrawReconstruction", "vrmod_gshader_quad", function()
+		if not started then return end
+		local sl = shaderlib
+		local q = sl and sl.quadVerts
+		if not q then return end
+		local vs = render.GetViewSetup(false)
+		local zn = vs.znear + 0.01 -- shaderlib's z-fighting bias
+		local a = vs.angles
+		local f, r, u = a:Forward(), a:Right(), a:Up()
+		local hw = tan(rad(vs.fov * 0.5)) * zn
+		local hh = hw / (vs.aspect or 1)
+		sl.halfW, sl.halfH = hw, hh
+		local c = vs.origin + f * zn
+		r:Mul(hw)
+		u:Mul(hh)
+		q[1] = c - r + u
+		q[2] = c + r + u
+		q[3] = c + r - u
+		q[4] = c - r - u
+	end)
+end
 
 ------------------------------------------------------------------------
 -- Reporting
@@ -220,6 +302,7 @@ end
 hook.Add("VRMod_Start", "vrmod_compat", function(ply)
 	if ply ~= LocalPlayer() then return end
 	started = true
+	C.WrapGShader()
 	-- Deferred: addons that add their hooks on spawn/deploy are not in the
 	-- table yet at VRMod_Start.
 	timer.Simple(1, function()

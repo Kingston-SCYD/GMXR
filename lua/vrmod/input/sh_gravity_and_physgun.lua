@@ -25,22 +25,27 @@ if CLIENT then
         lastHandAng = newAng
     end
 
+    -- Sole owner of +use for boolean_use / boolean_exit. The press is gated by
+    -- AllowDefaultAction; the release only by whether the press ran, so a gate
+    -- flipping mid-hold (e.g. a door under the crosshair) can't strand +use.
+    local useDown = false
     hook.Add("VRMod_Input", "physgun_controll", function(action, pressed)
-        if hook.Call("VRMod_AllowDefaultAction", nil, action) == false then return end
-        if action == "boolean_use" or action == "boolean_exit" then
-            if pressed then
-                LocalPlayer():ConCommand("+use")
-                local wep = LocalPlayer():GetActiveWeapon()
-                if IsValid(wep) and wep:GetClass() == "weapon_physgun" then
-                    lastHandPos = g_VR.tracking.pose_lefthand.pos
-                    lastHandAng = g_VR.tracking.pose_lefthand.ang
-                    hook.Add("CreateMove", "vrutil_hook_cmphysguncontrol", VRPhysgunControl)
-                end
-            else
-                LocalPlayer():ConCommand("-use")
-                hook.Remove("CreateMove", "vrutil_hook_cmphysguncontrol")
-            end
+        if action ~= "boolean_use" and action ~= "boolean_exit" then return end
+        local ply = LocalPlayer()
+        if not pressed then
+            if not useDown then return end
+            useDown = false
+            ply:ConCommand("-use")
+            hook.Remove("CreateMove", "vrutil_hook_cmphysguncontrol")
             return
+        end
+        if hook.Call("VRMod_AllowDefaultAction", nil, action) == false then return end
+        useDown = true
+        ply:ConCommand("+use")
+        local wep, hand = ply:GetActiveWeapon(), g_VR.tracking.pose_lefthand
+        if hand and IsValid(wep) and wep:GetClass() == "weapon_physgun" then
+            lastHandPos, lastHandAng = hand.pos, hand.ang
+            hook.Add("CreateMove", "vrutil_hook_cmphysguncontrol", VRPhysgunControl)
         end
     end)
 elseif SERVER then

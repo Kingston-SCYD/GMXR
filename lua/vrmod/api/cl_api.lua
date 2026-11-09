@@ -1,11 +1,6 @@
-local requiredModuleVersion = nil
-if system.IsLinux() then
-    requiredModuleVersion = 2
-else
-    requiredModuleVersion = 2
-end
-
-local latestModuleVersion = 2
+-- The one GMXR module build this addon speaks to. Exact match: an older or
+-- newer module both get sent to the workshop page for the matching set.
+local REQUIRED_MODULE = 2
 g_VR = g_VR or {}
 vrmod = vrmod or {}
 local convars = vrmod.GetConvars()
@@ -52,17 +47,81 @@ if CLIENT then
         if ver == 0 then
             if not file.Exists(moduleFile, "GAME") then return "Module not installed.\nPlease follow the workshop instructions to install the module.", "nomodule" end
             return "Failed to load module.\nModule file exists but could not be loaded. Check antivirus or permissions.", "loadfail"
-        elseif ver < requiredModuleVersion then
-            return "Module update required.\nRun the installer or re-download from the workshop.\n\nInstalled: v" .. ver .. "\nRequired: v" .. requiredModuleVersion, "outdated"
-        elseif ver > latestModuleVersion then
-            print("[VRMOD] Warning: Module version is newer than tested. Installed: v" .. ver .. " | Required: v" .. requiredModuleVersion .. " | Addon version: " .. vrmod.GetVersion() .. " | Most features should work, but some bugs may exist.")
+        elseif ver ~= REQUIRED_MODULE then
+            return "Module version mismatch.\nDownload the new modules from the workshop page.\n\nInstalled: v" .. ver .. "\nRequired: v" .. REQUIRED_MODULE, "outdated"
         end
         if probeHMD and VRMOD_IsHMDPresent and not VRMOD_IsHMDPresent() then return "VR headset not detected.", "nohmd" end
     end
 
     function vrmod.GetModuleVersion()
-        return g_VR.moduleVersion, requiredModuleVersion, latestModuleVersion
+        return g_VR.moduleVersion, REQUIRED_MODULE, REQUIRED_MODULE
     end
+
+    -- This addon's workshop id, found by which mounted addon carries the
+    -- loader (an addon's title is a file search path). false: none, e.g. a
+    -- legacy addons/ folder install. Resolved once.
+    local wsid
+    local function WorkshopID()
+        if wsid == nil then
+            wsid = false
+            local list = engine.GetAddons()
+            for i = 1, #list do
+                local a = list[i]
+                if a.mounted and a.wsid and file.Exists("lua/vrmod/loader.lua", a.title) then
+                    wsid = a.wsid
+                    break
+                end
+            end
+        end
+        return wsid
+    end
+
+    -- Opens the workshop page in the Steam overlay; false when there is none
+    function vrmod.OpenWorkshopPage()
+        local id = WorkshopID()
+        if id then steamworks.ViewFile(id) end
+        return id ~= false
+    end
+
+    local COL_WARN = Color(255, 190, 60)
+    local function ModuleNotice(ver)
+        local id = WorkshopID()
+        local body = "The installed VR module is v" .. ver .. ", this version of VRMod needs v" .. REQUIRED_MODULE .. ".\nDownload the new modules from the workshop page."
+        chat.AddText(COL_WARN, "[VRMod] ", color_white, "Module v" .. ver .. " detected, v" .. REQUIRED_MODULE .. " required. Download the new modules from the workshop page.")
+        if id then
+            Derma_Query(body, "VRMod: module version mismatch", "Open Workshop Page", vrmod.OpenWorkshopPage, "Later")
+        else
+            Derma_Message(body, "VRMod: module version mismatch", "OK")
+        end
+    end
+
+    -- Only a module that loaded and reports another version: 0 is "not
+    -- installed", which every non-VR player on a VRMod server has.
+    hook.Add("InitPostEntity", "vrmod_modulecheck", function()
+        local ver = g_VR.moduleVersion or 0
+        if ver ~= 0 and ver ~= REQUIRED_MODULE then ModuleNotice(ver) end
+    end)
+
+    -- vrmod_module_check [version]: module status, and the notice as a
+    -- mismatch shows it. A version argument stands in for the installed one.
+    concommand.Add("vrmod_module_check", function(_, _, args)
+        local real = g_VR.moduleVersion or 0
+        local ver = tonumber(args[1]) or real
+        local n = 0
+        for k in pairs(_G) do
+            if isstring(k) and k:sub(1, 6) == "VRMOD_" then n = n + 1 end
+        end
+        local id = WorkshopID()
+        print("[VRMod Module] installed v" .. real .. (ver ~= real and (" (testing as v" .. ver .. ")") or "") .. " | required v" .. REQUIRED_MODULE)
+        print("[VRMod Module] " .. moduleFile .. ": " .. (file.Exists(moduleFile, "GAME") and "present" or "MISSING") .. " | " .. n .. " module functions")
+        print("[VRMod Module] workshop id: " .. (id or "none (not a mounted workshop addon)"))
+        if g_VR.moduleLoadError then print("[VRMod Module] load error: " .. g_VR.moduleLoadError) end
+        if ver == REQUIRED_MODULE then
+            print("[VRMod Module] OK")
+        else
+            ModuleNotice(ver)
+        end
+    end)
 
     function vrmod.IsPlayerInVR(ply)
         return getPlayerVRData(ply) ~= nil
@@ -516,91 +575,37 @@ if CLIENT then
         g_VR.originAngle = ang
     end
 
-    -- Add or restore a menu item.
-    --
-    -- The backup is keyed by NAME and never by function ref. VRMod_Start
-    -- rebuilds every item with fresh closures, and it re-fires on each join and
-    -- respawn -- more often in MP, where vrutil_net_join is rebroadcast. Keyed
-    -- by "name_<funcaddr>" the backup therefore gained one stale entry per
-    -- rebuild, and the restore pass (which revives anything whose name+func is
-    -- missing from menuItems) re-added each stale closure as a second button.
-    --
-    -- The update path below must refresh the backup too, for the same reason:
-    -- returning early left the PREVIOUS closure on file, which the restore pass
-    -- then read as a missing item and duplicated.
+    -- Quick menu registry: one entry per name, never wiped. Registering again
+    -- (every VRMod_Start, respawns included) updates the entry in place, so
+    -- nothing can be lost to registration order or duplicated. slot/slotpos
+    -- are a preference; cl_quickmenu resolves clashes and paging on open.
+    -- forceSlot marks built-ins, which are placed before everything else.
+    local menuOrder = 0
+    -- Placement for items registered by other addons, which we can't edit.
+    -- slotpos 4+ is page 2 (see cl_quickmenu).
+    local PLACE = { ["ArcCW Customize"] = { 0, 4 } }
     function vrmod.AddInGameMenuItem(name, slot, slotpos, func, forceSlot, hint)
+        local o = PLACE[name]
+        if o then slot, slotpos = o[1], o[2] end
         local items = g_VR.menuItems
-        if not items then items = {} g_VR.menuItems = items end
-        local backup = g_VR.menuBackup
-        if not backup then backup = {} g_VR.menuBackup = backup end
-        local n = #items
-        -- Determine slot if not forced
-        if not forceSlot then
-            local occupied = {}
-            for i = 1, n do
-                local item = items[i]
-                local o = occupied[item.slot]
-                if not o then o = {} occupied[item.slot] = o end
-                o[item.slotPos] = true
-            end
-
-            local found = false
-            for s = 0, 10 do
-                local o = occupied[s]
-                for p = 0, 10 do
-                    if not (o and o[p]) then
-                        slot, slotpos, found = s, p, true
-                        break
-                    end
-                end
-
-                if found then break end
+        for i = 1, #items do
+            local it = items[i]
+            if it.name == name then
+                it.slot, it.slotPos, it.func, it.hint, it.forced = slot or 0, slotpos or 0, func, hint, forceSlot == true
+                return
             end
         end
-
-        local item
-        for i = 1, n do
-            if items[i].name == name then
-                item = items[i]
-                break
-            end
-        end
-
-        if item then
-            item.slot, item.slotPos, item.func, item.hint = slot, slotpos, func, hint
-        else
-            items[n + 1] = {
-                name = name,
-                slot = slot,
-                slotPos = slotpos,
-                func = func,
-                hint = hint
-            }
-        end
-
-        local b = backup[name]
-        if b then
-            b.slot, b.slotPos, b.func, b.internal, b.hint = slot, slotpos, func, forceSlot == true, hint
-        else
-            backup[name] = {
-                name = name,
-                slot = slot,
-                slotPos = slotpos,
-                func = func,
-                internal = forceSlot == true,
-                hint = hint
-            }
-        end
+        menuOrder = menuOrder + 1
+        items[#items + 1] = { name = name, slot = slot or 0, slotPos = slotpos or 0, func = func, hint = hint, forced = forceSlot == true, order = menuOrder }
     end
 
-    -- Remove menu item, optionally permanently
-    function vrmod.RemoveInGameMenuItem(name, func, permanent)
+    -- func narrows the match; the third (permanent) arg is accepted for old
+    -- callers but meaningless now that nothing restores removed items.
+    function vrmod.RemoveInGameMenuItem(name, func)
         local items = g_VR.menuItems
         for i = #items, 1, -1 do
             if items[i].name == name and (not func or items[i].func == func) then table.remove(items, i) end
         end
-
-        if permanent then g_VR.menuBackup[name] = nil end
     end
 
     function vrmod.GetLeftEyePos()

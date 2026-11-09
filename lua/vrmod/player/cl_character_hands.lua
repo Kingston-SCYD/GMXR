@@ -1,5 +1,6 @@
 if CLIENT then
 	local hands, srcModel, active
+	local primeFrame = -1 -- FrameNumber of the full SetupBones in VRMod_PreRender
 	local dirty = false -- finger tables were edited in place; rebuild targets
 	CreateClientConVar("vrmod_floatinghands_material", "models/c_arms_citizen_hand", true, FCVAR_ARCHIVE)
 	CreateClientConVar("vrmod_floatinghands_model", "models/player/vr_hands.mdl", true, FCVAR_ARCHIVE)
@@ -7,7 +8,55 @@ if CLIENT then
 	CreateClientConVar("vrmod_floatinghands_stub", "1", true, FCVAR_ARCHIVE)
 	local convars = vrmod.GetConvars()
 	local FrameNumber, LerpAngle, IsValid = FrameNumber, LerpAngle, IsValid
+	local SetBoneMatrix = FindMetaTable("Entity").SetBoneMatrix
 	local ZERO_VEC, ANG_R180 = Vector(0, 0, 0), Angle(0, 0, 180)
+	local sqrt, atan2, deg, rad, sin, cos = math.sqrt, math.atan2, math.deg, math.rad, math.sin, math.cos
+
+	-- Forearm stub aims at an estimated elbow instead of riding the wrist
+	-- rigidly: wrist flex/deviation no longer swings it, roll still carries
+	-- through (minimal rotation off the rigid pose keeps the hand's twist).
+	-- Shoulder = head - 9 down, 3 back, 7.5 out along characterYaw; upper arm
+	-- taken equal to the forearm, so the elbow is an isosceles 2-bone solve
+	-- and lands exactly L from the hand. Pole: down, a little out and back.
+	local _axis = Vector()
+	local function AimForearm(mF, H, L, out, hp, fx, fy)
+		local rx, ry = fy, -fx -- yaw Right()
+		local sx, sy, sz = hp.x - fx * 3 + rx * out * 7.5, hp.y - fy * 3 + ry * out * 7.5, hp.z - 9
+		local dx, dy, dz = H.x - sx, H.y - sy, H.z - sz
+		local len = sqrt(dx * dx + dy * dy + dz * dz)
+		if len < 0.01 then return end
+		local nx, ny, nz = dx / len, dy / len, dz / len
+		local ca = len / (2 * L)
+		if ca > 0.999 then ca = 0.999 end
+		local sa = sqrt(1 - ca * ca)
+		local px, py, pz = rx * out * 0.6 - fx * 0.3, ry * out * 0.6 - fy * 0.3, -1
+		local d = px * nx + py * ny + pz * nz
+		px, py, pz = px - d * nx, py - d * ny, pz - d * nz
+		local pl = sqrt(px * px + py * py + pz * pz)
+		if pl < 0.01 then return end
+		local u = L * sa / pl
+		-- elbow; then forearm axis elbow -> hand
+		local ex, ey, ez = sx + nx * L * ca + px * u, sy + ny * L * ca + py * u, sz + nz * L * ca + pz * u
+		local ax, ay, az = H.x - ex, H.y - ey, H.z - ez
+		local al = sqrt(ax * ax + ay * ay + az * az)
+		if al < 0.01 then return end
+		ax, ay, az = ax / al, ay / al, az / al
+		local o = mF:GetTranslation()
+		local bx, by, bz = H.x - o.x, H.y - o.y, H.z - o.z
+		local bl = sqrt(bx * bx + by * by + bz * bz)
+		if bl < 0.01 then return end
+		bx, by, bz = bx / bl, by / bl, bz / bl
+		local cx, cy, cz = by * az - bz * ay, bz * ax - bx * az, bx * ay - by * ax
+		local cl = sqrt(cx * cx + cy * cy + cz * cz)
+		if cl > 1e-4 then
+			_axis:SetUnpacked(cx / cl, cy / cl, cz / cl)
+			local a = mF:GetAngles()
+			a:RotateAroundAxis(_axis, deg(atan2(cl, bx * ax + by * ay + bz * az)))
+			mF:SetAngles(a)
+		end
+		_axis:SetUnpacked(H.x - ax * L, H.y - ay * L, H.z - az * L)
+		mF:SetTranslation(_axis)
+	end
 	-- ApplyOpenHandPose (cl_vrmod) rewrites defaultOpenHandAngles IN PLACE, so
 	-- the table-identity check in the bone callback can't see it. Flag it.
 	-- Open-hand extend is per hands model: c_hands rest poses differ (the HL1
@@ -74,6 +123,9 @@ if CLIENT then
 		if IsValid(hands) then hands:Remove() end
 		local steamid = ply:SteamID()
 		hands, srcModel = ResolveHands(ply)
+		-- Pin LOD 0: a c_hands with $lod bone drops would otherwise send every
+		-- lower-LOD pass down the per-bone fallback in the bone callback.
+		hands:SetLOD(0)
 		hands:SetPos(ply:GetPos())
 		hands:SetupBones()
 		g_VR.hands = hands
@@ -167,6 +219,7 @@ if CLIENT then
 			mFR = hands:GetBoneMatrix(topR) or Matrix()
 			fPosR, fAngR = WorldToLocal(mFR:GetTranslation(), mFR:GetAngles(), mHR:GetTranslation(), mHR:GetAngles())
 		end
+		local lenL, lenR = fPosL and fPosL:Length(), fPosR and fPosR:Length()
 		local mTL, mTR = mFL or mHL, mFR or mHR
 		local mCL, mCR = Matrix(), Matrix()
 		mCL:Scale(ZERO_VEC)
@@ -265,10 +318,22 @@ if CLIENT then
 		end
 
 		hands:SetRenderBounds(ZERO_VEC, ZERO_VEC, Vector(65000, 65000, 65000))
-		local wIdx, wMat, nWrite = {}, {}
+		-- Flag-0 bones are never writable; the rest are once the frame has had a
+		-- full setup (see Prime). Static flags, so no live pass shapes the list.
+		local wIdx, wMat, nWrite = {}, {}, 0
+		for i = 0, boneCount - 1 do
+			if hands:BoneHasFlag(i, BONE_USED_BY_ANYTHING) then
+				nWrite = nWrite + 1
+				wIdx[nWrite], wMat[nWrite] = i, aMat[i]
+			end
+		end
 		local frame = 0
 		hands:AddCallback("BuildBonePositions", function(ent)
 			local fn = FrameNumber()
+			-- Anything before this frame's Prime may be a reduced-mask setup
+			-- (bonemerge/attachment): its bones aren't all writable, so leave
+			-- the engine pose for that consumer and write nothing.
+			if fn ~= primeFrame then return end
 			if fn ~= frame then
 				frame = fn
 				local net = g_VR.net[steamid]
@@ -293,6 +358,12 @@ if CLIENT then
 						mFR:Translate(fPosR)
 						mFR:Rotate(fAngR)
 					end
+					if mFL or mFR then
+						local y = rad(f.characterYaw or 0)
+						local fx, fy, hp = cos(y), sin(y), f.hmdPos
+						if mFL and lenL > 0 then AimForearm(mFL, f.lefthandPos, lenL, -1, hp, fx, fy) end
+						if mFR and lenR > 0 then AimForearm(mFR, f.righthandPos, lenR, 1, hp, fx, fy) end
+					end
 					mCL:Set(mTL)
 					mCL:Scale(ZERO_VEC)
 					mCR:Set(mTR)
@@ -311,19 +382,7 @@ if CLIENT then
 				end
 			end
 
-			if not nWrite then
-				-- Bones with no usage flags (HL1 pack has a few) throw "Bone is
-				-- unwriteable" from SetBoneMatrix; GetBoneMatrix is nil for exactly
-				-- those. Probe once, inside a real pass, and never touch them again.
-				nWrite = 0
-				for i = 0, boneCount - 1 do
-					if ent:GetBoneMatrix(i) then
-						nWrite = nWrite + 1
-						wIdx[nWrite], wMat[nWrite] = i, aMat[i]
-					end
-				end
-			end
-			for n = 1, nWrite do ent:SetBoneMatrix(wIdx[n], wMat[n]) end
+			for n = 1, nWrite do SetBoneMatrix(ent, wIdx[n], wMat[n]) end
 		end)
 	end
 
@@ -337,8 +396,12 @@ if CLIENT then
 	-- opaque in the first eye, colour and depth writes off, then re-merge the
 	-- weapon and its muzzle against the fresh bones.
 	local drawFrame = 0
+	-- Worldmodel mode only: a viewmodel weapon merges to nothing on the body.
+	-- Running it anyway drew the active weapon's worldmodel through the
+	-- player draw in the first eye, and any base that flips the colour-write
+	-- override in its own draw hooks (TacRP while aiming) made it visible.
 	local function DummyDraw(depth, skybox)
-		if depth or skybox then return end
+		if depth or skybox or not g_VR.wmActive then return end
 		local fn = FrameNumber()
 		if fn == drawFrame then return end
 		local ep = EyePos()
@@ -359,14 +422,52 @@ if CLIENT then
 		if IsValid(vm) and vm:IsWeapon() then vrmod.utils.RefreshViewModelMuzzle(vm) end
 	end
 
-	hook.Add("VRMod_Start", "vrmod_starthandsonly", function(ply)
-		if not (ply == LocalPlayer() and convars.vrmod_floatinghands:GetBool()) then return end
+	-- The writable set is the frame's accumulated setup mask, and GMod reports
+	-- an unwriteable SetBoneMatrix without throwing, so it can't be caught. A
+	-- full (BONE_USED_BY_ANYTHING) setup right before the first eye makes every
+	-- flagged bone writable; later reduced setups this frame find them built
+	-- and skip the callback entirely. Called by cl_vrmod's DrawEyeFull AFTER
+	-- every VRMod_PreRender hook, not as one: hook order is pairs order, and
+	-- anything that edits the hand pose there (manualreload's right-hand
+	-- follow) was lost whenever this ran first.
+	local function Prime()
+		if not IsValid(hands) then return end
+		primeFrame = FrameNumber()
+		hands:SetupBones()
+	end
+
+	local function StartHands(ply)
 		active = true
-		timer.Simple(0, function() LocalPlayer().RenderOverride = function() end end)
+		timer.Simple(0, function() if active then LocalPlayer().RenderOverride = function() end end end)
 		Build(ply)
 		g_VR.characterYaw = 0
 		hook.Add("PreDrawOpaqueRenderables", "vrmod_floatinghands_dummydraw", DummyDraw)
+		g_VR.handsPrime = Prime
+	end
+
+	local function StopHands()
+		active = nil
+		g_VR.handsPrime = nil
+		timer.Remove("vrmod_floatinghands_rebuild")
+		hook.Remove("PreDrawOpaqueRenderables", "vrmod_floatinghands_dummydraw")
+		if IsValid(hands) then hands:Remove() end
+		hands = nil
+		g_VR.hands = nil
+		LocalPlayer().RenderOverride = nil
+	end
+
+	hook.Add("VRMod_Start", "vrmod_starthandsonly", function(ply)
+		if ply == LocalPlayer() and convars.vrmod_floatinghands:GetBool() then StartHands(ply) end
 	end)
+
+	-- Live switch. The character system runs in both modes (DummyDraw needs
+	-- its IK), so off just drops the hands and lets cl_vrmod draw the body.
+	cvars.AddChangeCallback("vrmod_floatinghands", function(_, _, new)
+		if not g_VR.active then return end
+		local on = new ~= "0"
+		if on and not active then StartHands(LocalPlayer())
+		elseif not on and active then StopHands() end
+	end, "vrmod_floatinghands_live")
 
 	-- Both are read at build time; rebuild live instead of asking for a restart.
 	local function Rebuild() if active then Build(LocalPlayer()) end end
@@ -374,12 +475,6 @@ if CLIENT then
 	cvars.AddChangeCallback("vrmod_floatinghands_stub", Rebuild, "vrmod_floatinghands")
 
 	hook.Add("VRMod_Exit", "vrmod_stophandsonly", function(ply)
-		if not active or ply ~= LocalPlayer() then return end
-		active = nil
-		timer.Remove("vrmod_floatinghands_rebuild")
-		hook.Remove("PreDrawOpaqueRenderables", "vrmod_floatinghands_dummydraw")
-		if IsValid(hands) then hands:Remove() end
-		hands = nil
-		LocalPlayer().RenderOverride = nil
+		if active and ply == LocalPlayer() then StopHands() end
 	end)
 end

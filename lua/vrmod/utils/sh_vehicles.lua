@@ -1,130 +1,87 @@
-g_VR = g_VR or {}
-vrmod = vrmod or {}
-vrmod.utils = vrmod.utils or {}
-local cachedBonePos, cachedBoneAng, cachedFrame = nil, nil, 0
+local U = vrmod.utils
+local IsValid = IsValid
 --Vehicles/Glide
-local function GetApproximateBoneId(vehicle, targetNames)
-    if not IsValid(vehicle) then return nil end
-    local boneCount = vehicle:GetBoneCount()
-    if boneCount <= 0 then return nil end
-    for i = 0, boneCount - 1 do
-        local boneName = vehicle:GetBoneName(i)
-        if boneName then
-            for _, target in ipairs(targetNames) do
-                if string.find(string.lower(boneName), string.lower(target), 1, true) then return i, boneName end
+-- Steering bone: exact names first, then a case-insensitive substring scan
+-- of the bone names. Static tables, with lowered copies for the scan.
+local MOTO = {type = "motorcycle", names = {"handlebars", "handles", "Airboat.Steer", "handle", "steer", "steerw_bone"}}
+local CAR = {type = "car", names = {"steering_wheel", "steering", "Rig_Buggy.Steer_Wheel", "car.steer_wheel", "steer", "steerw_bone"}}
+for _, e in ipairs({MOTO, CAR}) do
+    e.lower = {}
+    for i, n in ipairs(e.names) do e.lower[i] = n:lower() end
+end
+local BIKE_FIRST, CAR_FIRST = {MOTO, CAR}, {CAR, MOTO}
+
+local function ApproxBone(ent, lowered)
+    for i = 0, ent:GetBoneCount() - 1 do
+        local name = ent:GetBoneName(i)
+        if name then
+            local l = name:lower()
+            for k = 1, #lowered do
+                if l:find(lowered[k], 1, true) then return i, name end
             end
         end
     end
-    return nil
 end
 
-function vrmod.utils.GetVehicleBonePosition(vehicle, boneId)
-    if not IsValid(vehicle) or not boneId then return nil, nil end
-    if g_VR.vehicle.glide then return vehicle:GetBonePosition(boneId) end
-    if cachedFrame == FrameNumber() then return cachedBonePos, cachedBoneAng end
-    local m = vehicle:GetBoneMatrix(boneId)
-    if not m then return nil, nil end
-    cachedBonePos, cachedBoneAng = m:GetTranslation(), m:GetAngles()
-    cachedFrame = FrameNumber()
-    return cachedBonePos, cachedBoneAng
-end
-
-function vrmod.utils.GetSteeringInfo(ply)
+function U.GetSteeringInfo(ply)
     if not IsValid(ply) or not ply:InVehicle() then return nil, nil, nil, nil end
-    local glideVeh, vehicle
-    if ply.GlideGetVehicle then
-        glideVeh = ply:GlideGetVehicle()
-        if IsValid(glideVeh) then
-            vehicle = glideVeh
-        else
-            vehicle = ply:GetVehicle()
-        end
-    else
-        vehicle = ply:GetVehicle()
-    end
-
+    local glideVeh = ply.GlideGetVehicle and ply:GlideGetVehicle()
+    if not IsValid(glideVeh) then glideVeh = nil end
+    local vehicle = glideVeh or ply:GetVehicle()
     if not IsValid(vehicle) then return nil, nil, nil, nil end
-    local seatIndex = ply.GlideGetSeatIndex and ply:GlideGetSeatIndex() or 1
-    local sitSeq = glideVeh and glideVeh.GetPlayerSitSequence and glideVeh:GetPlayerSitSequence(seatIndex)
-    -- Define bone search priorities
-    local bonePriority = {
-        motorcycle = {
-            names = {"handlebars", "handles", "Airboat.Steer", "handle", "steer", "steerw_bone"},
-            type = "motorcycle"
-        },
-        car = {
-            names = {"steering_wheel", "steering", "Rig_Buggy.Steer_Wheel", "car.steer_wheel", "steer", "steerw_bone"},
-            type = "car"
-        }
-    }
-
-    -- Decide search order based on Glide type
-    local searchOrder
-    if IsValid(glideVeh) then
-        local vType = glideVeh.VehicleType
-        if vType == Glide.VEHICLE_TYPE.MOTORCYCLE or sitSeq == "drive_airboat" then
-            searchOrder = {bonePriority.motorcycle, bonePriority.car}
-        elseif vType == Glide.VEHICLE_TYPE.CAR then
-            searchOrder = {bonePriority.car, bonePriority.motorcycle}
-        else
-            -- For other Glide types, just try both
-            searchOrder = {bonePriority.motorcycle, bonePriority.car}
-        end
+    -- Search order: Glide's type, else the HL2 class
+    local T, vType, bike, order
+    if glideVeh then
+        T, vType = Glide.VEHICLE_TYPE, glideVeh.VehicleType
+        local sitSeq = glideVeh.GetPlayerSitSequence and glideVeh:GetPlayerSitSequence(ply.GlideGetSeatIndex and ply:GlideGetSeatIndex() or 1)
+        bike = vType == T.MOTORCYCLE or sitSeq == "drive_airboat"
+        order = (vType == T.CAR and not bike) and CAR_FIRST or BIKE_FIRST
     else
-        -- No Glide, detect HL2 vehicle type by class
-        local vehClass = vehicle:GetClass()
-        if vehClass == "prop_vehicle_airboat" then
-            searchOrder = {bonePriority.motorcycle, bonePriority.car}
-        else
-            searchOrder = {bonePriority.car, bonePriority.motorcycle}
-        end
+        order = vehicle:GetClass() == "prop_vehicle_airboat" and BIKE_FIRST or CAR_FIRST
     end
 
-    -- Search bones
-    local candidates = {IsValid(glideVeh) and glideVeh or vehicle}
-    local boneId, boneType, boneName
-    for _, candidate in ipairs(candidates) do
-        for _, entry in ipairs(searchOrder) do
-            for _, name in ipairs(entry.names) do
-                local id = candidate:LookupBone(name)
-                if id then
-                    boneId, boneType, boneName = id, entry.type, name
-                    break
-                end
+    -- A seat parented to a car body (simfphys, LVS): the wheel is the body's
+    local parent = not glideVeh and vehicle:GetParent()
+    if not IsValid(parent) then parent = nil end
+    local boneId, boneType, boneName, boneEnt
+    for c = 1, parent and 2 or 1 do
+        local cand = c == 1 and vehicle or parent
+        for o = 1, 2 do
+            local e = order[o]
+            local names = e.names
+            for k = 1, #names do
+                local id = cand:LookupBone(names[k])
+                if id then boneId, boneName = id, names[k] break end
             end
-
-            if not boneId then
-                local id, approxName = GetApproximateBoneId(candidate, entry.names)
-                if id then boneId, boneType, boneName = id, entry.type, approxName end
-            end
-
-            if boneId then break end
+            if not boneId then boneId, boneName = ApproxBone(cand, e.lower) end
+            if boneId then boneType, boneEnt = e.type, cand break end
         end
-
         if boneId then break end
     end
 
     -- Glide type still takes precedence in naming
-    if IsValid(glideVeh) then
-        local vType = glideVeh.VehicleType
-        if vType == Glide.VEHICLE_TYPE.MOTORCYCLE or sitSeq == "drive_airboat" then
-            return glideVeh, boneId, "motorcycle", true, boneName
-        elseif vType == Glide.VEHICLE_TYPE.BOAT then
-            return glideVeh, boneId, boneType or "boat", true, boneName
-        elseif vType == Glide.VEHICLE_TYPE.CAR then
-            return glideVeh, boneId, "car", true, boneName
-        elseif vType == Glide.VEHICLE_TYPE.PLANE or vType == Glide.VEHICLE_TYPE.HELICOPTER then
-            return glideVeh, boneId, "aircraft", true, boneName
-        elseif vType == Glide.VEHICLE_TYPE.TANK then
-            return glideVeh, boneId, "tank", true, boneName
-        end
+    if glideVeh then
+        if bike then return glideVeh, boneId, "motorcycle", true, boneName end
+        if vType == T.BOAT then return glideVeh, boneId, boneType or "boat", true, boneName end
+        if vType == T.CAR then return glideVeh, boneId, "car", true, boneName end
+        if vType == T.PLANE or vType == T.HELICOPTER then return glideVeh, boneId, "aircraft", true, boneName end
+        if vType == T.TANK then return glideVeh, boneId, "tank", true, boneName end
     end
 
-    if boneId then return vehicle, boneId, boneType, false, boneName end
+    if boneId then return boneEnt, boneId, boneType, false, boneName end
     return vehicle, nil, "unknown", false, nil
 end
 
-function vrmod.utils.PatchGlideCamera()
+-- Glide camera in VR. Fallbacks are read-only constants, trace inputs reused:
+-- the arm trace's result is read at once (output), the aim trace's HitPos is
+-- kept on the camera, so that result stays fresh.
+local ANG0, VEC0, CAM_OFF = Angle(), Vector(), Vector(-100, 0, 50)
+local VUnpack, VSetU = FindMetaTable("Vector").Unpack, FindMetaTable("Vector").SetUnpacked
+local _armOut = {}
+local _armTr = {endpos = Vector(), mask = 16395, output = _armOut} -- MASK_SOLID_BRUSHONLY
+local _aimF = {}
+local _aimTr = {endpos = Vector(), filter = _aimF}
+function U.PatchGlideCamera()
     local Camera = Glide.Camera
     if not Camera then return end
     local Config = Glide.Config
@@ -140,59 +97,52 @@ function vrmod.utils.PatchGlideCamera()
         local user = self.user
         -- VR guard: ensure vrmod and g_VR.view exist
         if vrmod and vrmod.IsPlayerInVR and vrmod.IsPlayerInVR(user) and g_VR and g_VR.view then
-            local hmdPos = g_VR.view.origin or user:EyePos()
+            local eye = user:EyePos()
+            local hmdPos = g_VR.view.origin or eye
             local hmdAng = g_VR.view.angles or user:EyeAngles()
-            local pivot, offset
             local angles = hmdAng
             if self.isInFirstPerson then
-                local localEyePos = vehicle:WorldToLocal(hmdPos)
-                local localPos = vehicle:GetFirstPersonOffset(self.seatIndex, localEyePos)
-                pivot = vehicle:LocalToWorld(localPos)
-                offset = Vector()
+                self.position = vehicle:LocalToWorld(vehicle:GetFirstPersonOffset(self.seatIndex, vehicle:WorldToLocal(hmdPos)))
             else
-                angles = hmdAng + (vehicle.CameraAngleOffset or Angle(0, 0, 0))
-                pivot = vehicle:LocalToWorld((vehicle.CameraCenterOffset or Vector()) + (vehicle.CameraTrailerOffset or Vector()) * (self.trailerDistanceFraction or 0))
-                local cfgCamDist = Config and Config.cameraDistance or 100
-                local cfgCamHeight = Config and Config.cameraHeight or 50
-                local baseOffset = (vehicle.CameraOffset or Vector(-100, 0, 50)) * Vector(cfgCamDist * (1 + (self.trailerDistanceFraction or 0) * (vehicle.CameraTrailerDistanceMultiplier or 0)), 1, cfgCamHeight)
-                local endPos = pivot + angles:Forward() * baseOffset[1] + angles:Right() * baseOffset[2] + angles:Up() * baseOffset[3]
-                local offsetDir = endPos - pivot
-                local offsetLen = offsetDir:Length()
-                if offsetLen > 0 then
-                    offsetDir:Normalize()
-                else
-                    offsetDir = angles:Forward() -- arbitrary fallback
-                    offsetLen = 1
-                end
-
-                -- Local trace table; do NOT rely on global traceData/traceResult
-                local tr = util.TraceLine({
-                    start = pivot,
-                    endpos = endPos + offsetDir * 10,
-                    mask = 16395, -- MASK_SOLID_BRUSHONLY
-                    filter = {vehicle}
-                })
-
+                angles = hmdAng + (vehicle.CameraAngleOffset or ANG0)
+                local tdf = self.trailerDistanceFraction or 0
+                local pivot = vehicle:LocalToWorld((vehicle.CameraCenterOffset or VEC0) + (vehicle.CameraTrailerOffset or VEC0) * tdf)
+                -- The arm, in view axes
+                local ox, oy, oz = VUnpack(vehicle.CameraOffset or CAM_OFF)
+                ox = ox * (Config and Config.cameraDistance or 100) * (1 + tdf * (vehicle.CameraTrailerDistanceMultiplier or 0))
+                oz = oz * (Config and Config.cameraHeight or 50)
+                local fx, fy, fz = VUnpack(angles:Forward())
+                local rx, ry, rz = VUnpack(angles:Right())
+                local ux, uy, uz = VUnpack(angles:Up())
+                local px, py, pz = VUnpack(pivot)
+                local ax, ay, az = fx * ox + rx * oy + ux * oz, fy * ox + ry * oy + uy * oz, fz * ox + rz * oy + uz * oz
+                local len = (ax * ax + ay * ay + az * az) ^ 0.5
+                local dx, dy, dz = fx, fy, fz -- arbitrary fallback
+                if len > 0 then dx, dy, dz = ax / len, ay / len, az / len end
+                VSetU(_armTr.endpos, px + ax + dx * 10, py + ay + dy * 10, pz + az + dz * 10)
+                _armTr.start, _armTr.filter = pivot, vehicle
+                util.TraceLine(_armTr)
                 local fraction = self.distanceFraction or 1
-                if tr.Hit then
-                    fraction = tr.Fraction or fraction
+                if _armOut.Hit then
+                    fraction = _armOut.Fraction or fraction
                     if fraction < (self.distanceFraction or 1) then self.distanceFraction = fraction end
                 end
-
-                offset = (self.shakeOffset or Vector()) + baseOffset * fraction
+                -- arm * fraction plus shake
+                local sx, sy, sz = 0, 0, 0
+                if self.shakeOffset then sx, sy, sz = VUnpack(self.shakeOffset) end
+                sx, sy, sz = sx + ox * fraction, sy + oy * fraction, sz + oz * fraction
+                self.position = Vector(px + fx * sx + rx * sy + ux * sz, py + fy * sx + ry * sy + uy * sz, pz + fz * sx + rz * sy + uz * sz)
             end
-
-            self.position = pivot + angles:Forward() * offset[1] + angles:Right() * offset[2] + angles:Up() * offset[3]
             -- Aim trace from player's eyes using HMD forward
-            local trAim = util.TraceLine({
-                start = user:EyePos(),
-                endpos = user:EyePos() + hmdAng:Forward() * 50000,
-                filter = {user, vehicle}
-            })
-
+            local ex, ey, ez = VUnpack(eye)
+            local hx, hy, hz = VUnpack(hmdAng:Forward())
+            _aimF[1], _aimF[2] = user, vehicle
+            _aimTr.start = eye
+            VSetU(_aimTr.endpos, ex + hx * 50000, ey + hy * 50000, ez + hz * 50000)
+            local trAim = util.TraceLine(_aimTr)
             self.lastAimPos = trAim.HitPos
             self.lastAimEntity = trAim.Entity
-            local aimDir = trAim.HitPos - user:EyePos()
+            local aimDir = trAim.HitPos - eye
             self.lastAimPosDistanceFromEyes = aimDir:Length()
             if self.lastAimPosDistanceFromEyes > 0 then
                 aimDir:Normalize()
@@ -205,7 +155,7 @@ function vrmod.utils.PatchGlideCamera()
             if user.SetEyeAngles then user:SetEyeAngles(hmdAng) end
             return {
                 origin = self.position,
-                angles = angles + (self.punchAngle or Angle(0, 0, 0)),
+                angles = angles + (self.punchAngle or ANG0),
                 fov = self.fov,
                 drawviewer = not self.isInFirstPerson
             }
@@ -217,8 +167,7 @@ function vrmod.utils.PatchGlideCamera()
     function Camera:CreateMove(cmd)
         if self.isActive and vrmod and vrmod.IsPlayerInVR and vrmod.IsPlayerInVR(self.user) then
             -- Prefer the cached eye-relative aim angles; fall back to HMD or stored angles if missing.
-            local setAng = self.lastAimPosAnglesFromEyes or g_VR and g_VR.view and g_VR.view.angles or self.angles or Angle(0, 0, 0)
-            cmd:SetViewAngles(setAng)
+            cmd:SetViewAngles(self.lastAimPosAnglesFromEyes or g_VR and g_VR.view and g_VR.view.angles or self.angles or ANG0)
             cmd:SetUpMove(math.Clamp(self.lastAimPosDistanceFromEyes or 0, 0, 10000))
             return
         end

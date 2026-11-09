@@ -11,6 +11,7 @@ local RealTime    = RealTime
 local Clamp       = math.Clamp
 local floor       = math.floor
 local abs         = math.abs
+local sin, sqrt   = math.sin, math.sqrt
 local pairs       = pairs
 local ipairs      = ipairs
 local Format      = string.format
@@ -22,6 +23,11 @@ local cv_smooth   = CreateClientConVar("ft_smooth", "0.5", true, false, "Smoothi
 local cv_debug    = CreateClientConVar("ft_debug", "0", false, false, "Show debug HUD overlay")
 local cv_debugcnt = CreateClientConVar("ft_debug_count", "20", false, false, "Debug HUD param count")
 local cv_mult     = CreateClientConVar("ft_multiplier", "1", true, false, "Global flex multiplier")
+local cv_gaze     = CreateClientConVar("ft_gaze", "1", true, false, "Drive playermodel eyes from eye tracking (OpenXR, else OSC)")
+local cv_eyesonly = CreateClientConVar("ft_eyesonly", "0", true, false, "Use tracking for eye gaze only; leave every other flex alone")
+
+local FTPoll, FTActive, FTGetData = vrmod.FaceTrackingPoll, vrmod.FaceTrackingActive, vrmod.FaceTrackingGetData
+local GetEyeGaze = vrmod.GetEyeGaze   -- nil on modules without XR_EXT_eye_gaze_interaction
 
 FaceTrack.DEFAULT_MAP = {
 	jaw_drop               = {{ "v2/JawOpen", 1.5 }},
@@ -191,41 +197,114 @@ function FaceTrack.LiveRemoveFlex(flexID)
 end
 
 -- ── Eye tracking ────────────────────────────────────────────────────────────
+-- Headset eye tracking via OpenXR XR_EXT_eye_gaze_interaction. The module
+-- returns the gaze ray's x/y in view space (+right, +up), i.e. the sine of its
+-- deflection off the head; only that pair is sent. Each client rebuilds the
+-- target from its own interpolated HMD pose at draw, so eyes stay locked to
+-- the head instead of trailing it by a net tick. Independent of the OSC face
+-- receiver: either source runs without the other.
 
-local eyeVec = Vector()
-local function ComputeEyeTarget(ply, data)
-	local lr = (data["v2/EyeLookOutRight"] or 0) + (data["v2/EyeLookInLeft"] or 0)
-	local ll = (data["v2/EyeLookOutLeft"] or 0) + (data["v2/EyeLookInRight"] or 0)
-	local lu = ((data["v2/EyeLookUpRight"] or 0) + (data["v2/EyeLookUpLeft"] or 0)) * 0.5
-	local ld = ((data["v2/EyeLookDownRight"] or 0) + (data["v2/EyeLookDownLeft"] or 0)) * 0.5
-	local ea = ply:EyeAngles()
-	ea:RotateAroundAxis(ea:Right(), (ld - lu) * 22.5)
-	ea:RotateAroundAxis(ea:Up(), (lr - ll) * 22.5)
-	local f = ea:Forward()
-	eyeVec:Set(ply:EyePos())
-	eyeVec.x = eyeVec.x + f.x * 1000
-	eyeVec.y = eyeVec.y + f.y * 1000
-	eyeVec.z = eyeVec.z + f.z * 1000
-	return eyeVec
+local EYE_DIST  = 128    -- convergence distance, units
+local GAZE_Q    = 1 / 127
+local GAZE_HOLD = 0.4    -- keep the last gaze through blinks before releasing
+
+local gazeX, gazeY, gazeSeen, gazeSent, gazeWhy = 0, 0, 0, false, -1
+local GAZE_WHY = { [-1] = "off / not in VR", [0] = "unavailable (see console)", "binding inactive", "eyes untracked" }
+
+-- OSC gaze fallback: VRCFT v2, VRCFT v1 / Steam Link's single-float
+-- Left/RightEyeX/Y, or VRChat's native multi-float eye addresses. A sender uses one address at a time, so the
+-- source is resolved when the param set changes, not probed per frame. A
+-- native message lands as <address>/0..N in one go, so its probe key being
+-- present means every index is.
+local DEG, HALF_DEG = math.pi / 180, math.pi / 360
+local OSC_GAZE = {
+	"v2/EyeLeftX",
+	"LeftEyeX",
+	"/tracking/eye/LeftRightPitchYaw/3",
+	"/tracking/eye/CenterPitchYaw/1",
+	"/tracking/eye/CenterPitchYawDist/1",
+	"/tracking/eye/LeftRightVec/5",
+	"/tracking/eye/CenterVec/2",
+	"/tracking/eye/CenterVecFull/2",
+}
+local oscGaze, gazeOsc = 0, false
+
+local function ResolveOscGaze(d)
+	oscGaze = 0
+	for i = 1, #OSC_GAZE do
+		if d[OSC_GAZE[i]] then oscGaze = i return end
+	end
+end
+
+-- Degrees: +pitch down, +yaw right. Vectors: Unity axes, x right, y up.
+local function ReadOscGaze(d)
+	local m = oscGaze
+	if m == 1 then
+		return ((d["v2/EyeLeftX"] or 0) + (d["v2/EyeRightX"] or 0)) * 0.5,
+			d["v2/EyeY"] or ((d["v2/EyeLeftY"] or 0) + (d["v2/EyeRightY"] or 0)) * 0.5
+	elseif m == 2 then
+		-- Single floats each; a missing right eye mirrors the left instead of halving it.
+		-- Y is +down here (confirmed in headset), the opposite of every other source.
+		local lx, ly = d.LeftEyeX, d.LeftEyeY or 0
+		return (lx + (d.RightEyeX or lx)) * 0.5, -(d.EyesY or (ly + (d.RightEyeY or ly)) * 0.5)
+	elseif m == 3 then
+		return sin((d["/tracking/eye/LeftRightPitchYaw/1"] + d["/tracking/eye/LeftRightPitchYaw/3"]) * HALF_DEG),
+			-sin((d["/tracking/eye/LeftRightPitchYaw/0"] + d["/tracking/eye/LeftRightPitchYaw/2"]) * HALF_DEG)
+	elseif m == 4 then
+		return sin(d["/tracking/eye/CenterPitchYaw/1"] * DEG), -sin(d["/tracking/eye/CenterPitchYaw/0"] * DEG)
+	elseif m == 5 then
+		return sin(d["/tracking/eye/CenterPitchYawDist/1"] * DEG), -sin(d["/tracking/eye/CenterPitchYawDist/0"] * DEG)
+	elseif m == 6 then
+		return (d["/tracking/eye/LeftRightVec/0"] + d["/tracking/eye/LeftRightVec/3"]) * 0.5,
+			(d["/tracking/eye/LeftRightVec/1"] + d["/tracking/eye/LeftRightVec/4"]) * 0.5
+	elseif m == 7 then
+		return d["/tracking/eye/CenterVec/0"], d["/tracking/eye/CenterVec/1"]
+	end
+	local x, y, z = d["/tracking/eye/CenterVecFull/0"], d["/tracking/eye/CenterVecFull/1"], d["/tracking/eye/CenterVecFull/2"]
+	local l = sqrt(x * x + y * y + z * z)
+	if l > 0 then return x / l, y / l end
+end
+local localGaze = { on = false }   -- same shape as remoteData entries
+
+-- Head-local target (Source axes: x fwd, y left, z up), pre-scaled.
+local function StoreGaze(t, x, y)
+	local q = x * x + y * y
+	if q > 0.96 then q = 0.96 end
+	t.f, t.l, t.u, t.on = sqrt(1 - q) * EYE_DIST, -x * EYE_DIST, y * EYE_DIST, true
+end
+
+local gazeVec = Vector()
+local function ApplyGaze(ply, t)
+	local fr = g_VR and g_VR.net
+	fr = fr and fr[t.sid]
+	fr = fr and fr.lerpedFrame
+	gazeVec:SetUnpacked(t.f, t.l, t.u)
+	if fr and fr.hmdAng then
+		gazeVec:Rotate(fr.hmdAng)
+		gazeVec:Add(fr.hmdPos)
+	else
+		gazeVec:Rotate(ply:EyeAngles())
+		gazeVec:Add(ply:EyePos())
+	end
+	ply:SetEyeTarget(gazeVec)
 end
 
 -- ── Net: send mapped flexes ─────────────────────────────────────────────────
 
-local function SendFlexData(ply)
-	if not activeMap then return end
-	local cnt = #activeMap
-	if cnt == 0 or cnt > 128 then return end
-
+local function SendFlexData(cnt, gz)
+	if cnt > 128 then cnt = 0 end
 	net.Start("ft_flex")
 		net.WriteUInt(cnt, 8)
 		for i = 1, cnt do
-			local e = activeMap[i]
-			net.WriteUInt(e.id, 8)
-			net.WriteUInt(floor(Clamp(smoothed[e.id] or 0, 0, 1) * 255 + 0.5), 8)
+			local id = activeMap[i].id
+			net.WriteUInt(id, 8)
+			net.WriteUInt(floor(Clamp(smoothed[id] or 0, 0, 1) * 255 + 0.5), 8)
 		end
-		local hasEye = vrmod.FaceTrackingActive()
-		net.WriteBool(hasEye)
-		if hasEye then net.WriteVector(ComputeEyeTarget(ply, lastData)) end
+		net.WriteBool(gz)
+		if gz then
+			net.WriteInt(floor(Clamp(gazeX, -1, 1) * 127 + 0.5), 8)
+			net.WriteInt(floor(Clamp(gazeY, -1, 1) * 127 + 0.5), 8)
+		end
 	net.SendToServer()
 end
 
@@ -233,21 +312,15 @@ end
 
 net.Receive("ft_flex", function()
 	local ply = net.ReadEntity()
-	local cnt = net.ReadUInt(8)
-
-	if not IsValid(ply) or ply == LocalPlayer() or cnt == 0 then
-		-- drain remaining bytes
-		for _ = 1, cnt do net.ReadUInt(8); net.ReadUInt(8) end
-		if net.ReadBool() then net.ReadVector() end
-		return
-	end
+	if not IsValid(ply) or ply == LocalPlayer() then return end
 
 	local rd = remoteData[ply]
 	if not rd then
-		rd = { id = {}, wt = {}, n = 0, eye = nil }
+		rd = { id = {}, wt = {}, n = 0, on = false, sid = ply:SteamID() }
 		remoteData[ply] = rd
 	end
 
+	local cnt = net.ReadUInt(8)
 	rd.n = cnt
 	local ids, wts = rd.id, rd.wt
 	for i = 1, cnt do
@@ -255,9 +328,10 @@ net.Receive("ft_flex", function()
 		wts[i] = net.ReadUInt(8) / 255
 	end
 	if net.ReadBool() then
-		rd.eye = net.ReadVector()
+		local x = net.ReadInt(8) * GAZE_Q
+		StoreGaze(rd, x, net.ReadInt(8) * GAZE_Q)
 	else
-		rd.eye = nil
+		rd.on = false
 	end
 end)
 
@@ -295,79 +369,123 @@ FaceTrack.Stop  = Stop
 -- ── Think ───────────────────────────────────────────────────────────────────
 
 hook.Add("Think", "facetracking_core", function()
-	if not cv_enabled:GetBool() then
-		if listening then Stop() end
-		return
+	if cv_enabled:GetBool() then
+		if not listening then Start() end
+	elseif listening then
+		Stop()
 	end
-	if not listening then Start() end
-	if not listening then return end
 
 	local ply = LocalPlayer()
 	if not IsValid(ply) or not ply:Alive() then return end
 
-	vrmod.FaceTrackingPoll()
-	if not vrmod.FaceTrackingActive() then return end
-
-	lastData = vrmod.FaceTrackingGetData()
-
-	-- Rebuild known param list on count change
-	local cnt = 0
-	for _ in pairs(lastData) do cnt = cnt + 1 end
-	if cnt ~= paramCount then
-		paramCount = cnt
-		local sorted = {}
-		for k in pairs(lastData) do sorted[#sorted + 1] = k end
-		table.sort(sorted)
-		FaceTrack.knownParams = sorted
-	end
-
-	ResolveMapping(ply)
-	if not activeMap then return end
-
 	local alpha = Clamp(cv_smooth:GetFloat(), 0, 0.95)
 	local oneMinusAlpha = 1 - alpha
-	local mult = cv_mult:GetFloat()
+	local cnt, ftLive = 0, false
 
-	for i = 1, #activeMap do
-		local entry = activeMap[i]
-		local val = entry.bias
-		local sources = entry.sources
-		for j = 1, #sources do
-			local src = sources[j]
-			local raw = lastData[src.param]
-			if raw then val = val + raw * src.scale end
+	if listening then
+		FTPoll()
+		if FTActive() then
+			ftLive = true
+			lastData = FTGetData()
+
+			-- Rebuild known param list on count change
+			local n = 0
+			for _ in pairs(lastData) do n = n + 1 end
+			if n ~= paramCount then
+				paramCount = n
+				local sorted = {}
+				for k in pairs(lastData) do sorted[#sorted + 1] = k end
+				table.sort(sorted)
+				FaceTrack.knownParams = sorted
+				ResolveOscGaze(lastData)
+			end
+
+			if cv_eyesonly:GetBool() then
+				-- Hand the face back once: zero every mapped flex locally and on
+				-- the server copy (it networks to everyone), then stop driving.
+				if activeMap then
+					for i = 1, #activeMap do smoothed[activeMap[i].id] = 0 end
+					SendFlexData(#activeMap, localGaze.on)
+					activeMap = nil
+				end
+			else
+				ResolveMapping(ply)
+				local mult = cv_mult:GetFloat()
+				for i = 1, #activeMap do
+					local entry = activeMap[i]
+					local val, hit = entry.bias, false
+					local sources = entry.sources
+					for j = 1, #sources do
+						local raw = lastData[sources[j].param]
+						if raw then val = val + raw * sources[j].scale; hit = true end
+					end
+					-- No source params at all = neutral, not the bias: an unsent
+					-- EyeOpen left lid_closer at its bias of 1 (eyes shut).
+					if not hit then val = 0 end
+					local id = entry.id
+					smoothed[id] = (smoothed[id] or 0) * alpha + val * mult * oneMinusAlpha
+				end
+				cnt = #activeMap
+			end
 		end
-		val = val * mult
-		local id = entry.id
-		smoothed[id] = (smoothed[id] or 0) * alpha + val * oneMinusAlpha
 	end
 
+	-- OpenXR: x, y | false, reason | nothing (no gaze action this session).
+	-- OSC fills in whenever OpenXR has nothing this frame.
+	local gx, gy
+	gazeWhy = -1
+	if cv_gaze:GetBool() then
+		if GetEyeGaze and g_VR.active then
+			gx, gy = GetEyeGaze()
+			gazeWhy = gx == nil and 0 or gy
+		end
+		gazeOsc = not gx and ftLive and oscGaze ~= 0
+		if gazeOsc then gx, gy = ReadOscGaze(lastData) end
+	end
+	local rt = RealTime()
+	if gx then
+		if not localGaze.on then gazeX, gazeY = gx, gy end   -- no ease-in from a stale pose
+		gazeX = gazeX * alpha + gx * oneMinusAlpha
+		gazeY = gazeY * alpha + gy * oneMinusAlpha
+		gazeSeen = rt
+		localGaze.sid = localGaze.sid or ply:SteamID()
+		StoreGaze(localGaze, gazeX, gazeY)
+	elseif localGaze.on and rt - gazeSeen > GAZE_HOLD then
+		localGaze.on = false
+	end
+
+	-- One "gaze off" packet after release so remotes drop back to the default look
+	local gz = localGaze.on
+	if cnt == 0 and not gz and not gazeSent then return end
 	local now = CurTime()
 	if now - lastNetSend >= 1 / cv_rate:GetInt() then
 		lastNetSend = now
-		SendFlexData(ply)
+		SendFlexData(cnt, gz)
+		gazeSent = gz
 	end
 end)
 
 -- ── PrePlayerDraw: apply flex weights after engine lip sync ──────────────────
+-- Eye target goes here too: the engine re-interpolates m_viewtarget each frame,
+-- and SetupWeights reads it during this player's draw.
 
 hook.Add("PrePlayerDraw", "facetracking_flex", function(ply)
+	local g
 	if ply == LocalPlayer() then
-		if not activeMap then return end
-		for i = 1, #activeMap do
-			local e = activeMap[i]
-			ply:SetFlexWeight(e.id, smoothed[e.id] or 0)
+		g = localGaze
+		if activeMap then
+			for i = 1, #activeMap do
+				local id = activeMap[i].id
+				ply:SetFlexWeight(id, smoothed[id] or 0)
+			end
 		end
-		ply:SetEyeTarget(ComputeEyeTarget(ply, lastData))
 	else
-		local rd = remoteData[ply]
-		if not rd then return end
-		local ids, wts, n = rd.id, rd.wt, rd.n
-		for i = 1, n do
-			ply:SetFlexWeight(ids[i], wts[i])
-		end
-		if rd.eye then ply:SetEyeTarget(rd.eye) end
+		g = remoteData[ply]
+		if not g then return end
+		local ids, wts = g.id, g.wt
+		for i = 1, g.n do ply:SetFlexWeight(ids[i], wts[i]) end
 	end
+	if g.on then ApplyGaze(ply, g) end
 end)
 
 -- ── Debug HUD ───────────────────────────────────────────────────────────────
@@ -375,8 +493,8 @@ end)
 local paramActivity = {}
 
 hook.Add("HUDPaint", "facetracking_debug", function()
-	if not cv_debug:GetBool() or not listening then return end
-	local active = vrmod.FaceTrackingActive()
+	if not cv_debug:GetBool() then return end
+	local active = listening and FTActive()
 	local data, now = lastData, RealTime()
 	for name, val in pairs(data) do
 		local prev = paramActivity[name]
@@ -394,8 +512,11 @@ hook.Add("HUDPaint", "facetracking_debug", function()
 	end
 	table.sort(sorted, function(a, b) return a.lastChange > b.lastChange end)
 	local x, y, lineH, barW = 10, 10, 16, 120
-	draw.SimpleText(Format("FaceTrack: %s (%d params) mult=%.1fx",
-		active and "RECEIVING" or "NO DATA", paramCount, cv_mult:GetFloat()),
+	draw.SimpleText(Format("FaceTrack: %s (%d params) mult=%.1fx | gaze: %s",
+		active and "RECEIVING" or "NO DATA", paramCount, cv_mult:GetFloat(),
+		localGaze.on and Format("%s %+.2f %+.2f", gazeOsc and OSC_GAZE[oscGaze] or "OpenXR", gazeX, gazeY)
+			or not GetEyeGaze and "module not rebuilt"
+			or (GAZE_WHY[gazeWhy] or "?") .. (oscGaze == 0 and ", no OSC gaze" or "")),
 		"DermaDefault", x, y, active and Color(80, 220, 80) or Color(220, 80, 80))
 	if activeMap then
 		y = y + lineH

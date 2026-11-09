@@ -33,6 +33,16 @@ end
 local function netReadAng()
 	return Angle(net_ReadFloat(), net_ReadFloat(), net_ReadFloat())
 end
+-- Torso-minus-hip yaw (cl_character's split body yaw), +-90 in 7 bits,
+-- 1.4 deg steps. Travels with characterYaw (the pair's average) in the yaw
+-- group: hip = yaw - twist / 2, torso = yaw + twist / 2.
+local function netReadTwist()
+	return net_ReadUInt(7) * 1.417323 - 90
+end
+local function netWriteTwist(tw)
+	tw = (tw or 0) + 90
+	net_WriteUInt(tw < 0 and 0 or tw > 180 and 127 or tw * 0.705556 + 0.5, 7)
+end
 -- HELPERS
 local function netReadFrame()
 	local frame = {
@@ -40,6 +50,7 @@ local function netReadFrame()
 		ts = net.ReadDouble(),
 		characterYaw = net_ReadUInt(7) * 2.85714,
 	}
+	frame.yawTwist = netReadTwist()
 	for i = 1, 10 do
 		frame[FINGERS[i]] = net_ReadUInt(7) / 100
 	end
@@ -69,7 +80,7 @@ local function buildClientFrame(relative)
 	if not IsValid(lp) then return nil end
 	-- Determine character yaw with Glide support
 	local vehicle = g_VR.vehicle.current
-	local characterYaw
+	local characterYaw, twist = nil, 0
 	if g_VR.vehicle.inside and IsValid(vehicle) then
 		local rawYaw = vehicle:GetAngles().yaw
 		rawYaw = (rawYaw + 180) % 360 - 180
@@ -77,6 +88,8 @@ local function buildClientFrame(relative)
 		characterYaw = math.Clamp(rawYaw, -MAX_YAW, MAX_YAW)
 	else
 		characterYaw = g_VR.characterYaw or 0
+		local h, t = g_VR.characterHipYaw, g_VR.characterTorsoYaw
+		if h and t then twist = (t - h + 180) % 360 - 180 end
 	end
 
 	local tracking = g_VR.tracking
@@ -86,24 +99,12 @@ local function buildClientFrame(relative)
 		hmdAng = tracking.hmd.ang,
 	}
 
-	local netTab = g_VR.net and g_VR.net[lp:SteamID()]
-	local netFrame = netTab and netTab.lerpedFrame
-	-- Handle hands: use netFrame if gripping, otherwise tracking
-	if g_VR.wheelGrippedLeft and netFrame then
-		frame.lefthandPos = netFrame.lefthandPos
-		frame.lefthandAng = netFrame.lefthandAng
-	else
-		frame.lefthandPos = tracking.pose_lefthand.pos
-		frame.lefthandAng = tracking.pose_lefthand.ang
-	end
-
-	if g_VR.wheelGrippedRight and netFrame then
-		frame.righthandPos = netFrame.righthandPos
-		frame.righthandAng = netFrame.righthandAng
-	else
-		frame.righthandPos = tracking.pose_righthand.pos
-		frame.righthandAng = tracking.pose_righthand.ang
-	end
+	-- Hands straight from tracking: a hand on the steering wheel is pinned
+	-- to the rim there (cl_wheel), before this runs
+	frame.lefthandPos = tracking.pose_lefthand.pos
+	frame.lefthandAng = tracking.pose_lefthand.ang
+	frame.righthandPos = tracking.pose_righthand.pos
+	frame.righthandAng = tracking.pose_righthand.ang
 
 	-- Assign fingers using loop
 	local curlsL = g_VR.input.skeleton_lefthand.fingerCurls
@@ -133,6 +134,7 @@ local function buildClientFrame(relative)
 	-- a new table containing only known position/angle fields.
 	local wd = g_VR.input and g_VR.input.vector2_walkdirection
 	frame.stickMoving = wd and (wd.x * wd.x + wd.y * wd.y) > 0.04 or false
+	frame.yawTwist = twist
 	-- ConVar objects are stable: resolve the registry lookup once, keep only
 	-- :GetFloat() in the per-tick path.
 	cv_eyeheight = cv_eyeheight or GetConVar("vrmod_charactereyeheight")
@@ -152,6 +154,7 @@ local function netWriteFrame(frame)
 	--net.WriteFloat(SysTime())
 	net.WriteDouble(SysTime())
 	netWriteYaw(frame.characterYaw)
+	netWriteTwist(frame.yawTwist)
 	for i = 1, 10 do
 		net_WriteUInt(frame[FINGERS[i]] * 100, 7)
 	end
@@ -232,7 +235,8 @@ end
 
 local function buildDeltaMask(frame, base)
 	local mask = 0
-	if math.abs(math.AngleDifference(frame.characterYaw or 0, base.characterYaw or 0)) > ANG_DELTA then
+	if math.abs(math.AngleDifference(frame.characterYaw or 0, base.characterYaw or 0)) > ANG_DELTA
+		or math.abs((frame.yawTwist or 0) - (base.yawTwist or 0)) > ANG_DELTA then
 		mask = bor(mask, BM_YAW)
 	end
 	if deltaFingersChanged(frame, base) then
@@ -267,6 +271,7 @@ local function netWriteDeltaFrame(frame, baseFrame)
 
 	if band(mask, BM_YAW) ~= 0 then
 		netWriteYaw(frame.characterYaw)
+		netWriteTwist(frame.yawTwist)
 	end
 	if band(mask, BM_FINGERS) ~= 0 then
 		for i = 1, 10 do
@@ -309,6 +314,7 @@ local function netReadDeltaFrame(baseFrame)
 	-- branch hoisted out of the field loop
 	if baseFrame then
 		frame.characterYaw = baseFrame.characterYaw or 0
+		frame.yawTwist = baseFrame.yawTwist or 0
 		for i = 1, 10 do
 			local key = FINGERS[i]
 			frame[key] = baseFrame[key] or 0
@@ -327,7 +333,7 @@ local function netReadDeltaFrame(baseFrame)
 		frame.rightfootPos = baseFrame.rightfootPos
 		frame.rightfootAng = baseFrame.rightfootAng
 	else
-		frame.characterYaw = 0
+		frame.characterYaw, frame.yawTwist = 0, 0
 		for i = 1, 10 do frame[FINGERS[i]] = 0 end
 		frame.hmdPos, frame.hmdAng = Vector(), Angle()
 		frame.lefthandPos, frame.lefthandAng = Vector(), Angle()
@@ -337,6 +343,7 @@ local function netReadDeltaFrame(baseFrame)
 	-- Overwrite with fields present in the delta
 	if band(mask, BM_YAW) ~= 0 then
 		frame.characterYaw = net_ReadUInt(7) * 2.85714
+		frame.yawTwist = netReadTwist()
 	end
 	if band(mask, BM_FINGERS) ~= 0 then
 		for i = 1, 10 do
@@ -467,6 +474,83 @@ function vrmod.GetPlayerTrackerLabels(ply)
 	return data and data.trackerLabels
 end
 
+-- Body/animation settings belong to the player they animate: every client
+-- poses a VR player with that player's own values, so one player's choices
+-- (sit, solver, lean...) show to everyone and drive nobody else's body.
+-- Order is the wire format. {convar, key, bool}
+local CHAR_CFG = {
+	{"vrmod_characterik", "characterIK", true},
+	{"vrmod_charactereyeheight", "characterEyeHeight"},
+	{"vrmod_characterheadtohmddist", "characterHeadToHmdDist"},
+	{"vrmod_armstretcher", "armStretcher", true},
+	{"vrmod_characterik_solver", "characterIKSolver"},
+	{"vrmod_hik_animblend", "hikAnimBlend"},
+	{"vrmod_hik_handblend", "hikHandBlend"},
+	{"vrmod_lean_sens", "leanSens"},
+	{"vrmod_lean_sens_fwd", "leanSensFwd"},
+	{"vrmod_sitheight", "sitHeight"},
+	{"vrmod_lieheight", "lieHeight"},
+	{"vrmod_sitheadtohmddist", "sitHeadToHmdDist"},
+	{"vrmod_fbt_leginfluence", "fbtLegInfluence"},
+	{"vrmod_fbt_animshoulders", "fbtAnimShoulders", true},
+	{"vrmod_althead_auto", "altHeadAuto", true},
+}
+local CFG_N = #CHAR_CFG
+local function WriteCfg(t) for i = 1, CFG_N do net_WriteFloat(t[i]) end end
+local SendCharCfg
+
+if CLIENT then
+	local cfgLocal, cfgDefault
+	local function CfgRead(def)
+		local t = {}
+		for i = 1, CFG_N do
+			local c = CHAR_CFG[i]
+			local cv = GetConVar(c[1])
+			local v = cv and tonumber(def and cv:GetDefault() or cv:GetString()) or 0
+			if c[3] then v = v ~= 0 end
+			t[c[2]] = v
+		end
+		return t
+	end
+	-- Local player: its own convars, no round trip. Remote: what they sent,
+	-- defaults until it lands -- never the viewer's settings.
+	function vrmod.CharCfg(ply)
+		if ply == LocalPlayer() then
+			cfgLocal = cfgLocal or CfgRead()
+			return cfgLocal
+		end
+		local n = g_VR.net[ply:SteamID()]
+		if n and n.cfg then return n.cfg end
+		cfgDefault = cfgDefault or CfgRead(true)
+		return cfgDefault
+	end
+	function SendCharCfg()
+		cfgLocal = cfgLocal or CfgRead()
+		net.Start("vrmod_charcfg")
+		for i = 1, CFG_N do
+			local v = cfgLocal[CHAR_CFG[i][2]]
+			net_WriteFloat(v == true and 1 or v or 0)
+		end
+		net.SendToServer()
+	end
+	-- Coalesced: a slider drag is one send, under the server's rate limit
+	local function CfgChanged()
+		cfgLocal = nil
+		if g_VR.active then timer.Create("vrmod_charcfg", 0.2, 1, SendCharCfg) end
+	end
+	for i = 1, CFG_N do cvars.AddChangeCallback(CHAR_CFG[i][1], CfgChanged, "vrmod_net_charcfg") end
+	net.Receive("vrmod_charcfg", function()
+		local ply, t = net.ReadEntity(), {}
+		for i = 1, CFG_N do
+			local c, v = CHAR_CFG[i], net_ReadFloat()
+			if c[3] then v = v ~= 0 end
+			t[c[2]] = v
+		end
+		local n = IsValid(ply) and g_VR.net[ply:SteamID()]
+		if n then n.cfg = t end
+	end)
+end
+
 if CLIENT then
 	vrmod.AddCallbackedConvar("vrmod_net_delay", nil, "0.1", nil, nil, nil, nil, tonumber, nil)
  
@@ -521,7 +605,7 @@ if CLIENT then
 			lastSentFrame = vrmod.utils.CopyFrame(frame) -- keyframe: full resync
 		else
 			local lsf = lastSentFrame
-			if band(mask, BM_YAW) ~= 0 then lsf.characterYaw = frame.characterYaw end
+			if band(mask, BM_YAW) ~= 0 then lsf.characterYaw, lsf.yawTwist = frame.characterYaw, frame.yawTwist end
 			if band(mask, BM_FINGERS) ~= 0 then
 				for i = 1, 10 do
 					local k = FINGERS[i]
@@ -677,6 +761,30 @@ if CLIENT then
 		objRegDirty = true
 	end
 
+	-- Predicted shots read OUR m_vecViewOffset, not the server's. Left to the
+	-- network it arrives a round trip late (and xy is range-clamped in the
+	-- send table), so the shot origin trailed and orbited the muzzle. Set it
+	-- from the live muzzle after movement, before ItemPostFrame fires.
+	local _vo = Vector()
+	hook.Add("FinishMove", "vrmod_muzzle_eye", function(ply, mv)
+		local muz = g_VR.active and g_VR.viewModelMuzzle
+		if not muz then return end
+		_vo:Set(muz.Pos)
+		_vo:Sub(mv:GetOrigin())
+		ply:SetCurrentViewOffset(_vo)
+	end)
+	-- Bullets themselves: pin the source to the muzzle at the moment they are
+	-- fired (see the server hook). Predicted copy, so tracers and impacts you
+	-- see match what the server does. Shots from the gun only, never a
+	-- penetration/ricochet follow-up: vrmod.MuzzleBullet (sh_startup).
+	hook.Add("EntityFireBullets", "vrmod_muzzle_src", function(ent, data)
+		local muz = g_VR.active and g_VR.viewModelMuzzle
+		if not muz then return end
+		local lp = LocalPlayer()
+		if ent ~= lp and ent:GetOwner() ~= lp then return end
+		if vrmod.MuzzleBullet(data, muz.Pos) then return true end
+	end)
+
 	-- Transmit timer factored out so the rate can change live (see the
 	-- vrmod_net_tickrate callback below). Send rate is clamped to 10..100 Hz
 	-- regardless of the convar's raw value.
@@ -714,20 +822,7 @@ if CLIENT then
 		net.WriteBool(GetConVar("vrmod_althead"):GetBool())
 		net.WriteBool(GetConVar("vrmod_floatinghands"):GetBool())
 		net.SendToServer()
-		-- Send characterIK state separately so the join wire format stays stable
-		local cvIK = GetConVar("vrmod_characterik")
-		net.Start("vrmod_characterik_sync")
-		net.WriteBool(cvIK and cvIK:GetBool() or true)
-		net.SendToServer()
-		-- Send character calibration (eyeHeight + headToHmdDist)
-		local cvEye = GetConVar("vrmod_charactereyeheight")
-		local cvHmd = GetConVar("vrmod_characterheadtohmddist")
-		local eyeVal = cvEye and cvEye:GetFloat() or 66.8
-		local hmdVal = cvHmd and cvHmd:GetFloat() or 6.3
-		net.Start("vrmod_charcal_sync")
-		net.WriteFloat(eyeVal)
-		net.WriteFloat(hmdVal)
-		net.SendToServer()
+		SendCharCfg()
 	end
  
 	-- === INTERPOLATION (in place) ===
@@ -745,6 +840,8 @@ if CLIENT then
 		local yA = a.characterYaw or 0
 		-- (d + 180) % 360 - 180 == math.NormalizeAngle, inlined (pure arithmetic)
 		lf.characterYaw = yA + (((b.characterYaw or 0) - yA + 180) % 360 - 180) * t
+		local wA = a.yawTwist or 0
+		lf.yawTwist = wA + ((b.yawTwist or 0) - wA) * t
 		for i = 1, 10 do
 			local k = FINGERS[i]
 			local fa = a[k] or 0
@@ -845,7 +942,7 @@ if CLIENT then
 			if ply:InVehicle() then
 				local plyAng = ply:GetVehicle():GetAngles()
 				local _, fwdAng = LocalToWorld(vector_origin, VEH_FWD_ANG, vector_origin, plyAng)
-				lf.characterYaw = fwdAng.yaw
+				lf.characterYaw, lf.yawTwist = fwdAng.yaw, 0
 				for i = 1, 6 do
 					local pk = PKEYS[i]
 					local p = lf[pk]
@@ -939,9 +1036,7 @@ if CLIENT then
 			dontHideBullets = net.ReadBool(),
 			-- Preserve per-player state that arrives via separate sync messages;
 			-- join re-fires on respawn and would otherwise wipe calibration data.
-			characterIK = prev and prev.characterIK,
-			charEyeHeight = prev and prev.charEyeHeight,
-			charHeadToHmd = prev and prev.charHeadToHmd,
+			cfg = prev and prev.cfg,
 			trackerLabels = prev and prev.trackerLabels,
 			trackers = prev and prev.trackers,
 			lastFrame = nil,
@@ -954,30 +1049,6 @@ if CLIENT then
 		hook.Run("VRMod_Start", ply)
 	end)
  
-	net.Receive("vrmod_characterik_sync", function()
-		local ply = net.ReadEntity()
-		if not IsValid(ply) then return end
-		local sid = ply:SteamID()
-		if g_VR.net[sid] then g_VR.net[sid].characterIK = net.ReadBool() end
-	end)
-
-	cvars.AddChangeCallback("vrmod_characterik", function(_, _, new)
-		if not g_VR.active then return end
-		net.Start("vrmod_characterik_sync")
-		net.WriteBool(new ~= "0" and new ~= "")
-		net.SendToServer()
-	end, "vrmod_net_charik_sync")
-
-	net.Receive("vrmod_charcal_sync", function()
-		local ply = net.ReadEntity()
-		if not IsValid(ply) then return end
-		local sid = ply:SteamID()
-		if g_VR.net[sid] then
-			g_VR.net[sid].charEyeHeight = net.ReadFloat()
-			g_VR.net[sid].charHeadToHmd = net.ReadFloat()
-		end
-	end)
-
 	net.Receive("vrmod_trackers_reg", function()
 		local ply = net.ReadEntity()
 		local labels = netReadTrackerLabels()
@@ -1000,18 +1071,6 @@ if CLIENT then
 		if tab and not store then store = {} tab.trackers = store end
 		netReadTrackerTick(labels, store or {})
 	end)
-
-	local function SendCharCal()
-		if not g_VR.active then return end
-		local cvEye = GetConVar("vrmod_charactereyeheight")
-		local cvHmd = GetConVar("vrmod_characterheadtohmddist")
-		net.Start("vrmod_charcal_sync")
-		net.WriteFloat(cvEye and cvEye:GetFloat() or 66.8)
-		net.WriteFloat(cvHmd and cvHmd:GetFloat() or 6.3)
-		net.SendToServer()
-	end
-	cvars.AddChangeCallback("vrmod_charactereyeheight", SendCharCal, "vrmod_net_charcal")
-	cvars.AddChangeCallback("vrmod_characterheadtohmddist", SendCharCal, "vrmod_net_charcal2")
 
 	-- === PLAYER EXIT (unchanged) ===
 	local swepOriginalFovs = {}
@@ -1182,41 +1241,55 @@ if SERVER then
 	util.AddNetworkString("vrutil_net_requestvrplayers")
 	util.AddNetworkString("vrutil_net_entervehicle")
 	util.AddNetworkString("vrutil_net_exitvehicle")
-	util.AddNetworkString("vrmod_characterik_sync")
-	util.AddNetworkString("vrmod_charcal_sync")
+	util.AddNetworkString("vrmod_charcfg")
 	util.AddNetworkString("vrmod_trackers_reg")
 	util.AddNetworkString("vrmod_trackers_tick")
+	-- World-space muzzle per player, as the client SAW it. Absolute, not
+	-- relative to an origin: in SP the client's own origin is the
+	-- interpolated one, ~cl_interp behind the server's, so any offset built
+	-- from it put the shot wherever that lag left your body -- the "depends
+	-- where I stand" offset.
+	local MUZ_MAX = 160 * 160
+	local muzPos = setmetatable({}, {__mode = "k"})
+	-- EyePos for GetShootPos consumers (physgun, toolgun, melee traces).
+	-- Re-applied after every usercmd's movement, against that command's
+	-- origin, so EyePos lands on the muzzle whatever the hull did.
+	local _vo = Vector()
+	hook.Add("FinishMove", "vrmod_muzzle_eye", function(ply, mv)
+		local m = muzPos[ply]
+		if not m then return end
+		_vo:Set(m)
+		_vo:Sub(mv:GetOrigin())
+		ply:SetCurrentViewOffset(_vo)
+	end)
+	-- Bullets themselves get the muzzle as Src in sh_startup's VRMod_Bullets,
+	-- which owns every VRMod edit to a bullet (one hook, one return true).
+	hook.Add("VRMod_Exit", "vrmod_muzzle_eye", function(ply) muzPos[ply] = nil end)
 	-- maxLen is in BITS. FBT keyframes run ~1500 bits (hmd+hands+fullbody+
 	-- muzzle); 1200 silently dropped every FBT tick. 210/sec covers 100 Hz
 	-- plus timer catch-up bursts after client hitches.
-	local _voZ = Vector()
 	vrmod.NetReceiveLimited("vrutil_net_tick", 210, 2400, function(len, ply)
 		local steamid = ply:SteamID()
 		if g_VR[steamid] == nil then return end
 		local viewHackPos = Vector(net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
 		local viewHackAng = Angle(net.ReadFloat(), net.ReadFloat(), net.ReadFloat())
-		-- Store muzzle/VR viewmodel info
-		g_VR[steamid].muzzlePos = viewHackPos
 		g_VR[steamid].muzzleAng = viewHackAng
 		-- Read delta-compressed frame, merging with the last known frame for this player
 		local baseFrame = g_VR[steamid].latestFrame
 		local frame = netReadDeltaFrame(baseFrame)
 		g_VR[steamid].latestFrame = frame
-		if not viewHackPos:IsZero() and util.IsInWorld(viewHackPos) then
-			-- ABSOLUTE, not a running sum. The old form self-corrected only
-			-- while EyePos() == GetPos() + viewOffset; seated, EyePos() is the
-			-- VEHICLE view origin and ignores the offset entirely, so every
-			-- tick spent driving added (muzzle - vehicle eye) again. That
-			-- accumulated offset is what the gun inherited on the way out.
-			local vo, pp = ply.viewOffset, ply:GetPos()
-			if not vo then vo = Vector() ply.viewOffset = vo end
-			vo.x, vo.y, vo.z = viewHackPos.x - pp.x, viewHackPos.y - pp.y, viewHackPos.z - pp.z
-			ply:SetCurrentViewOffset(vo)
-			_voZ.z = vo.z
-			ply:SetViewOffset(_voZ)
-		else
-			ply:SetCurrentViewOffset(ply.originalViewOffset)
-			ply:SetViewOffset(ply.originalViewOffset)
+		-- Zero = no muzzle. Distance cap stands in for the old IsInWorld
+		-- check. Restore once on the transition, not every packet: ducking
+		-- owns the offset again from then on.
+		-- muzzlePos (world space) is the bullet source in sh_startup's
+		-- VRMod_Bullets; nil whenever it fails this check.
+		if not viewHackPos:IsZero() and viewHackPos:DistToSqr(ply:GetPos()) <= MUZ_MAX then
+			muzPos[ply] = viewHackPos
+			g_VR[steamid].muzzlePos = viewHackPos
+		elseif muzPos[ply] then
+			muzPos[ply] = nil
+			g_VR[steamid].muzzlePos = nil
+			ply:SetCurrentViewOffset(ply:Crouching() and ply:GetViewOffsetDucked() or ply:GetViewOffset())
 		end
 
 		--relay frame to everyone except sender
@@ -1231,7 +1304,6 @@ if SERVER then
 		if g_VR[ply:SteamID()] ~= nil then return end
 		ply:DrawShadow(false)
 		ply.originalViewOffset = ply:GetViewOffset()
-		ply.viewOffset = Vector(0, 0, 0)
 		--add gt entry
 		g_VR[ply:SteamID()] = {
 			--store join values so we can re-send joins to players that connect later
@@ -1255,25 +1327,19 @@ if SERVER then
 		hook.Run("VRMod_Start", ply)
 	end)
 
-	vrmod.NetReceiveLimited("vrmod_characterik_sync", 10, 1, function(len, ply)
-		local steamid = ply:SteamID()
-		if not g_VR[steamid] then return end
-		g_VR[steamid].characterIK = net.ReadBool()
-		net.Start("vrmod_characterik_sync")
+	-- maxLen is bits. Non-finite or absurd values read as 0.
+	vrmod.NetReceiveLimited("vrmod_charcfg", 10, CFG_N * 32, function(len, ply)
+		local d = g_VR[ply:SteamID()]
+		if not d then return end
+		local t = {}
+		for i = 1, CFG_N do
+			local v = net_ReadFloat()
+			t[i] = v > -1e6 and v < 1e6 and v or 0
+		end
+		d.charCfg = t
+		net.Start("vrmod_charcfg")
 		net.WriteEntity(ply)
-		net.WriteBool(g_VR[steamid].characterIK)
-		net.Broadcast()
-	end)
-
-	vrmod.NetReceiveLimited("vrmod_charcal_sync", 10, 1, function(len, ply)
-		local steamid = ply:SteamID()
-		if not g_VR[steamid] then return end
-		g_VR[steamid].charEyeHeight = net.ReadFloat()
-		g_VR[steamid].charHeadToHmd = net.ReadFloat()
-		net.Start("vrmod_charcal_sync")
-		net.WriteEntity(ply)
-		net.WriteFloat(g_VR[steamid].charEyeHeight)
-		net.WriteFloat(g_VR[steamid].charHeadToHmd)
+		WriteCfg(t)
 		net.Broadcast()
 	end)
 
@@ -1360,17 +1426,10 @@ if SERVER then
 					net.WriteBool(v.characterAltHead)
 					net.WriteBool(v.dontHideBullets)
 					net.Send(ply)
-					if v.characterIK ~= nil then
-						net.Start("vrmod_characterik_sync")
+					if v.charCfg then
+						net.Start("vrmod_charcfg")
 						net.WriteEntity(vrPly)
-						net.WriteBool(v.characterIK)
-						net.Send(ply)
-					end
-					if v.charEyeHeight then
-						net.Start("vrmod_charcal_sync")
-						net.WriteEntity(vrPly)
-						net.WriteFloat(v.charEyeHeight)
-						net.WriteFloat(v.charHeadToHmd or 6.3)
+						WriteCfg(v.charCfg)
 						net.Send(ply)
 					end
 

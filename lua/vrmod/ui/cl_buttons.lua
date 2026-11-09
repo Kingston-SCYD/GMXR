@@ -1,6 +1,7 @@
 if SERVER then return end
+-- The registry is persistent and upserts by name: no wipe, so items other
+-- addons registered (in any order) survive this rebuild.
 local function InitializeMenuItems()
-    g_VR.menuItems = {}
 
     -- Row 1
     vrmod.AddInGameMenuItem("Spawn Menu", 0, 0, function()
@@ -67,7 +68,8 @@ local function InitializeMenuItems()
     end, true)
     vrmod.AddInGameMenuItem("RESPAWN", 4, 2, function() LocalPlayer():ConCommand("kill") end, true)
     vrmod.AddInGameMenuItem("VR EXIT", 5, 2, function() LocalPlayer():ConCommand("vrmod_exit") end, true)
-    vrmod.AddInGameMenuItem("DISCONNECT", 5, 2, function() LocalPlayer():ConCommand("disconnect") end, true)
+    vrmod.AddInGameMenuItem("Adjust Seat", 0, 3, function() LocalPlayer():ConCommand("vrmod_seat_adjust") end, true)
+    vrmod.AddInGameMenuItem("DISCONNECT", 5, 3, function() LocalPlayer():ConCommand("disconnect") end, true)
 end
 
 hook.Add("VRMod_Start", "ReloadMenuItems", function(ply)

@@ -48,6 +48,11 @@ end
 
 -- CLIENT-SIDE CODE BELOW
 local vrmod_fbt = {} -- Module table for organization
+-- cl_character reads the tracker targets (GetTargets) to run FBT through
+-- Hai IK, and places the body / hull off the waist for both solvers.
+vrmod.fbt = vrmod_fbt
+local POSE = vrmod.pose or {seq = {}, raw = {}}
+vrmod.pose = POSE
 vrmod_fbt.characterInfo = {}
 vrmod_fbt.convarValues = select(2, vrmod.GetConvars()) -- Cache convars
 vrmod_fbt.zeroVec = Vector()
@@ -63,13 +68,9 @@ vrmod.AddCallbackedConvar("vrmod_fbt_leginfluence", "fbtLegInfluence", "1", FCVA
 -- look if anim arm swing fights with hand tracking). Default on for parity
 -- with previous behavior.
 vrmod.AddCallbackedConvar("vrmod_fbt_animshoulders", "fbtAnimShoulders", "1", FCVAR_ARCHIVE, "Allow walk anim to swing shoulders while FBT is active", nil, nil, tobool)
--- Per-player characterIK lookup for FBT: LocalPlayer uses local convar,
--- remote players use the value networked via vrmod_characterik_sync.
-local function GetPlayerCharacterIK(ply)
-	if ply == LocalPlayer() then return vrmod_fbt.convarValues.characterIK end
-	local n = g_VR.net and g_VR.net[ply:SteamID()]
-	return not n or n.characterIK ~= false
-end
+-- Per-player body settings (sh_network; client only): the player's own
+local CharCfg = vrmod.CharCfg
+local function GetPlayerCharacterIK(ply) return CharCfg(ply).characterIK end
 -- Bone name constants for clarity
 local BONE_NAMES = {
 	leftClavicle = "ValveBiped.Bip01_L_Clavicle",
@@ -269,12 +270,21 @@ function vrmod_fbt.CalculateArmIK(boneinfo, boneids, upperArmLen, lowerArmLen, u
 	local targetVecAng = targetVec:Angle()
 	local newUpperArmAng = Angle(targetVecAng.pitch, targetVecAng.yaw, targetVecAng.roll)
 	if not isLeft then newUpperArmAng:RotateAroundAxis(targetVec, 180) end
-	-- Arm roll (base character approach): flat Angle(armPitch, bodyYaw, ±90)
-	-- never composes through a tilted frame, so no Euler gimbal lock.
-	local _, tang = WorldToLocal(vrmod_fbt.zeroVec, Angle(targetVecAng.pitch, upperBodyAng.yaw, isLeft and -90 or 90), vrmod_fbt.zeroVec, targetVecAng)
+	-- Arm roll: flat Angle(armPitch, 0, ±90) in the upper body's OWN frame.
+	-- (A world yaw-only reference bent the elbows inward lying down.)
+	local zv = vrmod_fbt.zeroVec
+	local localAng = WorldToLocal(targetVec, vrmod_fbt.zeroAng, zv, upperBodyAng):Angle()
+	local _, ref = LocalToWorld(zv, Angle(localAng.pitch, 0, isLeft and -90 or 90), zv, upperBodyAng)
+	local _, tang = WorldToLocal(zv, ref, zv, targetVecAng)
 	newUpperArmAng:RotateAroundAxis(newUpperArmAng:Forward(), tang.roll)
-	local heightRoll = math.max((targetPos.z - wpos.z + 20) * 1.5, 0)
-	newUpperArmAng:RotateAroundAxis(targetVec:GetNormalized(), (isLeft and 1 or -1) * (30 + heightRoll))
+	-- Height along the body's up, not the world's, for the same reason.
+	local tn = targetVec:GetNormalized()
+	local heightRoll = math.max((targetVec:Dot(upperBodyAng:Up()) + 20) * 1.5, 0)
+	-- Reaching forward (aiming) the swing throws the elbow out -- chicken
+	-- wing; past 0.3 of forward reach it eases to 15%, elbow down.
+	local fr = (tn:Dot(upperBodyAng:Forward()) - 0.3) / 0.7
+	local swing = (30 + heightRoll) * (fr > 0 and 1 - math.min(fr, 1) * 0.85 or 1)
+	newUpperArmAng:RotateAroundAxis(tn, (isLeft and 1 or -1) * swing)
 	-- Contraction with stretching
 	local targetVecLen = targetVec:Length()
 	local totalArmLen = upperArmLen + lowerArmLen
@@ -324,26 +334,19 @@ end
 -- Reusable frame table for LocalPlayer to avoid per-frame allocation
 local localFrame = {}
 
--- Main bone position calculation function
-function vrmod_fbt.CalculateBonePositions(ply)
-	local steamid = ply:SteamID()
-	local info = vrmod_fbt.characterInfo[steamid]
-	if info.frameNumber == FrameNumber() then return end
-	-- LocalPlayer reads directly from g_VR.tracking (freshest data, no lerpedFrame timing dependency)
-	local frame
-	-- Resolved by sh_trackers.lua on rescan, so this stays three table
-	-- indexes on a path that runs every BuildBonePositions. Falls back to the
-	-- raw HTCX keys when the registry is absent. All three are tested before
-	-- use: the old guard checked only the waist and then indexed both feet
-	-- unconditionally, which errored the bone callback every frame if a foot
-	-- tracker's battery died mid-session.
+-- The tracker frame for a player: LocalPlayer reads g_VR.tracking directly
+-- (freshest), others the relayed lerped frame. nil when a tracker's missing.
+-- Resolved by sh_trackers.lua on rescan, so this stays three table indexes.
+-- All three are tested: a foot tracker's battery dying mid-session must not
+-- error the bone callback.
+function vrmod_fbt.GetFrame(ply)
 	local fbt = g_VR.fbtPose
 	local t = g_VR.tracking
 	local waistPose     = fbt and fbt.pelvis    or t.pose_waist
 	local leftFootPose  = fbt and fbt.leftfoot  or t.pose_leftfoot
 	local rightFootPose = fbt and fbt.rightfoot or t.pose_rightfoot
-	local isLocal = ply == LocalPlayer()
-	if isLocal and waistPose and leftFootPose and rightFootPose then
+	local frame
+	if ply == LocalPlayer() and waistPose and leftFootPose and rightFootPose then
 		local f = localFrame
 		f.hmdPos = t.hmd.pos; f.hmdAng = t.hmd.ang
 		f.lefthandPos = t.pose_lefthand.pos; f.lefthandAng = t.pose_lefthand.ang
@@ -355,12 +358,63 @@ function vrmod_fbt.CalculateBonePositions(ply)
 		for i = 1, 5 do f["finger" .. i] = lh.fingerCurls[i]; f["finger" .. (i + 5)] = rh.fingerCurls[i] end
 		frame = f
 	else
-		frame = g_VR.net[steamid] and g_VR.net[steamid].lerpedFrame
+		frame = g_VR.net[ply:SteamID()] and g_VR.net[ply:SteamID()].lerpedFrame
 	end
-	-- waistPos & co. are required below; a relayed frame can legitimately
-	-- lack them right after a remote toggles FBT off (before vrmod_fbt_toggle
-	-- lands). Bail instead of erroring the bone callback every frame.
-	if not frame or not frame.waistPos then return end
+	-- a relayed frame can lack waistPos right after a remote toggles FBT off
+	if frame and frame.waistPos then return frame end
+end
+
+-- Calibrated tracker targets, once per frame per player: pelvis (tracker
+-- frame + the pelvis bone's angle), both foot bones (position, angle), and
+-- the stick-walk leg blend (0 trackers .. 1 walk anim; only upright -- the
+-- walk cycle on a body lying down wrecked the legs). nil until calibrated.
+local fbtTargets = {}
+function vrmod_fbt.GetTargets(ply)
+	local steamid = ply:SteamID()
+	local info = vrmod_fbt.characterInfo[steamid]
+	if not info or not info.waistCalibrationPos or not info.defaultLeftFootAngles then return end
+	local T = fbtTargets[steamid]
+	if not T then
+		T = {}
+		fbtTargets[steamid] = T
+	end
+	local fn = FrameNumber()
+	if T.fn == fn then return T.ok and T or nil end
+	T.fn = fn
+	local frame = vrmod_fbt.GetFrame(ply)
+	T.ok = frame ~= nil
+	if not frame then return end
+	local z = vrmod_fbt.zeroVec
+	T.pelvisPos, T.pelvisAng = LocalToWorld(info.waistCalibrationPos, info.waistCalibrationAng, frame.waistPos, frame.waistAng)
+	_, T.pelvisBoneAng = LocalToWorld(z, Angle(0, 90, 90), T.pelvisPos, T.pelvisAng)
+	local p, a = LocalToWorld(info.leftFootCalibrationPos, info.leftFootCalibrationAng, frame.leftfootPos, frame.leftfootAng)
+	T.lfPos = p
+	_, T.lfAng = LocalToWorld(z, info.defaultLeftFootAngles, z, a)
+	p, a = LocalToWorld(info.rightFootCalibrationPos, info.rightFootCalibrationAng, frame.rightfootPos, frame.rightfootAng)
+	T.rfPos = p
+	_, T.rfAng = LocalToWorld(z, info.defaultRightFootAngles, z, a)
+	local sm
+	if ply == LocalPlayer() then
+		local wd = g_VR.input and g_VR.input.vector2_walkdirection
+		sm = wd and (wd.x * wd.x + wd.y * wd.y) > 0.04 or false
+	else
+		sm = frame.stickMoving or false
+	end
+	local target = (GetPlayerCharacterIK(ply) and sm and T.pelvisAng:Up().z > 0.6) and 1 or 0
+	T.legBlend = math.Approach(T.legBlend or target, target, RealFrameTime() * 3)
+	T.frame = frame
+	return T
+end
+
+-- Main bone position calculation function
+function vrmod_fbt.CalculateBonePositions(ply)
+	local steamid = ply:SteamID()
+	local info = vrmod_fbt.characterInfo[steamid]
+	if info.frameNumber == FrameNumber() then return end
+	local frame = vrmod_fbt.GetFrame(ply)
+	if not frame then return end
+	local isLocal = ply == LocalPlayer()
+	local cfg = CharCfg(ply)
 	info.frameNumber = FrameNumber()
 	local boneids = info.boneids
 	local boneinfo = info.boneinfo
@@ -385,7 +439,7 @@ function vrmod_fbt.CalculateBonePositions(ply)
 	-- When fbtAnimShoulders is off, skip the whole spine chain + clavicles
 	-- so walk arm/torso swing doesn't bleed into the FBT-driven shoulders.
 	if GetPlayerCharacterIK(ply) then
-		local skipShoulderAnim = not vrmod_fbt.convarValues.fbtAnimShoulders
+		local skipShoulderAnim = not cfg.fbtAnimShoulders
 		-- Hidden bones carry the zeroed 3x3 the bone hider wrote last pass;
 		-- reading their angles back here feeds junk relativeAng into their
 		-- whole subtree. Skip them, they drive nothing.
@@ -427,7 +481,8 @@ function vrmod_fbt.CalculateBonePositions(ply)
 	else
 		isStickMoving = frame.stickMoving or false
 	end
-	local targetBlend = (GetPlayerCharacterIK(ply) and isStickMoving) and 1 or 0
+	-- Not while lying: the walk cycle on a horizontal pelvis wrecked the legs.
+	local targetBlend = (GetPlayerCharacterIK(ply) and isStickMoving and pelvisTargetAng:Up().z > 0.6) and 1 or 0
 	info.legBlend = math.Approach(info.legBlend or targetBlend, targetBlend, RealFrameTime() * 3)
 	-- Crouch reach threshold (shared by the per-leg hybrid below). When the
 	-- pelvis is closer to a foot tracker than a fully-extended leg would
@@ -436,7 +491,7 @@ function vrmod_fbt.CalculateBonePositions(ply)
 	-- total leg length matches, keeping the walk anim on the thigh.
 	local crouchReach = (upperLegLen + lowerLegLen) * 0.95
 	local legBlend = info.legBlend
-	local legInfluence = vrmod_fbt.convarValues.fbtLegInfluence or 1
+	local legInfluence = cfg.fbtLegInfluence or 1
 	local bodyYawAng, leftLegPitch, leftLegAbduct, rightLegPitch, rightLegAbduct
 	if legBlend > 0 then
 		bodyYawAng = Angle(0, pelvisTargetAng.yaw, 0)
@@ -565,9 +620,9 @@ function vrmod_fbt.CalculateBonePositions(ply)
 		end
 
 		-- Left arm IK
-		if i == boneids.leftUpperArm then vrmod_fbt.CalculateArmIK(boneinfo, boneids, upperArmLen, lowerArmLen, boneids.leftUpperArm, boneids.leftForearm, boneids.leftHand, boneids.leftWrist, boneids.leftUlna, leftHandTargetPos, leftHandTargetAng, upperBodyAng, vrmod_fbt.convarValues, true, wpos) end
+		if i == boneids.leftUpperArm then vrmod_fbt.CalculateArmIK(boneinfo, boneids, upperArmLen, lowerArmLen, boneids.leftUpperArm, boneids.leftForearm, boneids.leftHand, boneids.leftWrist, boneids.leftUlna, leftHandTargetPos, leftHandTargetAng, upperBodyAng, cfg, true, wpos) end
 		-- Right arm IK
-		if i == boneids.rightUpperArm then vrmod_fbt.CalculateArmIK(boneinfo, boneids, upperArmLen, lowerArmLen, boneids.rightUpperArm, boneids.rightForearm, boneids.rightHand, boneids.rightWrist, boneids.rightUlna, rightHandTargetPos, rightHandTargetAng + Angle(0, 0, 180), upperBodyAng, vrmod_fbt.convarValues, false, wpos) end
+		if i == boneids.rightUpperArm then vrmod_fbt.CalculateArmIK(boneinfo, boneids, upperArmLen, lowerArmLen, boneids.rightUpperArm, boneids.rightForearm, boneids.rightHand, boneids.rightWrist, boneids.rightUlna, rightHandTargetPos, rightHandTargetAng + Angle(0, 0, 180), upperBodyAng, cfg, false, wpos) end
 		-- Apply overrides and build matrix
 		wpos = bi.overridePos or wpos
 		wang = bi.overrideAng or wang
@@ -752,6 +807,10 @@ function vrmod_fbt.Start(ply)
 	local isLocal = ply == LocalPlayer()
 	local zeroVec = vrmod_fbt.zeroVec
 	info.fbtBoneCallback = ply:AddCallback("BuildBonePositions", function(ent, numbones)
+		if POSE.raw[ply] then POSE.RawBones(ply, info.boneids.head) return end
+		-- Hai IK solves FBT in cl_character's callback (same arms, hands and
+		-- spine as without trackers); this one stays out of it.
+		if vrmod.FbtUsesHai and vrmod.FbtUsesHai(ply) then return end
 		vrmod_fbt.CalculateBonePositions(ply)
 		local boneinfo = info.boneinfo
 		for i = 0, info.boneCount - 1 do

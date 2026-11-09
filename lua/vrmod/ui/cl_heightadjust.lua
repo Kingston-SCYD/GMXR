@@ -1,17 +1,29 @@
 if SERVER then return end
 local convars, convarValues = vrmod.GetConvars()
-local mirrorYaw = 0
 
+-- Mirror = a clientside copy of the local player wearing their live pose
+-- reflected across a vertical plane MIRROR_DIST ahead of the head. Rendered in
+-- the scene like any other model, so it has real stereo depth, world lighting
+-- and occlusion -- no render target, no flat quad.
 local MIRROR_DIST = 50
-local MIRROR_W = 100
-local MIRROR_H = 100
-local RT_W, RT_H = 640, 640
 
-local rt_mirror, mat_mirror
-local math_abs = math.abs
-local math_AngleDifference = math.AngleDifference
-local math_deg = math.deg
-local math_atan = math.atan
+local ENT = FindMetaTable("Entity")
+local GetBoneMatrix, SetBoneMatrix = ENT.GetBoneMatrix, ENT.SetBoneMatrix
+local GetFlexWeight, SetFlexWeight = ENT.GetFlexWeight, ENT.SetFlexWeight
+local math_AngleDifference, math_rad, math_cos, math_sin = math.AngleDifference, math.rad, math.cos, math.sin
+local render_CullMode = render.CullMode
+local render_OverrideColorWriteEnable, render_OverrideDepthEnable = render.OverrideColorWriteEnable, render.OverrideDepthEnable
+local render_SuppressEngineLighting = render.SuppressEngineLighting
+local cam_Start3D, cam_End3D = cam.Start3D, cam.End3D
+local FrameNumber, LocalPlayer, IsValid = FrameNumber, LocalPlayer, IsValid
+
+-- Plane yaw (snaps in 45 deg steps) and its unit normal
+local mirrorYaw, fx, fy = 0, 1, 0
+-- reflect: world reflection across the plane, rebuilt per frame. boneMat: scratch.
+local reflect, boneMat, clonePos = Matrix(), Matrix(), Vector()
+-- Passed to VRUtilMenuOpen and mutated in place; charik aliases the angle
+local menuPos, menuAng = Vector(), Angle(0, -90, 90)
+local clone, owner, flexN, snapFrame = nil, nil, 0, 0
 
 local function GetEyeHeight()
 	return convarValues.characterEyeHeight or 66.8
@@ -22,112 +34,116 @@ local function AutoScale()
 	convars.vrmod_scale:SetFloat(g_VR.scale)
 end
 
-local function SetupMirror()
-	if not g_VR or not g_VR.tracking then return end
-	local ply = LocalPlayer()
-
-	if not rt_mirror then
-		rt_mirror = GetRenderTargetEx("rt_vrmod_heightmirror", RT_W, RT_H, RT_SIZE_NO_CHANGE, MATERIAL_RT_DEPTH_SEPARATE, bit.bor(256, 32768), 0, IMAGE_FORMAT_BGRA8888)
-		mat_mirror = CreateMaterial("mat_vrmod_heightmirror", "UnlitGeneric", {
-			["$basetexture"] = rt_mirror:GetName(),
-			["$model"] = "1",
-		})
+-- Reflected copy of the owner's bone cache. A reflection flips handedness,
+-- so the clone draws with clockwise culling.
+local function CopyBones(ent, n)
+	for i = 0, n - 1 do
+		local m = GetBoneMatrix(owner, i)
+		if m then
+			boneMat:Set(reflect)
+			boneMat:Mul(m)
+			SetBoneMatrix(ent, i, boneMat)
+		end
 	end
+end
 
-	-- Yaw tracking + menu anchoring
-	hook.Add("Think", "vrmod_heightmirror_update", function()
-		if not g_VR or not g_VR.tracking then return end
-		if not g_VR.menus or not g_VR.menus.heightmenu then return end
+local function OwnerColor() return owner:GetPlayerColor() end
 
-		local ad = math_AngleDifference(g_VR.tracking.hmd.ang.yaw, mirrorYaw)
-		if math_abs(ad) > 45 then mirrorYaw = mirrorYaw + (ad > 0 and 45 or -45) end
+local function BuildClone(ply)
+	if IsValid(clone) then clone:Remove() end
+	owner = ply
+	clone = ClientsideModel(ply:GetModel(), RENDERGROUP_OPAQUE)
+	if not IsValid(clone) then clone = nil return end
+	clone:SetNoDraw(true)
+	clone:DrawShadow(false)
+	clone:SetSkin(ply:GetSkin())
+	clone:SetMaterial(ply:GetMaterial())
+	for i = 0, ply:GetNumBodyGroups() - 1 do clone:SetBodygroup(i, ply:GetBodygroup(i)) end
+	clone.GetPlayerColor = OwnerColor
+	clone:AddCallback("BuildBonePositions", CopyBones)
+	flexN = ply:GetFlexNum()
+end
 
-		local mirrorPos = Vector(g_VR.tracking.hmd.pos.x, g_VR.tracking.hmd.pos.y, g_VR.origin.z)
-		mirrorPos:Add(Angle(0, mirrorYaw, 0):Forward() * MIRROR_DIST)
-		local menuAng = Angle(0, mirrorYaw - 90, 90)
-		g_VR.menus.heightmenu.pos = mirrorPos + Vector(0, 0, 75) + menuAng:Forward() * -15
-		g_VR.menus.heightmenu.ang = menuAng
-	end)
+-- Once per frame: plane + menu anchor, a clean pose on the player, then the
+-- clone's bones. Clearing the eye positions fails every first-person gate
+-- (head hide, FBT, pose, bone scaler/hider) for this one setup, the same way
+-- spectator and RT views see us. The DrawModel is what runs PrePlayerDraw
+-- (renderPos + IK + face flexes), so it stays but writes nothing.
+-- ShouldDrawLocalPlayer is cached per view setup: with viewmodels (and so
+-- hands-only, where nothing else draws the body) it is false here and
+-- DrawModel silently skips, leaving the plain anim pose at the real origin.
+-- An empty cam push re-queries it, as cl_vrmod's body draw does; skipped
+-- when player draw is already on (worldmodels).
+local function Snapshot(ply)
+	local tr = g_VR.tracking.hmd
+	local ad = math_AngleDifference(tr.ang.yaw, mirrorYaw)
+	if ad > 45 or ad < -45 then
+		mirrorYaw = mirrorYaw + (ad > 0 and 45 or -45)
+		local r = math_rad(mirrorYaw)
+		fx, fy = math_cos(r), math_sin(r)
+		menuAng.y = mirrorYaw - 90
+	end
+	local hp = tr.pos
+	local px, py = hp.x + fx * MIRROR_DIST, hp.y + fy * MIRROR_DIST
+	menuPos:SetUnpacked(px - fy * 15, py + fx * 15, g_VR.origin.z + 75)
 
-	-- Reflected camera render + mirror quad draw
-	hook.Add("PostDrawOpaqueRenderables", "vrmod_heightmirror_draw", function(depth, skybox)
-		if depth or skybox then return end
-		if not g_VR or not g_VR.active then return end
-		if g_VR.specCamRendering then return end
+	-- x' = x - 2(n.x - d)n : linear I - 2nn^T, translation 2dn
+	local d2, xy = 2 * (fx * px + fy * py), -2 * fx * fy
+	reflect:SetUnpacked(
+		1 - 2 * fx * fx, xy, 0, d2 * fx,
+		xy, 1 - 2 * fy * fy, 0, d2 * fy,
+		0, 0, 1, 0,
+		0, 0, 0, 1)
 
-		-- Mirror plane position
-		local mirrorFwd = Angle(0, mirrorYaw, 0):Forward()
-		local mirrorPos = Vector(g_VR.tracking.hmd.pos.x, g_VR.tracking.hmd.pos.y, g_VR.origin.z)
-		mirrorPos:Add(mirrorFwd * MIRROR_DIST)
-		local mirrorCenter = mirrorPos + Vector(0, 0, MIRROR_H * 0.5)
+	local allow, ro, el, er = g_VR.allowPlayerDraw, ply.RenderOverride, g_VR.eyePosLeft, g_VR.eyePosRight
+	g_VR.allowPlayerDraw, ply.RenderOverride, g_VR.eyePosLeft, g_VR.eyePosRight = true, nil, nil, nil
+	if not allow then cam_Start3D() cam_End3D() end
+	render_OverrideColorWriteEnable(true, false)
+	render_OverrideDepthEnable(true, false)
+	render_SuppressEngineLighting(true)
+	ply:DrawModel()
+	render_SuppressEngineLighting(false)
+	render_OverrideDepthEnable(false, false)
+	render_OverrideColorWriteEnable(false, false)
+	g_VR.allowPlayerDraw, ply.RenderOverride, g_VR.eyePosLeft, g_VR.eyePosRight = allow, ro, el, er
+	if not allow then cam_Start3D() cam_End3D() end
 
-		-- Reflect eye position across mirror plane (vertical mirror, only flip horizontal)
-		local eyePos = EyePos()
-		local normX, normY = -mirrorFwd.x, -mirrorFwd.y
-		local d = (eyePos.x - mirrorPos.x) * normX + (eyePos.y - mirrorPos.y) * normY
-		local camPos = Vector(eyePos.x - 2 * d * normX, eyePos.y - 2 * d * normY, eyePos.z)
+	for i = 0, flexN - 1 do SetFlexWeight(clone, i, GetFlexWeight(ply, i)) end
+	-- Render origin only drives lighting; the bones carry the pose
+	local p = ply:GetPos()
+	local s = 2 * (fx * p.x + fy * p.y) - d2
+	clonePos:SetUnpacked(p.x - s * fx, p.y - s * fy, p.z)
+	clone:SetPos(clonePos)
+	clone:SetupBones()
+end
 
-		-- Reflect view angles: look from reflected position toward mirror center
-		local camAng = (mirrorCenter - camPos):Angle()
+local function DrawMirror(depth, skybox)
+	if depth or skybox or not g_VR.active then return end
+	local ply = LocalPlayer()
+	if not ply:Alive() then return end
+	local fn = FrameNumber()
+	if fn ~= snapFrame then
+		snapFrame = fn
+		if not IsValid(clone) or clone:GetModel() ~= ply:GetModel() then BuildClone(ply) end
+		if clone then Snapshot(ply) end
+	end
+	if not clone then return end
+	render_CullMode(MATERIAL_CULLMODE_CW)
+	clone:DrawModel()
+	render_CullMode(MATERIAL_CULLMODE_CCW)
+end
 
-		-- Set up reflected camera — negative aspect provides the mirror horizontal flip
-		-- FOV computed from camera distance so mirror content is properly framed
-		local dist = camPos:Distance(mirrorCenter)
-		local mirrorFov = math_deg(2 * math_atan(MIRROR_W * 0.5 / dist))
-		cam.Start({
-			x = 0, y = 0, w = RT_W, h = RT_H,
-			type = "3D",
-			fov = mirrorFov,
-			aspect = -(RT_W / RT_H),
-			origin = camPos,
-			angles = camAng,
-		})
-
-		render.PushRenderTarget(rt_mirror)
-		render.Clear(140, 160, 180, 255, true, true)
-		render.CullMode(MATERIAL_CULLMODE_CW)
-
-		-- Guard: prevent other hooks from doing bone work in nested render
-		g_VR.specCamRendering = true
-
-		-- Draw player model in mirror
-		local prevAllow = g_VR.allowPlayerDraw
-		g_VR.allowPlayerDraw = true
-		local ogRO = ply.RenderOverride
-		ply.RenderOverride = nil
-
-		-- Temporarily clear VR eye positions so the character system's head-hide
-		-- check (ep == g_VR.eyePosLeft or ep == g_VR.eyePosRight) fails,
-		-- keeping the head bone visible in the mirror
-		local savedL, savedR = g_VR.eyePosLeft, g_VR.eyePosRight
-		g_VR.eyePosLeft, g_VR.eyePosRight = nil, nil
-
-		ply:DrawModel()
-
-		g_VR.eyePosLeft, g_VR.eyePosRight = savedL, savedR
-
-		ply.RenderOverride = ogRO
-		g_VR.allowPlayerDraw = prevAllow
-
-		g_VR.specCamRendering = false
-		render.CullMode(MATERIAL_CULLMODE_CCW)
-		render.PopRenderTarget()
-		cam.End3D()
-
-		-- Draw mirror quad
-		render.SetMaterial(mat_mirror)
-		render.DrawQuadEasy(mirrorCenter, -mirrorFwd, MIRROR_W, MIRROR_H, color_white, 0)
-	end)
+local function CloseMirror()
+	hook.Remove("PostDrawOpaqueRenderables", "vrmod_heightmirror_draw")
+	hook.Remove("VRMod_Input", "vrmod_heightmenu_input")
+	if IsValid(clone) then clone:Remove() end
+	clone, owner = nil, nil
 end
 
 function VRUtilOpenHeightMenu()
 	if not g_VR.threePoints or VRUtilIsMenuOpen("heightmenu") then return end
-	SetupMirror()
-	VRUtilMenuOpen("heightmenu", 300, 512, nil, nil, Vector(), Angle(), 0.1, true, function()
-		hook.Remove("Think", "vrmod_heightmirror_update")
-		hook.Remove("PostDrawOpaqueRenderables", "vrmod_heightmirror_draw")
-		hook.Remove("VRMod_Input", "vrmod_heightmenu_input")
-	end)
+	VRUtilMenuOpen("heightmenu", 300, 512, nil, nil, menuPos, menuAng, 0.1, true, CloseMirror)
+	hook.Add("PostDrawOpaqueRenderables", "vrmod_heightmirror_draw", DrawMirror)
 
 	local buttons, renderControls
 	buttons = {

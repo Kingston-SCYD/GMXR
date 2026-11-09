@@ -1,6 +1,56 @@
 if SERVER then return end
-g_VR.menuBackup = g_VR.menuBackup or {}
+-- 6 x 4 grid per page. Registrations (vrmod.AddInGameMenuItem, cl_api) are a
+-- persistent name-keyed list; slot/slotPos are only a preference, resolved
+-- here on every open, so nothing a registrant does can wipe or cover another.
+local COLS, ROWS = 6, 4
+local PER = COLS * ROWS
+local BW, BH, PX, PY, TOP = 82, 53, 86, 57, 230 -- button size, pitch, grid top
+local TAB_Y = TOP - PY -- page tabs: one row above the grid
+local floor, min, max, sort = math.floor, math.min, math.max, table.sort
+local COL_IDLE, COL_HOVER, COL_TEXT = Color(0, 0, 0, 128), Color(0, 0, 0, 200), Color(255, 255, 255, 255)
 local open = false
+
+local function ByPriority(a, b)
+	if a.f ~= b.f then return a.f end -- built-ins (forceSlot) place first
+	if a.want ~= b.want then return a.want < b.want end
+	return a.o < b.o
+end
+
+-- Each item takes its requested cell or the next free one in reading order
+-- (right, then down, then on to the next page). slotPos past the last row
+-- carries onto later pages: row 4 = page 2 row 0. Empty pages are dropped.
+local function Layout()
+	local src, list = g_VR.menuItems or {}, {}
+	for i = 1, #src do
+		local it = src[i]
+		local pos = max(floor(it.slotPos or 0), 0)
+		list[i] = {
+			it = it, f = it.forced == true, o = it.order or 0,
+			want = floor(pos / ROWS) * PER + (pos % ROWS) * COLS + min(max(floor(it.slot or 0), 0), COLS - 1),
+		}
+	end
+	sort(list, ByPriority)
+	local cells, used = {}, {}
+	for i = 1, #list do
+		local c = list[i].want
+		while cells[c] do c = c + 1 end
+		cells[c] = list[i].it
+		used[floor(c / PER)] = true
+	end
+	local pages = {}
+	for p in pairs(used) do pages[#pages + 1] = p end
+	sort(pages)
+	return cells, pages
+end
+
+local function DrawLabel(text, x, y)
+	local lines = string.Explode(" ", tostring(text or ""), false)
+	local n = #lines
+	for j = 1, n do
+		draw.SimpleText(lines[j], "HudSelectionText", x + BW / 2, y + BH / 2 - (n * 6 - 6 - (j - 1) * 12), COL_TEXT, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+	end
+end
+
 function g_VR.MenuOpen()
 	if hook.Call("VRMod_OpenQuickMenu") == false then return end
 	if open then
@@ -11,46 +61,17 @@ function g_VR.MenuOpen()
 	end
 
 	open = true
-	--
-	local items = {}
-	for k, v in pairs(g_VR.menuItems) do
-		local slot, slotPos = v.slot, v.slotPos
-		local index = #items + 1
-		for i = 1, #items do
-			if items[i].slot > slot or items[i].slot == slot and items[i].slotPos > slotPos then
-				index = i
-				break
-			end
-		end
+	local cells, pages = Layout()
+	local nTabs = min(#pages, COLS)
+	local page, hovered, tab = 1, nil, -1
+	local dPage, dHover, dTab = -1, false, -2 -- force the first draw
 
-		table.insert(items, index, {
-			index = k,
-			slot = slot,
-			slotPos = slotPos
-		})
-	end
-
-	local currentSlot, actualSlotPos = 0, 0
-	for i = 1, #items do
-		if items[i].slot ~= currentSlot then
-			actualSlotPos = 0
-			currentSlot = items[i].slot
-		end
-
-		items[i].actualSlotPos = actualSlotPos
-		actualSlotPos = actualSlotPos + 1
-	end
-
-	--
-	local prevHoveredItem = -2
 	VRUtilMenuOpen("miscmenu", 512, 512, nil, true, Vector(4, 3, 9.5), Angle(0, -90, 60), 0.03, true, function()
 		hook.Remove("PreRender", "vrutil_hook_renderigm")
 		open = false
-		local sel = items[prevHoveredItem]
-		local item = sel and g_VR.menuItems[sel.index]
 		-- isfunction: items may carry nil funcs. g_VR.active: close-all during
 		-- VR exit must not fire the hovered action.
-		if item and isfunction(item.func) and g_VR.active then item.func() end
+		if hovered and isfunction(hovered.func) and g_VR.active then hovered.func() end
 	end)
 
 	hook.Add("PreRender", "vrutil_hook_renderigm", function()
@@ -59,41 +80,43 @@ function g_VR.MenuOpen()
 			return
 		end
 
-		hoveredItem = -1
-		local hoveredSlot, hoveredSlotPos = -1, -1
-		if g_VR.menuFocus == "miscmenu" then hoveredSlot, hoveredSlotPos = math.floor(g_VR.menuCursorX / 86), math.floor((g_VR.menuCursorY - 230) / 57) end
-		for i = 1, #items do
-			if items[i].slot == hoveredSlot and items[i].actualSlotPos == hoveredSlotPos then
-				hoveredItem = i
-				break
+		hovered, tab = nil, -1
+		if g_VR.menuFocus == "miscmenu" then
+			local x, y = g_VR.menuCursorX, g_VR.menuCursorY
+			local col = floor(x / PX)
+			if col >= 0 and col < COLS then
+				if y >= TOP then
+					local row = floor((y - TOP) / PY)
+					if row < ROWS and pages[page] then hovered = cells[pages[page] * PER + row * COLS + col] end
+				elseif nTabs > 1 and y >= TAB_Y and col < nTabs then
+					-- Hover selects: the quick menu fires on release, so there
+					-- is no click to page with. The page sticks after leaving.
+					tab, page = col, col + 1
+				end
 			end
 		end
 
-		local changes = hoveredItem ~= prevHoveredItem
-		prevHoveredItem = hoveredItem
-		if not changes then return end
+		if page == dPage and hovered == dHover and tab == dTab then return end
+		dPage, dHover, dTab = page, hovered, tab
 		VRUtilMenuRenderStart("miscmenu")
-		-- buttons
-		local buttonWidth, buttonHeight = 82, 53
-		local gap = (512 - buttonWidth * 6) / 5
-		for i = 1, #items do
-			local x, y = items[i].slot, items[i].actualSlotPos
-			draw.RoundedBox(8, x * (buttonWidth + gap), 230 + y * (buttonHeight + gap), buttonWidth, buttonHeight, Color(0, 0, 0, hoveredItem == i and 200 or 128))
-			local item = g_VR.menuItems[items[i].index]
-			local label
-			if hoveredItem == i and item.hint then
-				label = item.hint
-			else
-				label = item.name
-			end
-
-			label = tostring(label or "")
-			local explosion = string.Explode(" ", label, false)
-			for j = 1, #explosion do
-				draw.SimpleText(explosion[j], "HudSelectionText", buttonWidth / 2 + x * (buttonWidth + gap), 230 + buttonHeight / 2 + y * (buttonHeight + gap) - (#explosion * 6 - 6 - (j - 1) * 12), Color(255, 255, 255, 255), TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+		if nTabs > 1 then
+			for t = 1, nTabs do
+				local x = (t - 1) * PX
+				draw.RoundedBox(8, x, TAB_Y, BW, BH, t == page and COL_HOVER or COL_IDLE)
+				DrawLabel("Page " .. t, x, TAB_Y)
 			end
 		end
-
+		local base = pages[page] and pages[page] * PER
+		if base then
+			for c = 0, PER - 1 do
+				local it = cells[base + c]
+				if it then
+					local x, y = (c % COLS) * PX, TOP + floor(c / COLS) * PY
+					draw.RoundedBox(8, x, y, BW, BH, it == hovered and COL_HOVER or COL_IDLE)
+					DrawLabel(it == hovered and it.hint or it.name, x, y)
+				end
+			end
+		end
 		VRUtilMenuRenderEnd()
 	end)
 end
@@ -101,47 +124,3 @@ end
 function g_VR.MenuClose()
 	VRUtilMenuClose("miscmenu")
 end
-
-local function AddMenuItemInternal(name, slot, slotpos, func, forceSlot, hint)
-	g_VR.menuItems = g_VR.menuItems or {}
-	-- Avoid duplicates
-	for _, item in ipairs(g_VR.menuItems) do
-		if item.name == name and item.func == func then return end
-	end
-
-	table.insert(g_VR.menuItems, {
-		name = name,
-		slot = slot,
-		slotPos = slotpos,
-		func = func, -- always string or nil
-		internal = forceSlot == true,
-		hint = hint, -- track forced slot
-	})
-end
-
--- Restore missing items safely
-local restoreCooldown = 1 -- seconds
-local lastRestore = 0
-hook.Add("Think", "SafeRestoreVRMenuItems", function()
-	if CurTime() - lastRestore < restoreCooldown then return end
-	lastRestore = CurTime()
-	for id, data in pairs(g_VR.menuBackup) do
-		local exists = false
-		for _, item in ipairs(g_VR.menuItems) do
-			if item.name == data.name and item.func == data.func then
-				exists = true
-				break
-			end
-		end
-
-		if not exists then
-			-- revive both forced slot and hint safely
-			AddMenuItemInternal(data.name, data.slot, data.slotPos, data.func, data.internal, data.hint)
-		end
-	end
-end)
-
-hook.Add("VRMod_Exit", "PurgeMenuBackup", function()
-	g_VR = g_VR or {}
-	g_VR.menuBackup = {}
-end)

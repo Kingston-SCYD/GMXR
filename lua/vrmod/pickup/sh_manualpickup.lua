@@ -120,14 +120,9 @@ local isDuplicate = ply:HasWeapon(wepClass)
          end
      end
 
+local picked = false
 
 if isDuplicate then
-    local ammoType = ent:GetPrimaryAmmoType()
-    if ammoType < 0 then
-        local p = ent.Primary
-        ammoType = p and p.Ammo and game.GetAmmoID(p.Ammo) or -1
-    end
-
     if avrState then
         -- Restore stasis directly to the existing weapon's ArcVR fields.
         -- Do NOT GiveAmmo — that adds to reserve on top of existing rounds,
@@ -139,26 +134,46 @@ if isDuplicate then
             existingWep.Magazine     = avrState.Magazine
             if existingWep.SendWeapon then existingWep:SendWeapon(true, true) end
         end
-    elseif ammoType >= 0 then
-        -- Clip1() is -1 on a weapon entity that was never deployed -- spawnmenu
-        -- dupes and ents.Create both -- so the old `clip > 0` test silently gave
-        -- nothing on the two paths that actually matter. Fall back to whatever
-        -- the SWEP declares it ships with.
+    -- The engine's own ammo-only pickup (what touching a duplicate does on
+    -- desktop): clip or not -- RPG, grenades and SLAM keep theirs off-clip,
+    -- which Clip1() never saw -- secondary ammo, the ammo caps and the pickup
+    -- notice. It bypasses PlayerCanPickupWeapon, and removes the weapon once
+    -- it has taken anything.
+    elseif not ply:PickupWeapon(ent, true) then
+        -- Took nothing: a SWEP never deployed (spawnmenu, ents.Create) still
+        -- has Clip1() -1, so fall back to what it declares it ships with.
+        local ammoType = ent:GetPrimaryAmmoType()
+        if ammoType < 0 then
+            local p = ent.Primary
+            ammoType = p and p.Ammo and game.GetAmmoID(p.Ammo) or -1
+        end
         local clip = ent:Clip1()
         if clip < 0 then
             local p = ent.Primary
             clip = p and (p.DefaultClip or p.ClipSize) or ent:GetMaxClip1()
         end
-        if clip and clip > 0 then ply:GiveAmmo(clip, ammoType, true) end
+        if ammoType >= 0 and clip and clip > 0 then ply:GiveAmmo(clip, ammoType, true) end
     end
 
     ply:SelectWeapon(wepClass)
 	else
-		ply:Give(wepClass, true)
+		-- The engine's own pickup, as walking over it does on desktop: you get
+		-- THIS weapon with what's in it, so an NPC's dropped gun keeps its clip.
+		-- Give(class, noAmmo) handed over an empty copy and threw the loaded
+		-- one away. A replacement class (ArcVR swap) is a different weapon and
+		-- is still given, as is anything the engine refuses (not visible from
+		-- your eyes, say) -- with the floor gun's clip carried across.
+		if not replacement and ply:PickupWeapon(ent) then
+			picked = true
+		else
+			local w = ply:Give(wepClass, true)
+			local c = replacement and -1 or ent:Clip1()
+			if c > 0 and IsValid(w) then w:SetClip1(c) end
+		end
 		timer.Simple(0, function() if IsValid(ply) then ply:SelectWeapon(wepClass) end end)
 	end
 
-	ent:Remove()
+	if not picked and IsValid(ent) then ent:Remove() end
 
 	-- ── ArcticVR ammo stasis restore ─────────────────────────────────────────
 	if SERVER and not isDuplicate then
@@ -210,6 +225,9 @@ if isDuplicate then
 		end)
 	end
 	-- ─────────────────────────────────────────────────────────────────────────
+	-- Handled: stop the physics grab. It used to carry on and put a weapon
+	-- that was being removed (or is now in your inventory) in your hand.
+	return false
 end)
 
 -- ── Manual item consumption (ammo, health, armor) ────────────────────────

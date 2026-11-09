@@ -3,7 +3,8 @@
 
     Muzzle Angles  : per-weapon P/Y/R muzzle correction + laser
     Grip Position  : freeze-and-regrab grip offset
-    Animations     : per-weapon viewmodel animation disabler
+    Animations     : per-weapon viewmodel animation disabler + right hand follow
+    Hand Pose      : fallback grip per weapon, and for every worldmodel
     World Models   : force world model rendering per weapon
     Attack Block   : strip IN_ATTACK for motion-controlled melees
     Presets        : import/export the whole config, shareable via Workshop
@@ -330,7 +331,18 @@ local function GetHandPose()
     if p then return p.pos, p.ang end
 end
 
-local function GetVMI() return g_VR and g_VR.currentvmi end
+-- The grip state (gripCurrent / the freeze) belongs to lastGripClass. sh_network
+-- swaps g_VR.currentvmi in its net receiver and ActiveClass() flips on its own
+-- schedule, so for a frame either can be the new weapon while the other is still
+-- the old one. Writing then put the old gun's offset into the NEW gun's vmi,
+-- which lives in g_VR.viewModelInfo for the rest of the session. Only hand out
+-- the vmi when it really is lastGripClass's.
+local lastGripClass = ""
+
+local function GetVMI()
+    local vmi = g_VR and g_VR.currentvmi
+    if vmi and g_VR.viewModelInfo and g_VR.viewModelInfo[lastGripClass] == vmi then return vmi end
+end
 
 hook.Add("Think", "vrmod_gripoffset_apply", function()
     if not g_VR or not g_VR.active then return end
@@ -378,8 +390,6 @@ hook.Add("VRMod_AllowDefaultAction", "vrmod_gripoffset_blockdefault", function(a
     if not gripRepos and not vrmod_gripfix.suppressDrop then return end
     if action == "boolean_left_pickup" or action == "boolean_right_pickup" then return false end
 end)
-
-local lastGripClass = ""
 
 hook.Add("Think", "vrmod_gripoffset_wepchange", function()
     local class = ActiveClass() or ""
@@ -463,13 +473,105 @@ end
 local function AnimSave() file.Write(ANIM_FILE, util.TableToJSON(animDisabled)) end
 AnimLoad()
 
+-- The viewmodel entity is shared by every weapon, so a frozen playback rate
+-- outlives the switch (it froze every gun until respawn). Freeze only while a
+-- disabled class is out and hand the rate back the moment it isn't. Pinning
+-- the idle sequence (not just cycle 0 of whatever the engine just sent) keeps
+-- one steady pose instead of snapping to frame 0 of each fire/deploy anim.
+local frozenVM
+local idleSeq = {}
+
 hook.Add("PreDrawViewModel", "vrmod_weaponfix_animdisable", function(vm, _, wep)
-    if not next(animDisabled) then return end
-    if not IsValid(vm) or not IsValid(wep) then return end
-    if not animDisabled[wep:GetClass()] then return end
-    vm:SetCycle(0)
-    vm:SetPlaybackRate(0)
+    if not frozenVM and not next(animDisabled) then return end
+    if not IsValid(vm) then return end
+    -- VR only: on desktop the weapon animates normally.
+    if g_VR.active and IsValid(wep) and animDisabled[wep:GetClass()] then
+        local mdl = vm:GetModel()
+        local s = idleSeq[mdl]
+        if not s then
+            s = vm:SelectWeightedSequence(ACT_VM_IDLE)
+            if s < 0 then s = math.max(vm:LookupSequence("idle"), 0) end
+            idleSeq[mdl] = s
+        end
+        if vm:GetSequence() ~= s then vm:SetSequence(s) end
+        vm:SetCycle(0)
+        vm:SetPlaybackRate(0)
+        frozenVM = vm
+    elseif frozenVM then
+        if IsValid(frozenVM) then frozenVM:SetPlaybackRate(1) end
+        frozenVM = nil
+    end
 end)
+
+-- ============================================================================
+-- FALLBACK HAND POSE
+-- Weapons whose viewmodel hand rig mangles the VR hand get a generic grip:
+-- fingers curled, index out at rest and following the trigger finger.
+-- Worldmodels always do: they have no hand rig to read a pose from, and
+-- sh_network hands them a flat open hand.
+-- sh_network rewrites the finger tables on every weapon switch (each set
+-- makes a new table), so an identity compare per tracking frame re-applies
+-- after it without hooking its net receiver.
+-- ============================================================================
+
+local HAND_FILE    = "vrmod_handpose_fallback.json"
+local handFallback = util.JSONToTable(file.Read(HAND_FILE, "DATA") or "") or {}
+local function HandSave() file.Write(HAND_FILE, util.TableToJSON(handFallback)) end
+vrmod_gripfix.handFallback = handFallback -- read by manual reload's support hand (edited in place, never replaced)
+local handApplied
+
+-- Curl per finger, 0 = VRMod's default open hand, 1 = its default fist. The
+-- index has two: at rest (open) and with the trigger pulled (closed), since the
+-- hand lerps open->closed on the trigger finger.
+local CURL_DEF = { 1, 0, 1, 1, 1, 1 }
+local CURL_NAME = { "Thumb", "Index (rest)", "Index (trigger pulled)", "Middle", "Ring", "Pinky" }
+local cv_curl = CreateClientConVar("vrmod_handpose_curl", "1 0 1 1 1 1", true, false,
+    "Fallback hand pose curl 0-1: thumb, index rest, index pulled, middle, ring, pinky")
+local curl = {}
+local function CurlParse()
+    local t = string.Explode(" ", cv_curl:GetString())
+    for i = 1, 6 do curl[i] = math.Clamp(tonumber(t[i]) or CURL_DEF[i], 0, 1) end
+end
+CurlParse()
+
+local function HandApply(force)
+    if not g_VR.active or not vrmod.SetRightHandClosedFingerAngles then return end
+    local class = ActiveClass()
+    if class and (g_VR.wmActive or handFallback[class]) then
+        if not force and g_VR.closedHandAngles == handApplied then return end
+        local c, o = vrmod.GetDefaultRightHandClosedFingerAngles(), vrmod.GetDefaultRightHandOpenFingerAngles()
+        local open, closed = {}, {}
+        for i = 1, 15 do
+            -- 3 joints per finger: thumb 1-3, index 4-6, middle 7-9, ring 10-12, pinky 13-15
+            local f = math.floor((i - 1) / 3) + 1
+            local ko, kc
+            if f == 2 then ko, kc = curl[2], curl[3] else ko = curl[f == 1 and 1 or f + 1] kc = ko end
+            open[i] = LerpAngle(ko, o[i], c[i])
+            closed[i] = LerpAngle(kc, o[i], c[i])
+        end
+        vrmod.SetRightHandOpenFingerAngles(open)
+        vrmod.SetRightHandClosedFingerAngles(closed)
+        handApplied = g_VR.closedHandAngles
+    elseif force and handApplied then
+        -- Toggled off while held: back to what sh_network would have set.
+        -- (Never a worldmodel here: those always take the branch above.)
+        local t = g_VR.currentvmi and g_VR.currentvmi.closedHandAngles
+        if t then
+            vrmod.SetRightHandOpenFingerAngles(t)
+            vrmod.SetRightHandClosedFingerAngles(t)
+        end
+        handApplied = nil
+    end
+end
+
+hook.Add("VRMod_Tracking", "vrmod_weaponfix_handpose", function()
+    if g_VR.wmActive or next(handFallback) then HandApply(false) end
+end)
+
+cvars.AddChangeCallback("vrmod_handpose_curl", function()
+    CurlParse()
+    HandApply(true) -- live on the held weapon if it uses the fallback
+end, "vrmod_weaponfix")
 
 -- ============================================================================
 -- PER-WEAPON WORLD MODELS
@@ -493,8 +595,8 @@ local function WMSave() file.Write(WM_FILE, util.TableToJSON(g_VR.wmWeapons, tru
 WMLoad()
 
 -- Apply the WM/VM switch for the current weapon immediately instead of waiting
--- for a weapon-switch net message. Switching TO viewmodel mode may leave finger
--- angles zeroed until the next full weapon swap.
+-- for a weapon-switch net message. Switching TO viewmodel mode may leave the
+-- fallback finger pose on until the next full weapon swap.
 local function WMApplyNow()
     if not g_VR.active then return end
     local ply = LocalPlayer()
@@ -506,15 +608,12 @@ local function WMApplyNow()
         wep:SetNoDraw(false) -- see sh_network: nothing else un-hides it
         g_VR.viewModel  = wep
         g_VR.currentvmi = nil
-        if g_VR.zeroHandAngles then
-            vrmod.SetRightHandOpenFingerAngles(g_VR.zeroHandAngles)
-            vrmod.SetRightHandClosedFingerAngles(g_VR.zeroHandAngles)
-        end
     else
         g_VR.wmActive = false
         local viewModel = ply:GetViewModel()
         if IsValid(viewModel) then g_VR.viewModel = viewModel end
     end
+    HandApply(true)
 end
 
 -- Force a weapon CLASS to always render as a worldmodel (never a viewmodel),
@@ -602,13 +701,14 @@ local function PresetCollect(name)
         anim     = KeyList(animDisabled),
         wm       = KeyList(g_VR.wmWeapons),
         atk      = KeyList(atkDisabled),
+        hand     = KeyList(handFallback),
     }
 end
 
 local function PresetCount(p)
     return table_Count(p.muzzle or EMPTY) + table_Count(p.muzzlewm or EMPTY)
          + table_Count(p.grip or EMPTY)   + table_Count(p.gripleft or EMPTY)
-         + #(p.anim or EMPTY) + #(p.wm or EMPTY) + #(p.atk or EMPTY)
+         + #(p.anim or EMPTY) + #(p.wm or EMPTY) + #(p.atk or EMPTY) + #(p.hand or EMPTY)
 end
 
 local function PresetApply(p, overwrite)
@@ -628,14 +728,14 @@ local function PresetApply(p, overwrite)
     n = n + GripUnpack(p.grip, gripSaved, overwrite)
           + GripUnpack(p.gripleft, gripSavedLH, overwrite)
 
-    for _, pair in ipairs({ { p.anim, animDisabled }, { p.wm, g_VR.wmWeapons }, { p.atk, atkDisabled } }) do
+    for _, pair in ipairs({ { p.anim, animDisabled }, { p.wm, g_VR.wmWeapons }, { p.atk, atkDisabled }, { p.hand, handFallback } }) do
         local dst = pair[2]
         for _, class in ipairs(pair[1] or EMPTY) do
             if not dst[class] then dst[class] = true n = n + 1 end
         end
     end
 
-    MuzzleSave() GripSaveFile() AnimSave() WMSave() AtkSave()
+    MuzzleSave() GripSaveFile() AnimSave() WMSave() AtkSave() HandSave()
     WMApplyNow()
     lastGripClass = "" -- forces the held weapon's grip offset to re-apply
 
@@ -981,10 +1081,11 @@ local function BuildTogglePanel(root, cfg)
         wepLbl:SetText("Weapon: " .. class)
         chk:SetQuiet(cfg.tbl[class])
     end)
+    return form
 end
 
 local function BuildAnimPanel(root)
-    BuildTogglePanel(root, {
+    local form = BuildTogglePanel(root, {
         title     = "Animations",
         help      = "Freezes the viewmodel animation for weapons whose anims fight the VR pose.",
         label     = "Disable animations for this weapon",
@@ -993,6 +1094,41 @@ local function BuildAnimPanel(root)
         tbl       = animDisabled,
         save      = AnimSave,
     })
+    -- Convar lives in manual reload, which does the following.
+    form:CheckBox("Right hand follows the gun's animation", "vrmod_rhfollow")
+    form:ControlHelp("All viewmodel weapons: the hand rides the model's hand through fire, reload and sway anims. Weapons frozen above stay still.")
+end
+
+local function BuildHandPanel(root)
+    BuildTogglePanel(root, {
+        title     = "Hand Pose",
+        help      = "Replaces the hand pose read from the viewmodel with a generic grip (fingers curled, index on the trigger). Use when a weapon mangles the VR hand. Worldmodels always use it.",
+        label     = "Use fallback hand pose for this weapon",
+        clear     = "Clear All",
+        listTitle = "Using Fallback Pose",
+        tbl       = handFallback,
+        save      = HandSave,
+        onChange  = function() HandApply(true) end,
+    })
+
+    local form = MakeForm(root, "Fallback Finger Curl")
+    form:ControlHelp("0 = open, 1 = fist. Applies live to a held weapon that uses the fallback (any worldmodel included). The support hand copies it on its next grab.")
+    local sliders = {}
+    local function Write()
+        local t = {}
+        for i = 1, 6 do t[i] = string_format("%.2f", sliders[i]:GetValue()) end
+        cv_curl:SetString(table.concat(t, " "))
+    end
+    for i = 1, 6 do
+        local sl = form:NumSlider(CURL_NAME[i], nil, 0, 1, 2)
+        sl:SetValue(curl[i])
+        sl.OnValueChanged = Write
+        sliders[i] = sl
+    end
+    form:Button("Reset Curl").DoClick = function()
+        for i = 1, 6 do sliders[i]:SetValue(CURL_DEF[i]) end
+        Write()
+    end
 end
 
 local function BuildWorldModelPanel(root)
@@ -1096,12 +1232,29 @@ local TABS = {
     { "Muzzle Angles", BuildMuzzlePanel,     "icon16/bullet_go.png" },
     { "Grip Position", BuildGripPanel,       "icon16/wrench.png" },
     { "Animations",    BuildAnimPanel,       "icon16/film.png" },
+    { "Hand Pose",     BuildHandPanel,       "icon16/user.png" },
     { "World Models",  BuildWorldModelPanel, "icon16/box.png" },
     { "Attack Block",  BuildAtkBlockPanel,   "icon16/cancel.png" },
     { "Presets",       BuildPresetPanel,     "icon16/package.png" },
 }
 
 local mainFrame
+
+-- Other modules append { name, builder(scroll), icon } via
+-- hook.Add("VRMod_WeaponFix_Tabs", id, function(tabs) ... end).
+local function BuildSheet(parent)
+    local sheet = vgui_Create("DPropertySheet", parent)
+    sheet:Dock(FILL)
+    local tabs = { unpack(TABS) }
+    hook.Run("VRMod_WeaponFix_Tabs", tabs)
+    for i = 1, #tabs do
+        local tab = tabs[i]
+        local scroll = vgui_Create("DScrollPanel", sheet)
+        tab[2](scroll)
+        sheet:AddSheet(tab[1], scroll, tab[3])
+    end
+    return sheet
+end
 
 local function OpenWeaponFixMenu()
     if IsValid(mainFrame) then mainFrame:Center() mainFrame:MakePopup() return end
@@ -1115,15 +1268,7 @@ local function OpenWeaponFixMenu()
     frame:Center()
     frame:MakePopup()
     mainFrame = frame
-
-    local sheet = vgui_Create("DPropertySheet", frame)
-    sheet:Dock(FILL)
-
-    for _, tab in ipairs(TABS) do
-        local scroll = vgui_Create("DScrollPanel", sheet)
-        tab[2](scroll)
-        sheet:AddSheet(tab[1], scroll, tab[3])
-    end
+    BuildSheet(frame)
 end
 
 concommand.Add("vrmod_weaponfix_menu", OpenWeaponFixMenu, nil, "Open the VRMod Weapon Fixer")
@@ -1133,55 +1278,30 @@ concommand.Add("vrmod_muzzlefix_menu", OpenWeaponFixMenu, nil, "Alias for vrmod_
 -- Menu integration
 -- ============================================================================
 
-hook.Add("VRMod_Menu", "vrmod_weaponfix_hook", function(frame)
-    local sheet = frame.DPropertySheet
-    if IsValid(sheet) then
-        local panel = vgui_Create("DPanel", sheet)
-        local btn = vgui_Create("DButton", panel)
-        btn:SetText("Open Weapon Fixer")
-        btn:Dock(TOP)
-        btn:DockMargin(8, 8, 8, 0)
-        btn:SetTall(32)
-        btn.DoClick = OpenWeaponFixMenu
-        sheet:AddSheet("Weapon Fixer", panel, "icon16/wrench.png")
-        return
-    end
-
-    local form = frame.SettingsForm
-    if not IsValid(form) then return end
-    form:ControlHelp("=== Weapon Fixer ===")
-    form:Button("Open Weapon Fixer").DoClick = OpenWeaponFixMenu
-end)
-
-local menuItemRegistered = false
-
-local function TryRegisterMenuItem()
-    if menuItemRegistered then return true end
-    if not vrmod or not vrmod.AddInGameMenuItem then return false end
-    if not g_VR.active then return false end
-    vrmod.AddInGameMenuItem("Weapon Fix", 5, 4, OpenWeaponFixMenu)
-    menuItemRegistered = true
-    return true
+-- The whole fixer as a top-level tab of the VRMod menu. Built on its first
+-- paint: the tabs scan for presets and start the weapon watcher, which a menu
+-- opened for anything else shouldn't pay for. cl_settings' Gameplay button
+-- jumps here through frame.WeaponFixTab.
+local function LazyPaint(self)
+    self.Paint = nil
+    BuildSheet(self):SetPadding(1)
 end
 
+hook.Add("VRMod_Menu", "vrmod_weaponfix_hook", function(frame)
+    local top = frame.DPropertySheet
+    if not IsValid(top) then return end
+    local panel = vgui_Create("DPanel", top)
+    panel.Paint = LazyPaint
+    frame.WeaponFixTab = top:AddSheet("Weapon Fixer", panel, "icon16/wrench.png").Tab
+end)
+
+-- The quick menu registry persists and upserts by name, so registering on
+-- every start (respawns included) is all it takes; no flag or poll. No
+-- spawnmenu page: the quick menu and VRMod settings both open the fixer.
 hook.Add("VRMod_Start", "vrmod_weaponfix_menuitem", function(ply)
-    if ply ~= LocalPlayer() then return end
-    menuItemRegistered = false
-    TryRegisterMenuItem()
-end)
-
-timer.Create("vrmod_weaponfix_menuitem_poll", 0.5, 0, function()
-    if TryRegisterMenuItem() then timer.Remove("vrmod_weaponfix_menuitem_poll") end
-end)
-
-hook.Add("PopulateToolMenu", "vrmod_weaponfix_spawnmenu", function()
-    spawnmenu.AddToolCategory("Utilities", "VRMod", "VRMod")
-    spawnmenu.AddToolMenuOption("Utilities", "VRMod", "VRMod_WeaponFix", "Weapon Fix", "", "", function(panel)
-        panel:ClearControls()
-        panel:Help("VRMod Weapon Fixer - muzzle angles, grip offsets, animations, world models and attack blocking.")
-        panel:Button("Open Weapon Fixer").DoClick = OpenWeaponFixMenu
-        panel:Help("Console: vrmod_weaponfix_menu, vrmod_weaponfix_export, vrmod_weaponfix_presets")
-    end)
+    if ply == LocalPlayer() and vrmod and vrmod.AddInGameMenuItem then
+        vrmod.AddInGameMenuItem("Weapon Fix", 2, 3, OpenWeaponFixMenu)
+    end
 end)
 
 -- ============================================================================

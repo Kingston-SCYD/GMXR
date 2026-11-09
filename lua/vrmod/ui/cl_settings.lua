@@ -10,12 +10,12 @@ local CLIENT_CVARS = {
 	-- General
 	"vrmod_laserpointer", "vrmod_useworldmodels", "vrmod_heightmenu", "vrmod_seated",
 	"vrmod_autostart", "vrmod_climbing", "vrmod_doors", "vrmod_flashlight_attachment",
-	"vrmod_flashlight_shadows", "vrmod_flashlight_depth",
-	"vrmod_menu_float", "vrmod_menu_scale", "vrmod_quickmenu_float",
+	"vrmod_menu_float", "vrmod_menu_smooth", "vrmod_menu_scale", "vrmod_quickmenu_float",
 	-- Controls
 	"vrmod_smoothturn", "vrmod_smoothturnrate", "vrmod_snapturnangle", "vrmod_althead", "vrmod_althead_auto",
 	"vrmod_controlleroffset_x", "vrmod_controlleroffset_y", "vrmod_controlleroffset_z",
 	"vrmod_controlleroffset_pitch", "vrmod_controlleroffset_yaw", "vrmod_controlleroffset_roll",
+	"vrmod_stick_deadzone_left", "vrmod_stick_deadzone_right",
 	-- Rendering
 	"vrmod_desktopview", "vrmod_postprocess", "vrmod_skybox", "vrmod_znear", "vrmod_eyescale",
 	"vrmod_perfoverrides",
@@ -23,11 +23,27 @@ local CLIENT_CVARS = {
 	"vrmod_perf_no_bloom", "vrmod_perf_no_fancyblend", "vrmod_perf_no_lightwarp",
 	"vrmod_perf_no_pspatch", "vrmod_perf_no_motionblur", "vrmod_perf_reduce_particles",
 	"vrmod_perf_no_rtt_shadows", "vrmod_perf_threaded_particles", "vrmod_perf_queued_ropes",
+	-- Desktop Rendering
+	"vrmod_cheaprender", "vrmod_specfov", "vrmod_specfov_mode", "vrmod_specfov_smooth_ang",
+	"vrmod_specfov_hidehead", "vrmod_specfov_showhud", "vrmod_specfov_shaders", "vrmod_specfov_showsprite",
+	"vrmod_specfov_eyepos", "vrmod_speccam_blend", "vrmod_specfov_rate", "vrmod_specfov_scale",
+	"vrmod_specfov_tp_x", "vrmod_specfov_tp_y", "vrmod_specfov_tp_z",
+	"vrmod_specfov_tp_ang_p", "vrmod_specfov_tp_ang_y", "vrmod_specfov_tp_ang_r",
+	"vrmod_specfov_tp_faceply", "vrmod_specfov_tp_usepitch", "vrmod_specfov_tp_useyaw", "vrmod_specfov_tp_useroll",
+	"vrmod_specfov_bodycam_x", "vrmod_specfov_bodycam_y", "vrmod_specfov_bodycam_z",
+	"vrmod_specfov_bone_name", "vrmod_specfov_bone_rotmode", "vrmod_specfov_bone_flip",
+	"vrmod_specfov_bone_x", "vrmod_specfov_bone_y", "vrmod_specfov_bone_z",
+	"vrmod_specfov_bone_ang_p", "vrmod_specfov_bone_ang_y", "vrmod_specfov_bone_ang_r",
+	"vrmod_specfov_vehmode", "vrmod_specfov_chase_dist", "vrmod_specfov_chase_z",
+	"vrmod_specfov_awesome", "vrmod_specfov_awesome_fov", "vrmod_specfov_awesome_sway",
+	"vrmod_specfov_awesome_shake", "vrmod_specfov_awesome_speed", "vrmod_specfov_awesome_speed_foot",
+	"vrmod_specfov_shot_min", "vrmod_specfov_shot_max", "vrmod_specfov_rotate", "vrmod_specfov_rotate_time",
+	"vrmod_specfov_rotate_checklist", "vrmod_specfov_rotate_pool",
 	-- Character
 	"vrmod_floatinghands", "vrmod_floatinghands_chands", "vrmod_floatinghands_stub",
-	"vrmod_characterik", "vrmod_armstretcher", "vrmod_characteryawblend",
+	"vrmod_characterik", "vrmod_armstretcher", "vrmod_characterik_solver", "vrmod_hik_animblend", "vrmod_hik_handblend", "vrmod_yaw_hip_head", "vrmod_yaw_hip_arms", "vrmod_yaw_torso_head", "vrmod_yaw_torso_arms", "vrmod_lean_sens", "vrmod_lean_sens_fwd",
 	"vrmod_fbt_leginfluence", "vrmod_fbt_animshoulders",
-	"vrmod_sitheight", "vrmod_sitheadtohmddist", "vrmod_proneheight", "vrmod_proneheadtohmddist",
+	"vrmod_sitheight", "vrmod_sitheadtohmddist", "vrmod_lieheight",
 	"vrmod_charactereyeheight", "vrmod_characterheadtohmddist", "vrmod_smallhull", "vrmod_hullscale", "vrmod_anticlip", "vrmod_scale",
 	-- HUD
 	"vrmod_hud", "vrmod_hudmode", "vrmod_hudcurve", "vrmod_huddistance", "vrmod_hudscale",
@@ -36,22 +52,24 @@ local CLIENT_CVARS = {
 	"vrmod_hudattach", "vrmod_hudarmscale",
 	"vrmod_hudcrt", "vrmod_hudarm_x", "vrmod_hudarm_y", "vrmod_hudarm_z",
 	"vrmod_hudarm_p", "vrmod_hudarm_yaw", "vrmod_hudarm_r", "vrmod_hudinteract",
-	"vrmod_ui_outline", "vrmod_pointer_hand",
+	"vrmod_ui_outline", "vrmod_pointer_hand", "vrmod_pointer_use",
 	-- Gameplay (client)
-	"vr_pickup_disable_client", "vrmod_collisions", "vrmod_weapondrop_enable", "vrmod_weapondrop_release",
+	"vr_pickup_disable_client", "vrmod_weapondrop_enable", "vrmod_weapondrop_release",
 	"vrmod_manualpickups", "vrmod_interactive_buttons", "vrmod_weapon_swap",
 	"vrmod_pickup_halos", "vrmod_nocrouchjump", "vrmod_allow_teleport_client",
 	"vrmod_teleport_use_left", "vrmod_weaponmenu_style", "vrmod_menu_hand",
 	"vrmod_deathcam_ragdoll", "vrmod_deathcam_ragdoll_view",
+	-- Collisions
+	"vrmod_collisions", "vrmod_collision_round", "vrmod_gunwall_clearance", "vrmod_hull_predict",
 	-- Melee (client)
 	"cl_vrmod_melee", "cl_vrmod_kick", "cl_vrmod_headbutt",
 	-- Vehicles
-	"vrmod_sens_pitch", "vrmod_sens_pitch_smooth", "vrmod_sens_yaw", "vrmod_sens_yaw_smooth",
-	"vrmod_sens_roll", "vrmod_sens_roll_smooth",
-	"vrmod_sens_steer_car", "vrmod_sens_steer_car_smooth", "vrmod_rot_range_car",
-	"vrmod_sens_steer_motorcycle", "vrmod_sens_steer_motorcycle_smooth", "vrmod_rot_range_motorcycle",
+	"vrmod_wheel", "vrmod_wheel_virtual", "vrmod_wheel_show", "vrmod_wheel_radius", "vrmod_wheel_lock",
+	"vrmod_wheel_bar_radius", "vrmod_wheel_bar_lock", "vrmod_wheel_autohands", "vrmod_wheel_animhands",
+	"vrmod_seat_x", "vrmod_seat_y", "vrmod_seat_z",
 	"vrmod_vehicle_gripenter", "vrmod_vehicle_gripamount", "vrmod_vehicle_gripdist",
 	"vrmod_vehicle_sitenter", "vrmod_vehicle_sitexit",
+	"vrmod_vehicle_aimsteer", "vrmod_vehicle_aimsteer_range", "vrmod_vehicle_aimsteer_deadzone",
 	-- Climbing
 	"vrmod_brushclimb", "vrmod_brushclimb_requireboth", "vrmod_brushclimb_nofloor",
 	"vrmod_brushclimb_magnet", "vrmod_brushclimb_magnet_offset", "vrmod_brushclimb_ledgeonly",
@@ -62,7 +80,7 @@ local CLIENT_CVARS = {
 	"vrmod_pouch_enabled", "vrmod_pouch_visiblename", "vrmod_pouch_visiblename_hud",
 	"vrmod_pouch_lefthandwep_enable", "vrmod_holster_showmodels", "vrmod_pouch_chest_z",
 	"vrmod_holster_prop_maxvolume", "vrmod_holster_ragdolls", "vrmod_holster_ragdoll_models",
-	"vrmod_holster_persist",
+	"vrmod_holster_persist", "vrmod_holster_follow_body",
 	"vrmod_holster_model_enabled", "vrmod_holster_model",
 	"vrmod_holster_model_x", "vrmod_holster_model_y", "vrmod_holster_model_z",
 	"vrmod_holster_model_p", "vrmod_holster_model_yaw", "vrmod_holster_model_r",
@@ -74,19 +92,23 @@ local CLIENT_CVARS = {
 local SERVER_CVARS = {
 	"vrmod_allow_teleport", "vrmod_teleport_maxdist",
 	"vrmod_pickup_limit", "vrmod_pickup_npcs", "vrmod_pickup_no_phys",
-	"vrmod_pickup_weight", "vrmod_pickup_range", "vrmod_hand_physics",
+	"vrmod_pickup_weight", "vrmod_pickup_range", "vrmod_hand_physics", "vrmod_hand_interp", "vrmod_foot_physics", "vrmod_foot_force",
 	"vrmod_pickup_players", "vrmod_pickup_players_adminprotect",
+	"vrmod_weight", "vrmod_weight_lag", "vrmod_weight_ramp",
 	"vrmod_selfdamage",
 	"sv_vrmod_melee", "vrmod_melee_damage", "vrmod_melee_velthreshold",
 	"vrmod_melee_delay", "vrmod_melee_speedscale", "vrmod_melee_fist_collisionmodel",
 	"sv_vrmod_kick", "vrmod_kick_damage", "vrmod_kick_velthreshold",
 	"sv_vrmod_headbutt", "vrmod_headbutt_damage", "vrmod_headbutt_velthreshold",
+	"vrmod_physmelee_force", "vrmod_physmelee_damage", "vrmod_physmelee_speed",
 	"vrmod_sv_climbing", "vrmod_sv_climbing_ledgeonly", "vrmod_sv_climbing_ladderonly",
 	"vrmod_sv_climbing_throw", "vrmod_sv_climbing_throwmin", "vrmod_sv_climbing_throwmax",
 	-- Hull
 	"vrmod_smallhull_all",
 	-- Networking
 	"vrmod_net_tickrate", "vrmod_net_minsend",
+	-- Poses
+	"vrmod_sv_poses",
 }
 
 -- ══════════════════════════════════════════════════════════════════
@@ -98,6 +120,35 @@ local SERVER_CVARS = {
 -- ══════════════════════════════════════════════════════════════════
 local cv_rcon = CreateClientConVar("vrmod_settings_rcon", "0", true, false)
 
+-- ══════════════════════════════════════════════════════════════════
+-- Setting descriptions (the DForm:ControlHelp line under each control),
+-- shown or hidden from the bottom of the menu. The ControlHelp override in
+-- VRUtilOpenMenu registers each one this menu builds -- tabs built later
+-- (ArcVR, VRMod_Menu hooks) included -- and hides it if they're off. A row
+-- some other logic hides (vrHidden: Arm HUD in Front mode) stays hidden.
+-- ══════════════════════════════════════════════════════════════════
+local cv_help = CreateClientConVar("vrmod_settings_help", "1", true, false, "Show the short description under each setting in the VRMod menu", 0, 1)
+local helpRows = setmetatable({}, {__mode = "k"})
+local function ShowHelp(show)
+	local forms = {}
+	for row in pairs(helpRows) do
+		if IsValid(row) then
+			row:SetVisible(show and not row.vrHidden)
+			forms[row:GetParent()] = true
+		else
+			helpRows[row] = nil
+		end
+	end
+	-- Re-lay each form, then up through its scroll panel to the frame
+	for p in pairs(forms) do
+		while IsValid(p) and p ~= frame do
+			p:InvalidateLayout(true)
+			p = p:GetParent()
+		end
+	end
+end
+cvars.AddChangeCallback("vrmod_settings_help", function(_, _, v) ShowHelp(v ~= "0") end, "vrmod_settings_help")
+
 local SERVER_CVAR_SET = {}
 for i = 1, #SERVER_CVARS do SERVER_CVAR_SET[SERVER_CVARS[i]] = true end
 
@@ -107,6 +158,20 @@ local function RconCvar(name, value)
 	timer.Create("vrmod_rcon_" .. name, 0.3, 1, function()
 		RunConsoleCommand("ulx", "rcon", name .. " " .. value)
 	end)
+end
+
+-- Resets convars to their code defaults (the Create*ConVar calls are the single
+-- source of truth). rcon mirrors each reset to the server for SERVER_CVARS.
+local function ResetCvars(list, rcon)
+	for i = 1, #list do
+		local n = list[i]
+		local cv = GetConVar(n)
+		if cv then
+			local d = cv:GetDefault()
+			RunConsoleCommand(n, d)
+			if rcon then RconCvar(n, d) end
+		end
+	end
 end
 
 -- One pass over the built frame: re-route every control bound to a server
@@ -154,7 +219,8 @@ local function SavePreset(dir, name, cvarList)
 	file.Write(dir .. "/" .. name .. ".json", util.TableToJSON(data, true))
 end
 
-local function LoadPreset(dir, name)
+local function LoadPreset(dir, name, cvarList)
+	if name == "Default" then ResetCvars(cvarList) return true end
 	local raw = file.Read(dir .. "/" .. name .. ".json", "DATA")
 	if not raw then return false end
 	local data = util.JSONToTable(raw)
@@ -171,9 +237,11 @@ local function GetPresetNames(dir)
 	local files = file.Find(dir .. "/*.json", "DATA")
 	local names = {}
 	for _, f in ipairs(files) do
-		names[#names + 1] = f:sub(1, -6)
+		f = f:sub(1, -6)
+		if f ~= "Default" then names[#names + 1] = f end
 	end
 	table.sort(names)
+	table.insert(names, 1, "Default")
 	return names
 end
 
@@ -192,82 +260,6 @@ local function ImportPresetFromText(dir, name, text)
 	if table.Count(data) == 0 then return false end
 	file.Write(dir .. "/" .. name .. ".json", util.TableToJSON(data, true))
 	return true, table.Count(data)
-end
-
--- Write built-in default presets to disk on first run
-do
-	EnsureDir("vrmod")
-	local defaultClient = {
-		vrmod_laserpointer = "0", vrmod_useworldmodels = "0", vrmod_heightmenu = "0",
-		vrmod_seated = "0", vrmod_autostart = "0", vrmod_doors = "1",
-		vrmod_flashlight_attachment = "1", vrmod_flashlight_shadows = "0", vrmod_flashlight_depth = "0",
-		vrmod_menu_float = "1", vrmod_menu_scale = "1.0", vrmod_quickmenu_float = "0",
-		vrmod_smoothturn = "1", vrmod_smoothturnrate = "180", vrmod_snapturnangle = "45", vrmod_althead = "0", vrmod_althead_auto = "1",
-		vrmod_controlleroffset_x = "-15", vrmod_controlleroffset_y = "-1",
-		vrmod_controlleroffset_z = "5", vrmod_controlleroffset_pitch = "50",
-		vrmod_controlleroffset_yaw = "0", vrmod_controlleroffset_roll = "0",
-		vrmod_desktopview = "3", vrmod_postprocess = "0", vrmod_skybox = "1",
-		vrmod_znear = "1", vrmod_eyescale = "0.5", vrmod_perfoverrides = "1",
-		vrmod_perf_threaded_bones = "1", vrmod_perf_mcore = "1", vrmod_perf_mat_queue = "1",
-		vrmod_perf_no_bloom = "1", vrmod_perf_no_fancyblend = "1", vrmod_perf_no_lightwarp = "1",
-		vrmod_perf_no_pspatch = "1", vrmod_perf_no_motionblur = "1", vrmod_perf_reduce_particles = "1",
-		vrmod_perf_no_rtt_shadows = "1", vrmod_perf_threaded_particles = "1", vrmod_perf_queued_ropes = "1",
-		vrmod_floatinghands = "0", vrmod_floatinghands_chands = "0", vrmod_floatinghands_stub = "1",
-		vrmod_characterik = "1", vrmod_armstretcher = "1",
-		vrmod_characteryawblend = "1.5", vrmod_fbt_leginfluence = "0.33",
-		vrmod_fbt_animshoulders = "1", vrmod_charactereyeheight = "55.6",
-		vrmod_characterheadtohmddist = "7.7", vrmod_smallhull = "1", vrmod_hullscale = "0.625", vrmod_anticlip = "1", vrmod_scale = "41.669140",
-		vrmod_hud = "1", vrmod_hudmode = "0", vrmod_hudcurve = "4", vrmod_huddistance = "59",
-		vrmod_hudscale = "0.04", vrmod_hudtestalpha = "0", vrmod_hudblacklist = "",
-		vrmod_beam_color = "203,109,109,255", vrmod_laser_color = "255,0,0,255",
-		vrmod_hud_color = "255,250,0,255", vrmod_hud_font = "Trebuchet MS",
-		vrmod_hudattach = "1", vrmod_hudarmscale = "0.0418", vrmod_hudcrt = "0",
-		vrmod_hudarm_x = "5", vrmod_hudarm_y = "-3", vrmod_hudarm_z = "1",
-		vrmod_hudarm_p = "0", vrmod_hudarm_yaw = "180", vrmod_hudarm_r = "90",
-		vrmod_hudinteract = "2", vrmod_ui_outline = "0", vrmod_pointer_hand = "0",
-		vrmod_collisions = "1", vrmod_weapondrop_enable = "0", vrmod_manualpickups = "0",
-		vrmod_interactive_buttons = "1", vrmod_weapon_swap = "1", vrmod_pickup_halos = "1",
-		vrmod_nocrouchjump = "1", vrmod_allow_teleport_client = "0",
-		vrmod_teleport_use_left = "0", vrmod_weaponmenu_style = "0", vrmod_menu_hand = "1",
-		vrmod_deathcam_ragdoll = "1", vrmod_deathcam_ragdoll_view = "1",
-		cl_vrmod_melee = "1", cl_vrmod_kick = "1", cl_vrmod_headbutt = "1",
-		vrmod_brushclimb = "1", vrmod_brushclimb_requireboth = "1",
-		vrmod_brushclimb_nofloor = "1", vrmod_brushclimb_magnet = "0",
-		vrmod_brushclimb_magnet_offset = "2.0", vrmod_brushclimb_ledgeonly = "0",
-		vrmod_brushclimb_ladderonly = "0", vrmod_brushclimb_ledgereach = "24", vrmod_brushclimb_ledge = "1",
-		vrmod_brushclimb_marker = "1", vrmod_brushclimb_vaultreach = "31",
-		vrmod_brushclimb_vaultmin = "8",
-		vrmod_brushclimb_reach = "2", vrmod_brushclimb_smooth = "0", vrmod_brushclimb_ladderreach = "24",
-		vrmod_pouch_enabled = "0", vrmod_pouch_visiblename = "0",
-		vrmod_pouch_visiblename_hud = "0", vrmod_pouch_lefthandwep_enable = "1",
-		vrmod_holster_showmodels = "1", vrmod_pouch_chest_z = "-3.4",
-		vrmod_holster_prop_maxvolume = "5750", vrmod_holster_ragdolls = "0",
-		vrmod_holster_ragdoll_models = "0", vrmod_holster_persist = "1",
-		vrmod_holster_model_enabled = "1", vrmod_holster_model = "models/weapons/w_eq_eholster.mdl",
-		vrmod_holster_model_x = "0", vrmod_holster_model_y = "0", vrmod_holster_model_z = "0",
-		vrmod_holster_model_p = "0", vrmod_holster_model_yaw = "0", vrmod_holster_model_r = "0",
-		vrmod_holster_model_slot1 = "1", vrmod_holster_model_slot2 = "1", vrmod_holster_model_slot3 = "1", vrmod_holster_model_slot4 = "1",
-	}
-	local defaultServer = {
-		vrmod_allow_teleport = "1", vrmod_teleport_maxdist = "0",
-		vrmod_pickup_limit = "1", vrmod_pickup_npcs = "1", vrmod_pickup_no_phys = "0",
-		vrmod_pickup_weight = "35", vrmod_pickup_range = "0.7", vrmod_selfdamage = "1",
-		vrmod_pickup_players = "0", vrmod_pickup_players_adminprotect = "1",
-		vrmod_hand_physics = "1",
-		sv_vrmod_melee = "1", vrmod_melee_damage = "2", vrmod_melee_velthreshold = "2.5",
-		vrmod_melee_delay = "0.03", vrmod_melee_speedscale = "0.001",
-		vrmod_melee_fist_collisionmodel = "models/props_junk/PopCan01a.mdl",
-		sv_vrmod_kick = "1", vrmod_kick_damage = "25", vrmod_kick_velthreshold = "1.6",
-		sv_vrmod_headbutt = "1", vrmod_headbutt_damage = "5", vrmod_headbutt_velthreshold = "2.5",
-	}
-	EnsureDir(PRESET_DIR_CLIENT)
-	EnsureDir(PRESET_DIR_SERVER)
-	if not file.Exists(PRESET_DIR_CLIENT .. "/Default.json", "DATA") then
-		file.Write(PRESET_DIR_CLIENT .. "/Default.json", util.TableToJSON(defaultClient, true))
-	end
-	if not file.Exists(PRESET_DIR_SERVER .. "/Default.json", "DATA") then
-		file.Write(PRESET_DIR_SERVER .. "/Default.json", util.TableToJSON(defaultServer, true))
-	end
 end
 
 -- VR-safe dialog helpers (render as children of parent frame, not as popups)
@@ -373,6 +365,7 @@ local function BuildPresetPanel(parent, dir, cvarList)
 	local combo = vgui.Create("DComboBox")
 	form:AddItem(combo)
 	combo:SetValue("Select preset...")
+	form:ControlHelp("Saved snapshots of these settings. Default puts every one of them back to its default.")
 
 	local function Refresh()
 		if not IsValid(combo) then return end
@@ -383,10 +376,11 @@ local function BuildPresetPanel(parent, dir, cvarList)
 	Refresh()
 
 	local loadBtn = form:Button("Load")
+	form:ControlHelp("Applies the selected preset.")
 	function loadBtn:DoClick()
 		local _, name = combo:GetSelected()
 		if not name then return end
-		if LoadPreset(dir, name) then
+		if LoadPreset(dir, name, cvarList) then
 			chat.AddText(Color(100, 255, 100), "[VRMod] ", Color(255, 255, 255), "Loaded preset: " .. name)
 		end
 	end
@@ -396,6 +390,7 @@ local function BuildPresetPanel(parent, dir, cvarList)
 	form:AddItem(saveEntry)
 	saveEntry:SetPlaceholderText("Preset name...")
 	local saveBtn = form:Button("Save Current Settings")
+	form:ControlHelp("Saves your current settings under the name typed above.")
 	function saveBtn:DoClick()
 		local name = saveEntry:GetValue()
 		if not name or name == "" then
@@ -410,15 +405,17 @@ local function BuildPresetPanel(parent, dir, cvarList)
 	end
 
 	local deleteBtn = form:Button("Delete")
+	form:ControlHelp("Deletes the selected preset.")
 	function deleteBtn:DoClick()
 		local _, name = combo:GetSelected()
-		if not name then return end
+		if not name or name == "Default" then return end
 		DeletePreset(dir, name)
 		Refresh()
 		chat.AddText(Color(100, 255, 100), "[VRMod] ", Color(255, 255, 255), "Deleted preset: " .. name)
 	end
 
 	local exportBtn = form:Button("Export to Console")
+	form:ControlHelp("Prints these settings to the console and to a file in data/, to share or paste into Import.")
 	function exportBtn:DoClick()
 		local lines = {}
 		for _, cvar in ipairs(cvarList) do
@@ -438,7 +435,8 @@ end
 
 function VRUtilOpenMenu()
 	if IsValid(frame) then return frame end
-	-- Darken ControlHelp labels once (deferred until VGUI is ready)
+	-- Darken ControlHelp labels once (deferred until VGUI is ready), and
+	-- register this menu's description rows (see ShowHelp)
 	if not darkHelpApplied then
 		local dt = vgui.GetControlTable("DForm")
 		if dt and dt.ControlHelp then
@@ -446,7 +444,14 @@ function VRUtilOpenMenu()
 			local darkColor = Color(50, 50, 50)
 			dt.ControlHelp = function(self, ...)
 				local lbl = _orig(self, ...)
-				if IsValid(lbl) then lbl:SetColor(darkColor) end
+				if IsValid(lbl) then
+					lbl:SetColor(darkColor)
+					local row = lbl:GetParent()
+					if IsValid(frame) and IsValid(row) and self:HasParent(frame) then
+						row.vrHelp, helpRows[row] = true, true
+						if not cv_help:GetBool() then row:SetVisible(false) end
+					end
+				end
 				return lbl
 			end
 		end
@@ -498,6 +503,18 @@ function VRUtilOpenMenu()
 		end
 	end
 
+	-- ── Description toggle (docked after the bar: sits just above it) ──
+	local helpRow = vgui.Create("DPanel", frame)
+	helpRow:Dock(BOTTOM)
+	helpRow:SetTall(20)
+	helpRow.Paint = nil
+	local helpBox = vgui.Create("DCheckBoxLabel", helpRow)
+	helpBox:Dock(LEFT)
+	helpBox:DockMargin(5, 2, 0, 0)
+	helpBox:SetText("Show setting descriptions")
+	helpBox:SetConVar("vrmod_settings_help")
+	helpBox:SizeToContents()
+
 	surface.CreateFont("BoldSliderFont", { font = "Tahoma", size = 13, weight = 1000 })
 
 	-- ══════════════════════════════════════════════════════════════════
@@ -544,11 +561,13 @@ function VRUtilOpenMenu()
 		local laser_pointer = form:CheckBox("Add laser pointer to tools/weapons")
 		laser_pointer:SetChecked(GetConVar("vrmod_laserpointer"):GetBool())
 		function laser_pointer:OnChange(val) RunConsoleCommand("vrmod_togglelaserpointer") end
+		form:ControlHelp("Draws a laser from the muzzle of whatever you hold, showing where it points.")
 
 		form:CheckBox("Use weapon world models", "vrmod_useworldmodels")
-		form:ControlHelp("Requires VR restart")
+		form:ControlHelp("Draws every weapon's third-person world model in your hand instead of its viewmodel. Requires VR restart.")
 
 		local heightCheckbox = form:CheckBox("Show height adjustment menu", "vrmod_heightmenu")
+		form:ControlHelp("Opens the height adjustment menu each time VR starts, to set your eye height and seated offset.")
 		local checkTime = 0
 		function heightCheckbox:OnChange(checked)
 			if checked and SysTime() - checkTime < 0.1 then VRUtilOpenHeightMenu() end
@@ -556,22 +575,48 @@ function VRUtilOpenMenu()
 		end
 
 		form:CheckBox("Enable seated offset", "vrmod_seated")
-		form:ControlHelp("Adjust from height adjustment menu")
+		form:ControlHelp("Raises your view by a fixed amount so you can play sitting down. Set the amount in the height adjustment menu.")
 		form:CheckBox("Automatically start VR after map loads", "vrmod_autostart")
+		form:ControlHelp("Starts VR by itself once a map has finished loading.")
 		form:CheckBox("Replace door use mechanics (when available)", "vrmod_doors")
+		form:ControlHelp("On maps with grab points set up, doors and lockers open by grabbing and pulling their handle instead of pressing use.")
 		form:CheckBox("Apply server settings via ULX RCON", "vrmod_settings_rcon")
 		form:ControlHelp("Sends changes to server-side settings (Server tab: teleport, pickup, melee, climbing) through 'ulx rcon' so you don't need console in VR. Requires ULX superadmin.")
 
-		-- Menus
+		-- Quick menu (spawn/context menu placement: its own tab)
 		local menuForm = vgui.Create("DForm", form)
-		menuForm:SetName("Menus")
+		menuForm:SetName("Quick Menu")
 		menuForm:Dock(TOP)
 		menuForm:DockMargin(10, 10, 10, 0)
 		menuForm:SetExpanded(true)
-		menuForm:CheckBox("Floating menus (stay in world)", "vrmod_menu_float")
-		menuForm:ControlHelp("Menus stay where opened instead of following your hand")
 		menuForm:CheckBox("Floating quick menu", "vrmod_quickmenu_float")
 		menuForm:ControlHelp("Quick menu stays where opened instead of following your hand")
+
+		form:Button("Reset settings to default", "vrmod_reset")
+		form:ControlHelp("Resets every VRMod client setting to its default value.")
+	end
+
+	-- ─────────────── Client > Spawn Menu ───────────────
+	do
+		local t = vgui.Create("DScrollPanel", clientSheet)
+		clientSheet:AddSheet("Spawn Menu", t, "icon16/application_view_tile.png")
+
+		local menuForm = vgui.Create("DForm", t)
+		menuForm:SetName("Spawn & Context Menus")
+		menuForm:Dock(TOP)
+		menuForm:DockMargin(5, 5, 5, 0)
+		menuForm:SetExpanded(true)
+
+		local posCombo = menuForm:ComboBox("Menu position", "vrmod_menu_float")
+		posCombo:AddChoice("Follow hand", "0")
+		posCombo:AddChoice("Stay where opened", "1")
+		posCombo:AddChoice("In front of you", "2")
+		posCombo:AddChoice("Follow where you look", "3")
+		posCombo:ChooseOptionID(math.Clamp(GetConVar("vrmod_menu_float"):GetInt(), 0, 3) + 1)
+		menuForm:ControlHelp("Follow hand: rides on your off hand. Stay where opened: left floating at your hand. In front of you: opens centred ahead of you and stays there. Follow where you look: stays ahead of you as you turn. Also applies to other popup windows, chat, keyboard and numpad.")
+		menuForm:NumSlider("Menu smoothing", "vrmod_menu_smooth", 0, 1, 2)
+		menuForm:ControlHelp("Smooths a menu that follows your hand or view, so tremor and small head movements don't shake it. 0 = rigid; higher trails further behind.")
+
 		local scaleRow = vgui.Create("DPanel", menuForm)
 		menuForm:AddItem(scaleRow)
 		scaleRow:SetTall(24)
@@ -601,9 +646,15 @@ function VRUtilOpenMenu()
 			RunConsoleCommand("vrmod_menu_scale", string.format("%.1f", v))
 			timer.Simple(0, UpdateScaleLabel)
 		end
-		menuForm:ControlHelp("Size of spawn/context menus (1 = default)")
+		menuForm:ControlHelp("Size of spawn/context menus (1.3 = default)")
 
-		form:Button("Reset settings to default", "vrmod_reset")
+		local resetBtn = menuForm:Button("Reset Menu Defaults")
+		menuForm:ControlHelp("Puts every Spawn & Context Menu setting back to its default.")
+		function resetBtn:DoClick()
+			ResetCvars({"vrmod_menu_float", "vrmod_menu_smooth", "vrmod_menu_scale"})
+			posCombo:ChooseOptionID(tonumber(GetConVar("vrmod_menu_float"):GetDefault()) + 1)
+			timer.Simple(0, UpdateScaleLabel)
+		end
 	end
 
 	-- ─────────────── Client > Controls ───────────────
@@ -651,14 +702,42 @@ function VRUtilOpenMenu()
 		snapAngleCombo:ChooseOptionID(({[30]=1,[45]=2,[90]=3})[convars.vrmod_snapturnangle:GetInt()] or 2)
 		snapAngleCombo:SetVisible(not isSmooth)
 		function snapAngleCombo:OnSelect(_, _, val) RunConsoleCommand("vrmod_snapturnangle", val) end
+		controlsPanel:ControlHelp("Smooth Turn rotates you continuously while the stick is held, at the rate set (degrees per second). Snap Turn rotates in fixed steps, one per flick.")
 
 		controlsPanel:NumSlider("Crouch threshold", "vrmod_crouchthreshold", 10, 60, 0)
 		controlsPanel:ControlHelp("HMD height below which roomscale crouch activates (default 40)")
+
+		controlsPanel:NumSlider("Left stick deadzone", "vrmod_stick_deadzone_left", 0, 0.9, 2)
+		controlsPanel:NumSlider("Right stick deadzone", "vrmod_stick_deadzone_right", 0, 0.9, 2)
+		controlsPanel:ControlHelp("Stick travel ignored before input registers; the rest is rescaled to full range. Raise to stop drift (default 0.10).")
 
 		local actionBtn = vgui.Create("DButton", controlsPanel)
 		controlsPanel:AddItem(actionBtn)
 		actionBtn:SetText("Edit custom controller input actions")
 		function actionBtn:DoClick() RunConsoleCommand("vrmod_actioneditor") end
+		controlsPanel:ControlHelp("Opens the action editor, to change which controller buttons trigger which VRMod actions.")
+
+		-- Pointer. Convar-bound combos sync their shown choice in Think
+		-- (DComboBox:CheckConVarChanges), so no ChooseOptionID here.
+		local ptrForm = vgui.Create("DForm", t)
+		ptrForm:SetName("Pointer")
+		ptrForm:Dock(TOP)
+		ptrForm:DockMargin(5, 5, 5, 0)
+		ptrForm:SetExpanded(true)
+		local ph = ptrForm:ComboBox("Pointer hand", "vrmod_pointer_hand")
+		ph:AddChoice("Right Hand", "0")
+		ph:AddChoice("Left Hand", "1")
+		ptrForm:ControlHelp("Which hand points at and clicks menus.")
+		ptrForm:CheckBox("Pointer uses map objects", "vrmod_pointer_use")
+		ptrForm:ControlHelp("Point that hand at a button, door, keypad, charger, ammo crate or vehicle within reach: the pointer beam lands on it, and Use uses exactly that instead of whatever you're facing. Anything else, or nothing, and Use works as before. Not while that hand holds a weapon.")
+		local hi = ptrForm:ComboBox("HUD pointer button", "vrmod_hudinteract")
+		hi:AddChoice("Reload", "0")
+		hi:AddChoice("Quick Menu", "1")
+		hi:AddChoice("Disabled", "2")
+		ptrForm:ControlHelp("Hold this button to point at and click the HUD with your right hand. Disabled turns the HUD pointer off.")
+		local ptrReset = ptrForm:Button("Reset Pointer Defaults")
+		ptrForm:ControlHelp("Puts every Pointer setting back to its default.")
+		function ptrReset:DoClick() ResetCvars({"vrmod_pointer_hand", "vrmod_pointer_use", "vrmod_hudinteract"}) end
 
 		-- Controller offsets
 		local offsetForm = vgui.Create("DForm", t)
@@ -676,7 +755,9 @@ function VRUtilOpenMenu()
 		AddOffsetSlider("Pitch", "vrmod_controlleroffset_pitch", -180, 180)
 		AddOffsetSlider("Yaw", "vrmod_controlleroffset_yaw", -180, 180)
 		AddOffsetSlider("Roll", "vrmod_controlleroffset_roll", -180, 180)
+		offsetForm:ControlHelp("Where the hand sits relative to the tracked controller: X forward, Y sideways, Z up, then its rotation. Press Apply offsets to use them.")
 		local applyBtn = offsetForm:Button("Apply offsets", nil)
+		offsetForm:ControlHelp("Uses the offsets above right away.")
 		function applyBtn:OnReleased()
 			local x = convars.vrmod_controlleroffset_x:GetFloat()
 			local y = convars.vrmod_controlleroffset_y:GetFloat()
@@ -692,6 +773,7 @@ function VRUtilOpenMenu()
 			end
 		end
 		local resetBtn = offsetForm:Button("Reset offsets", "")
+		offsetForm:ControlHelp("Puts the controller offsets back to their defaults and applies them.")
 		function resetBtn:OnReleased()
 			RunConsoleCommand("vrmod_controlleroffset_x", "-15")
 			RunConsoleCommand("vrmod_controlleroffset_y", "-1")
@@ -725,22 +807,13 @@ function VRUtilOpenMenu()
 		form:ControlHelp("Master switch for the FPS-friendly engine overrides below. These apply the moment you tick them, on desktop as well as in VR, and stay applied after you exit. Unticking one returns that convar to its engine default rather than a value you set yourself.")
 		for _, o in ipairs(vrmod.PerfOverrides or {}) do
 			form:CheckBox(o.label, o.toggle)
+			if o.desc then form:ControlHelp(o.desc) end
 		end
 
-		-- Desktop view combo
-		local dvCombo = form:ComboBox("Desktop view", "vrmod_desktopview")
-		dvCombo:AddChoice("none", "1")
-		dvCombo:AddChoice("left eye", "2")
-		dvCombo:AddChoice("right eye", "3")
-		local dvVal = convars.vrmod_desktopview:GetInt()
-		dvCombo:ChooseOptionID(dvVal > 0 and dvVal or 1)
-
 		form:CheckBox("Enable engine postprocessing", "vrmod_postprocess")
+		form:ControlHelp("Runs the engine's screen effects (colour correction, bloom and the like) in VR, at a cost in frame time." .. (shaderlib and " Also enables GShader in VR. Its effects are computed at your game resolution, so they look softer than the scene; it also runs twice a frame (details in chat when you turn it on)." or ""))
 		form:CheckBox("3D Skybox (disable for more FPS)", "vrmod_skybox")
-		form:CheckBox("Flashlight shadows", "vrmod_flashlight_shadows")
-		form:ControlHelp("Lets the VR flashlight cast shadows. Free to flip, but nothing changes unless the depth texture below is on too. Takes effect on your next flashlight toggle.")
-		form:CheckBox("Flashlight shadow depth texture", "vrmod_flashlight_depth")
-		form:ControlHelp("Off by default: the depth pass re-renders whenever your hands or a nearby prop sit in the beam, which stutters under the threaded material queue. Changing this reallocates the depth texture and WILL freeze the game for about a second. Applies outside VR -- toggling in-headset takes effect on exit.")
+		form:ControlHelp("Draws the map's 3D skybox. Off saves frame time on maps with a detailed one.")
 
 		form:NumSlider("ZNear", "vrmod_znear", -3.0, 3.0, 2)
 		form:ControlHelp("How close objects can be before clipping. Lower values let you see closer objects.")
@@ -749,15 +822,10 @@ function VRUtilOpenMenu()
 		form:ControlHelp("Adjusts stereo eye separation. Changing this will visually affect your POV.")
 
 		local resetBtn = form:Button("Reset Rendering Defaults")
+		form:ControlHelp("Puts every Rendering setting back to its default.")
 		function resetBtn:DoClick()
-			RunConsoleCommand("vrmod_postprocess", "0")
-			RunConsoleCommand("vrmod_skybox", "1")
-			RunConsoleCommand("vrmod_flashlight_shadows", "0")
-			RunConsoleCommand("vrmod_flashlight_depth", "0")
-			RunConsoleCommand("vrmod_znear", "1.0")
-			RunConsoleCommand("vrmod_eyescale", "0.5")
-			RunConsoleCommand("vrmod_perfoverrides", "1")
-			for _, o in ipairs(vrmod.PerfOverrides or {}) do RunConsoleCommand(o.toggle, "1") end
+			ResetCvars({"vrmod_postprocess", "vrmod_skybox", "vrmod_znear", "vrmod_eyescale", "vrmod_perfoverrides"})
+			for _, o in ipairs(vrmod.PerfOverrides or {}) do RunConsoleCommand(o.toggle, o.def or "1") end
 		end
 
 		local compat = vgui.Create("DForm", t)
@@ -766,7 +834,7 @@ function VRUtilOpenMenu()
 		compat:DockMargin(5, 5, 5, 0)
 		compat:SetExpanded(true)
 		compat:CheckBox("Warn about addons that break VR", "vrmod_compat_warn")
-		compat:ControlHelp("Reports render replacers such as gShader on VR start.")
+		compat:ControlHelp("Reports addons known to break the VR render on VR start.")
 		compat:CheckBox("Suppress other ShouldDrawLocalPlayer hooks", "vrmod_compat_killhooks")
 		compat:ControlHelp("Thirdperson and camera addons hook ShouldDrawLocalPlayer with no priority system and silently win over VRMod, killing the body and hands. Restored on VR exit.")
 		compat:CheckBox("Warn on screen when VR rendering stalls", "vrmod_compat_stallwarn")
@@ -775,6 +843,233 @@ function VRUtilOpenMenu()
 		compat:ControlHelp("Paints the reason into both eyes instead of leaving the last frame frozen.")
 		local compatBtn = compat:Button("Run compatibility check now")
 		function compatBtn:DoClick() RunConsoleCommand("vrmod_compat") end
+		compat:ControlHelp("Checks your installed addons against the known-incompatible list and reports what it finds.")
+	end
+
+	-- ─────────────── Client > Desktop Rendering ───────────────
+	-- What the monitor shows while you're in VR. The spectator camera lives in
+	-- utils/sh_speccam; every control here is a convar it reads live.
+	do
+		local t = vgui.Create("DScrollPanel", clientSheet)
+		clientSheet:AddSheet("Desktop Rendering", t, "icon16/television.png")
+		local function Section(name, open)
+			local f = vgui.Create("DForm", t)
+			f:SetName(name)
+			f:Dock(TOP)
+			f:DockMargin(5, 5, 5, 0)
+			f:SetExpanded(open)
+			return f
+		end
+		local function UseMode(f, mode)
+			f:Button("Use This Mode").DoClick = function() RunConsoleCommand("vrmod_specfov_mode", mode) end
+			f:ControlHelp("Switches the spectator camera to this mode.")
+		end
+
+		local form = Section("Desktop View", true)
+		form:CheckBox("Cheap Rendering", "vrmod_cheaprender")
+		form:ControlHelp("Mirrors one headset eye to the desktop. Costs nothing extra. Untick to use the spectator camera below instead, which renders a whole extra view of the scene every frame.")
+		local dvCombo = form:ComboBox("Mirrored eye", "vrmod_desktopview")
+		dvCombo:AddChoice("none", "1")
+		dvCombo:AddChoice("left eye", "2")
+		dvCombo:AddChoice("right eye", "3")
+		local dvVal = convars.vrmod_desktopview:GetInt()
+		dvCombo:ChooseOptionID(dvVal > 0 and dvVal or 1)
+		form:ControlHelp("Used while Cheap Rendering is on. Applies on VR start.")
+
+		local spec = Section("Spectator Camera", true)
+		spec:ControlHelp("Used while Cheap Rendering is off. Independent of the headset view.")
+		spec:NumSlider("Field of view", "vrmod_specfov", 10, 150, 0)
+		spec:ControlHelp("Field of view of the spectator camera, in degrees.")
+		spec:NumSlider("Render every Nth frame", "vrmod_specfov_rate", 1, 4, 0)
+		spec:ControlHelp("1 renders it every frame. 2 halves its GPU cost and the desktop shows each spectator frame twice. Raise it if the headset judders while the spectator camera is on.")
+		spec:NumSlider("Resolution scale", "vrmod_specfov_scale", 0.25, 1, 2)
+		spec:ControlHelp("Renders the spectator view smaller and stretches it to the desktop. Applies on VR start.")
+		spec:NumSlider("Rotation smoothing", "vrmod_specfov_smooth_ang", 0, 1, 2)
+		spec:ControlHelp("Smooths the spectator camera's turning so head movement doesn't shake the desktop view. 0 = rigid.")
+		local MODES = {"Eye (headset viewpoint)", "Static / Attached", "Third-Person", "Body Camera (Chest)", "Attach To Bone", "Chase (vehicles only)", "Random Shots"}
+		local modeCombo = spec:ComboBox("Camera mode", "vrmod_specfov_mode")
+		modeCombo:SetSortItems(false)
+		for i = 1, 7 do if i ~= 6 then modeCombo:AddChoice(MODES[i], i - 1) end end
+		spec:ControlHelp("Each mode has its own section below. Camera Rotation, while on, picks the mode for you. A VR Camera you are looking through overrides all of them.")
+		spec:CheckBox("Hide player head", "vrmod_specfov_hidehead")
+		spec:ControlHelp("Hides your playermodel's head from the spectator view in Eye (first-person) mode, so it doesn't block the camera. Other modes always show it.")
+		spec:CheckBox("Show HUD on desktop view", "vrmod_specfov_showhud")
+		spec:ControlHelp("Draws the HUD on the desktop spectator view.")
+		spec:CheckBox("Apply post-process shaders", "vrmod_specfov_shaders")
+		spec:ControlHelp("Runs RenderScreenspaceEffects on the spectator view, so shader addons apply to it.")
+		spec:CheckBox("Show camera sprite in VR", "vrmod_specfov_showsprite")
+		spec:ControlHelp("Marks where the spectator camera is in VR, so you can see what it's filming.")
+
+		local fx = Section("Awesome Camera & Vehicles", false)
+		fx:ControlHelp("Driving-game effects on the spectator view: speed widens the FOV, turns bank the camera and swing it into the corner, braking dips it, top speed shakes it, crashes slam it.")
+		local fxCombo = fx:ComboBox("Awesome camera", "vrmod_specfov_awesome")
+		fxCombo:SetSortItems(false)
+		fxCombo:AddChoice("Off", 0)
+		fxCombo:AddChoice("Always", 1)
+		fxCombo:AddChoice("Only in vehicles", 2)
+		fx:ControlHelp("Always also runs on foot, where walking speed barely moves it. Placed VR Cameras are never affected.")
+		fx:NumSlider("Speed FOV boost", "vrmod_specfov_awesome_fov", 0, 60, 0)
+		fx:ControlHelp("Degrees added to the field of view at full speed. Throttle punches it wider, braking pulls it in.")
+		fx:NumSlider("Sway strength", "vrmod_specfov_awesome_sway", 0, 3, 2)
+		fx:ControlHelp("How hard the camera banks and looks into turns, and dips under braking. 0 = off.")
+		fx:NumSlider("Shake strength", "vrmod_specfov_awesome_shake", 0, 3, 2)
+		fx:ControlHelp("High-speed rumble, and the jolt from crashes and hard landings. 0 = off.")
+		fx:NumSlider("Full-effect speed: vehicle", "vrmod_specfov_awesome_speed", 100, 5000, 0)
+		fx:NumSlider("Full-effect speed: on foot", "vrmod_specfov_awesome_speed_foot", 50, 2000, 0)
+		fx:ControlHelp("Speed where the effects peak, in units per second. About 1500 suits cars (raise it for planes), about 400 a sprint.")
+		local vehCombo = fx:ComboBox("Vehicle camera", "vrmod_specfov_vehmode")
+		vehCombo:SetSortItems(false)
+		vehCombo:AddChoice("Same as on foot", -1)
+		for i = 1, 7 do vehCombo:AddChoice(MODES[i], i - 1) end
+		fx:ControlHelp("Camera mode used while you're in a vehicle, with or without the awesome camera. Modes keep their own settings below.")
+		fx:NumSlider("Chase distance", "vrmod_specfov_chase_dist", 1, 6, 2)
+		fx:NumSlider("Chase height", "vrmod_specfov_chase_z", 0, 2, 2)
+		fx:ControlHelp("In vehicle sizes, so one setting frames a bike and a bus. The chase cam trails the vehicle's turns and pulls in off walls.")
+
+		local rot = Section("Camera Rotation", false)
+		rot:CheckBox("Camera rotation", "vrmod_specfov_rotate")
+		rot:ControlHelp("Switches to a random camera mode on a timer. Overrides Camera mode and Vehicle camera while on.")
+		rot:NumSlider("Seconds per camera", "vrmod_specfov_rotate_time", 5, 300, 0)
+		rot:ControlHelp("How long each camera stays up before the next.")
+		rot:CheckBox("Checklist selection", "vrmod_specfov_rotate_checklist")
+		rot:ControlHelp("No camera comes up twice until every camera in the list has had its turn.")
+		-- One bitmask convar; picking an entry flips its bit (bit n = mode n)
+		local cv_pool = GetConVar("vrmod_specfov_rotate_pool")
+		local poolCombo = rot:ComboBox("Cameras")
+		poolCombo:SetSortItems(false)
+		local function FillPool(mask)
+			poolCombo:Clear()
+			local n = 0
+			for i = 1, 7 do
+				local on = bit.band(mask, bit.lshift(1, i - 1)) ~= 0
+				if on then n = n + 1 end
+				poolCombo:AddChoice((on and "[X]  " or "[   ]  ") .. MODES[i], i - 1)
+			end
+			poolCombo:SetValue(n .. " of 7 in rotation")
+		end
+		FillPool(cv_pool:GetInt())
+		function poolCombo:OnSelect(_, _, bitIdx)
+			local mask = bit.bxor(cv_pool:GetInt(), bit.lshift(1, bitIdx))
+			RunConsoleCommand("vrmod_specfov_rotate_pool", tostring(mask))
+			FillPool(mask)
+		end
+		rot:ControlHelp("Pick a camera to tick or untick it. Chase only joins in while you're in a vehicle. Static sits wherever you last placed it.")
+
+		local eye = Section("Mode: Eye", false)
+		eye:ControlHelp("Renders from the headset itself: what you see, at the desktop's shape.")
+		local eyeCombo = eye:ComboBox("Eye position", "vrmod_specfov_eyepos")
+		eyeCombo:AddChoice("Center between eyes", 0)
+		eyeCombo:AddChoice("Left eye", 1)
+		eyeCombo:AddChoice("Right eye", 2)
+		eye:ControlHelp("Which eye position the view is taken from.")
+		UseMode(eye, "0")
+
+		local st = Section("Mode: Static / Attached", false)
+		st:ControlHelp("A fixed point in the world, or a camera bolted to a prop. The VR Spec Cam Placer tool places it on a surface or attaches it to a prop.")
+		UseMode(st, "1")
+		st:Button("Place at eye position now").DoClick = function() RunConsoleCommand("vrmod_specfov_place_static") end
+		st:Button("Detach from entity").DoClick = function() RunConsoleCommand("vrmod_specfov_detach") end
+		st:ControlHelp("Place moves the static camera to your eyes. Detach unbolts it from a prop, leaving it where it is.")
+		st:ControlHelp("Rotation: absolute in the world; added on top of the prop's angle when attached.")
+		st:NumSlider("Pitch", "vrmod_specfov_static_p", -89, 89, 1)
+		st:NumSlider("Yaw", "vrmod_specfov_static_y", -180, 180, 1)
+		st:NumSlider("Roll", "vrmod_specfov_static_r", -180, 180, 1)
+		st:ControlHelp("Offset from an attached prop, along its own axes:")
+		st:NumSlider("Forward", "vrmod_specfov_att_x", -100, 100, 1)
+		st:NumSlider("Right", "vrmod_specfov_att_y", -100, 100, 1)
+		st:NumSlider("Up", "vrmod_specfov_att_z", -100, 100, 1)
+
+		local tp = Section("Mode: Third-Person", false)
+		tp:ControlHelp("Follows you from the headset. Pulls in when it would go through a wall.")
+		UseMode(tp, "2")
+		tp:NumSlider("Right offset", "vrmod_specfov_tp_x", -100, 100, 1)
+		tp:NumSlider("Back offset", "vrmod_specfov_tp_y", -300, 0, 1)
+		tp:NumSlider("Up offset", "vrmod_specfov_tp_z", -100, 100, 1)
+		tp:ControlHelp("Where the camera sits relative to your head, in units.")
+		tp:CheckBox("Always face player", "vrmod_specfov_tp_faceply")
+		tp:ControlHelp("Keeps the camera pointed at you instead of looking where you look.")
+		tp:ControlHelp("Follow these headset rotation axes:")
+		tp:CheckBox("Pitch (tilt)", "vrmod_specfov_tp_usepitch")
+		tp:CheckBox("Yaw (turn)", "vrmod_specfov_tp_useyaw")
+		tp:CheckBox("Roll (lean)", "vrmod_specfov_tp_useroll")
+		tp:NumSlider("Pitch offset", "vrmod_specfov_tp_ang_p", -89, 89, 1)
+		tp:NumSlider("Yaw offset", "vrmod_specfov_tp_ang_y", -180, 180, 1)
+		tp:NumSlider("Roll offset", "vrmod_specfov_tp_ang_r", -180, 180, 1)
+		tp:ControlHelp("Extra rotation added to the camera's direction, in degrees.")
+
+		local body = Section("Mode: Body Camera", false)
+		body:ControlHelp("Anchored to the chest, looking where the headset looks. A helmet-cam feel.")
+		UseMode(body, "3")
+		body:NumSlider("Right / Left", "vrmod_specfov_bodycam_x", -30, 30, 1)
+		body:NumSlider("Up / Down", "vrmod_specfov_bodycam_y", -30, 30, 1)
+		body:NumSlider("Forward / Back", "vrmod_specfov_bodycam_z", -30, 30, 1)
+		body:ControlHelp("Where the camera sits relative to your chest, in units.")
+
+		local bone = Section("Mode: Bone", false)
+		bone:ControlHelp("Follows any bone on your playermodel.")
+		UseMode(bone, "4")
+		local boneCombo = bone:ComboBox("Bone", "vrmod_specfov_bone_name")
+		boneCombo:SetSortItems(false)
+		local function FillBones()
+			boneCombo:Clear()
+			local ply = LocalPlayer()
+			if not IsValid(ply) then return end
+			for i = 0, ply:GetBoneCount() - 1 do
+				local n = ply:GetBoneName(i)
+				if n and n ~= "__INVALIDBONE__" then boneCombo:AddChoice(n, n) end
+			end
+		end
+		FillBones()
+		bone:ControlHelp("Bone to follow, from your current playermodel.")
+		bone:TextEntry("Bone name", "vrmod_specfov_bone_name")
+		bone:ControlHelp("Or type a bone name in directly (ValveBiped.Bip01_Head1, for example).")
+		bone:Button("Refresh bone list").DoClick = FillBones
+		bone:ControlHelp("Re-reads the bone list after a playermodel change.")
+		local rotCombo = bone:ComboBox("Rotation", "vrmod_specfov_bone_rotmode")
+		rotCombo:AddChoice("Follow bone", 0)
+		rotCombo:AddChoice("Follow headset", 1)
+		bone:ControlHelp("Follow bone turns with the bone. Follow headset sits on the bone but looks where you look.")
+		bone:CheckBox("Flip camera (selfie)", "vrmod_specfov_bone_flip")
+		bone:ControlHelp("Turns the camera around to look back the other way, selfie-style.")
+		bone:NumSlider("Right / Left", "vrmod_specfov_bone_x", -100, 100, 1)
+		bone:NumSlider("Up / Down", "vrmod_specfov_bone_y", -100, 100, 1)
+		bone:NumSlider("Forward / Back", "vrmod_specfov_bone_z", -100, 100, 1)
+		bone:ControlHelp("Where the camera sits relative to the bone, in units.")
+		bone:NumSlider("Pitch offset", "vrmod_specfov_bone_ang_p", -89, 89, 1)
+		bone:NumSlider("Yaw offset", "vrmod_specfov_bone_ang_y", -180, 180, 1)
+		bone:NumSlider("Roll offset", "vrmod_specfov_bone_ang_r", -180, 180, 1)
+		bone:ControlHelp("Extra rotation added to the camera's direction, in degrees.")
+
+		local shots = Section("Mode: Random Shots", false)
+		shots:ControlHelp("A film crew: cuts between orbits, low hero angles, dutch tilts, cranes, telephoto, dolly zooms, close-ups and roadside tripods. In a vehicle a shot frames you, the vehicle, or both. Each shot sets its own FOV to keep its subject in frame.")
+		UseMode(shots, "6")
+		shots:NumSlider("Shortest shot", "vrmod_specfov_shot_min", 3, 60, 0)
+		shots:NumSlider("Longest shot", "vrmod_specfov_shot_max", 3, 60, 0)
+		shots:ControlHelp("Each shot runs a random time between these, in seconds. A tripod shot cuts early once you're out of its sight or range.")
+
+		local cams = Section("VR Cameras", false)
+		cams:ControlHelp("Key-bound cameras placed with the VR Camera tool (Render tab), or the stock Camera tool, which is converted. Press a camera's key to look through it. Needs Cheap Rendering off while you're in VR.")
+		cams:Button("Next camera").DoClick = function() RunConsoleCommand("vrmod_speccam_next") end
+		cams:Button("Previous camera").DoClick = function() RunConsoleCommand("vrmod_speccam_prev") end
+		cams:Button("Use camera I'm aiming at").DoClick = function() RunConsoleCommand("vrmod_speccam_pick") end
+		cams:Button("Stop viewing").DoClick = function() RunConsoleCommand("vrmod_speccam_off") end
+		cams:ControlHelp("Step through the cameras, look through the one you're aiming at, or go back to the normal desktop view.")
+		cams:NumSlider("Switch blend (seconds)", "vrmod_speccam_blend", 0, 3, 2)
+		cams:ControlHelp("0 cuts between cameras; higher flies the view across. Also used on every camera mode change, rotation and Random Shots cut. Per-camera FOV and number: context menu, right-click a camera, Edit Properties. Binds: vrmod_speccam_place / _next / _prev / _toggle / _off, vrmod_speccam_select <number>.")
+
+		local resetBtn = form:Button("Reset Desktop Rendering Defaults")
+		form:ControlHelp("Puts every Desktop Rendering setting back to its default.")
+		function resetBtn:DoClick()
+			ResetCvars({"vrmod_cheaprender", "vrmod_desktopview", "vrmod_specfov", "vrmod_specfov_mode",
+				"vrmod_specfov_smooth_ang", "vrmod_specfov_hidehead", "vrmod_specfov_showhud", "vrmod_specfov_shaders",
+				"vrmod_specfov_showsprite", "vrmod_speccam_blend", "vrmod_specfov_rate", "vrmod_specfov_scale",
+				"vrmod_specfov_vehmode", "vrmod_specfov_chase_dist", "vrmod_specfov_chase_z",
+				"vrmod_specfov_awesome", "vrmod_specfov_awesome_fov", "vrmod_specfov_awesome_sway",
+				"vrmod_specfov_awesome_shake", "vrmod_specfov_awesome_speed", "vrmod_specfov_awesome_speed_foot",
+				"vrmod_specfov_shot_min", "vrmod_specfov_shot_max", "vrmod_specfov_rotate", "vrmod_specfov_rotate_time",
+				"vrmod_specfov_rotate_checklist", "vrmod_specfov_rotate_pool"})
+			dvCombo:ChooseOptionID(tonumber(convars.vrmod_desktopview:GetDefault()))
+		end
 	end
 
 	-- ─────────────── Client > Character ───────────────
@@ -809,8 +1104,6 @@ function VRUtilOpenMenu()
 		animSection:ControlHelp("When checked, the player model stays in place without animations.")
 		animSection:CheckBox("Enable Arm Stretcher", "vrmod_armstretcher")
 		animSection:ControlHelp("Stretches arm bones to reach targets beyond the model's natural arm length.")
-		animSection:NumSlider("Body Yaw Source", "vrmod_characteryawblend", 1, 2, 1)
-		animSection:ControlHelp("1 = head direction only, 2 = arm direction only. Blend in between.")
 		local headAngleBox = vgui.Create("DCheckBoxLabel", animSection)
 		animSection:AddItem(headAngleBox)
 		headAngleBox:SetDark(true)
@@ -824,14 +1117,57 @@ function VRUtilOpenMenu()
 		animSection:ControlHelp("How much the foot trackers rotate the legs while walking. 0 = animation only, 1 = full FBT.")
 		animSection:CheckBox("FBT: Animate Shoulders", "vrmod_fbt_animshoulders")
 		animSection:ControlHelp("When checked, the walk animation also swings the shoulders during FBT.")
-		animSection:NumSlider("Sit Height", "vrmod_sitheight", 0, 60, 0)
-		animSection:ControlHelp("Head height above feet at/below which the sit animation plays. 0 disables. Default 40.")
-		animSection:NumSlider("Sit: HMD to Body Distance", "vrmod_sitheadtohmddist", 0, 20, 1)
-		animSection:ControlHelp("How far behind the HMD the body sits while sitting. Default 0.")
-		animSection:NumSlider("Prone Height", "vrmod_proneheight", 0, 60, 0)
-		animSection:ControlHelp("Head height above feet at/below which the prone animation plays. 0 disables. Default 15. Requires the [wOS] Animation Extension - Prone Mod addon; without it, sitting is used instead.")
-		animSection:NumSlider("Prone: HMD to Body Distance", "vrmod_proneheadtohmddist", 0, 40, 1)
-		animSection:ControlHelp("How far behind the HMD the body lies while prone. Default 26. Requires the [wOS] Animation Extension - Prone Mod addon.")
+		-- Hai IK (the default solver), the body yaw / lean tuning and the
+		-- sit / lie heights live out of the way.
+		local advSection = vgui.Create("DForm", animSection)
+		advSection:SetName("Advanced")
+		advSection:SetExpanded(false)
+		animSection:AddItem(advSection)
+		advSection:CheckBox("Use Hai IK (full body)", "vrmod_characterik_solver")
+		advSection:ControlHelp("On by default. Haï~'s solver: spine, head and legs follow your head, knees bend when you crouch, learned elbow placement. Applies to every VR player you see. Off = the classic solver. Falls back to classic on models without a full ValveBiped spine.")
+		advSection:NumSlider("Hai IK: Animation Blend", "vrmod_hik_animblend", 0, 1, 2)
+		advSection:ControlHelp("Lets the walk/idle animation move the head, and the shoulders and elbows a little. Calibrate Eye Height first: Hai IK stands the model at its own eye height when you stand at yours. Default 0.33.")
+		advSection:NumSlider("Hai IK: Hand Swing", "vrmod_hik_handblend", 0, 1, 2)
+		advSection:ControlHelp("How much the animation swings the hands. Only other players and your spectator view see it; in your headset the hands stay on the controllers. Default 0.1.")
+		-- Tuning sliders for the split body yaw (to be hard coded later).
+		advSection:ControlHelp("Body yaw is split: hips (legs, feet) and torso (chest, shoulders, arms). Each follows a mix of where your head and your arms point. Both 0 = that part only turns while you walk. Things that need one body yaw (holsters etc.) use the average.")
+		advSection:NumSlider("Hip Yaw: Head", "vrmod_yaw_hip_head", 0, 1, 2)
+		advSection:NumSlider("Hip Yaw: Arms", "vrmod_yaw_hip_arms", 0, 1, 2)
+		advSection:ControlHelp("Hips turn only once you're 30 degrees past them, and feet step to follow. Defaults 1 / 0.7.")
+		advSection:NumSlider("Torso Yaw: Head", "vrmod_yaw_torso_head", 0, 1, 2)
+		advSection:NumSlider("Torso Yaw: Arms", "vrmod_yaw_torso_arms", 0, 1, 2)
+		advSection:ControlHelp("The torso twists up to 60 degrees off the hips. Defaults 0.25 / 1. While walking with the stick both follow the head.")
+		advSection:NumSlider("Lean Sensitivity: Side", "vrmod_lean_sens", 0, 4, 2)
+		advSection:NumSlider("Lean Sensitivity: Forward/Back", "vrmod_lean_sens_fwd", 0, 4, 2)
+		advSection:ControlHelp("The body leans when you go down with your head tilted (side) or nodded (forward/back); the hips move the other way. Higher kicks in with less head angle. 0 turns that lean off. Defaults 3.13 / 1.28.")
+		-- A height of 0 is each pose's off switch; the box just makes it
+		-- findable. Off parks the height in a cookie, on brings it back (else the
+		-- default). The slider tracks the convar itself and drives the box, so
+		-- reset, presets and typing 0 all agree.
+		local function HeightToggle(form, label, help, name, slider, max, sliderHelp)
+			local cv = convars[name]
+			local box = form:CheckBox(label)
+			form:ControlHelp(help)
+			local sl = form:NumSlider(slider, name, 0, max, 0)
+			form:ControlHelp(sliderHelp)
+			box:SetChecked(cv:GetFloat() > 0)
+			function box:OnChange(on)
+				local v = cv:GetFloat()
+				if on then
+					if v <= 0 then cv:SetFloat(cookie.GetNumber(name, tonumber(cv:GetDefault()))) end
+				elseif v > 0 then
+					cookie.Set(name, v)
+					cv:SetFloat(0)
+				end
+			end
+			function sl:OnValueChanged(v) box:SetChecked(v > 0) end
+		end
+		HeightToggle(advSection, "Sit animation", "Plays a sit pose when you physically sit down. Off also stops sit-to-enter for vehicles.",
+			"vrmod_sitheight", "Sit Height", 60, "Head height above feet at/below which the sit animation plays. Default 31.")
+		advSection:NumSlider("Sit: HMD to Body Distance", "vrmod_sitheadtohmddist", 0, 20, 1)
+		advSection:ControlHelp("How far behind the HMD the body sits while sitting. Default 13.1.")
+		HeightToggle(advSection, "Lie down (prone / supine)", "Lying on the floor tips the whole body over, face down or face up from how your head is turned. Done by the IK, so arms and head keep tracking. No addon needed.",
+			"vrmod_lieheight", "Lie Down Height", 40, "Headset height above the floor where you are fully lying. The body starts tipping over from the bottom of your squat and follows your head down to here. Default 20.")
 
 		local calibSection = vgui.Create("DForm", t)
 		calibSection:SetName("Model Calibration")
@@ -839,22 +1175,15 @@ function VRUtilOpenMenu()
 		calibSection:DockMargin(5, 5, 5, 0)
 		calibSection:SetExpanded(true)
 		calibSection:NumSlider("Eye Height", "vrmod_charactereyeheight", 30, 100, 1)
-		calibSection:ControlHelp("Character eye height in source units. Default 66.8.")
+		calibSection:ControlHelp("Character eye height in source units. Default 67.8.")
 		calibSection:NumSlider("Head to HMD Distance", "vrmod_characterheadtohmddist", 0, 20, 1)
 		calibSection:ControlHelp("Distance from HMD to head bone. Default 6.3.")
 		local charRestoreBtn = calibSection:Button("Restore Character Defaults")
+		calibSection:ControlHelp("Puts the animation and calibration settings back to their defaults.")
 		function charRestoreBtn:DoClick()
-			RunConsoleCommand("vrmod_characterik", "1")
-			RunConsoleCommand("vrmod_armstretcher", "0")
-			RunConsoleCommand("vrmod_charactereyeheight", "66.8")
-			RunConsoleCommand("vrmod_characterheadtohmddist", "6.3")
-			RunConsoleCommand("vrmod_characteryawblend", "1.5")
-			RunConsoleCommand("vrmod_fbt_leginfluence", "1")
-			RunConsoleCommand("vrmod_fbt_animshoulders", "1")
-			RunConsoleCommand("vrmod_sitheight", "40")
-			RunConsoleCommand("vrmod_sitheadtohmddist", "0")
-			RunConsoleCommand("vrmod_proneheight", "15")
-			RunConsoleCommand("vrmod_proneheadtohmddist", "26")
+			ResetCvars({"vrmod_characterik", "vrmod_armstretcher", "vrmod_characterik_solver", "vrmod_hik_animblend", "vrmod_hik_handblend", "vrmod_charactereyeheight", "vrmod_characterheadtohmddist",
+				"vrmod_yaw_hip_head", "vrmod_yaw_hip_arms", "vrmod_yaw_torso_head", "vrmod_yaw_torso_arms", "vrmod_lean_sens", "vrmod_lean_sens_fwd", "vrmod_fbt_leginfluence", "vrmod_fbt_animshoulders", "vrmod_sitheight",
+				"vrmod_sitheadtohmddist", "vrmod_lieheight"})
 			chat.AddText(Color(100, 255, 100), "[VR Character] ", Color(255, 255, 255), "Settings reset to defaults!")
 		end
 
@@ -892,6 +1221,7 @@ function VRUtilOpenMenu()
 			RefreshStatus()
 		end
 		local clearBtn = presetForm:Button("Clear preset for current model")
+		presetForm:ControlHelp("Deletes the saved calibration for the model you're wearing and resets it.")
 		function clearBtn:DoClick()
 			if not presets or not presets.GetCurrentModel then return end
 			local model = presets.GetCurrentModel()
@@ -903,6 +1233,7 @@ function VRUtilOpenMenu()
 			end)
 		end
 		local clearAllBtn = presetForm:Button("Clear ALL saved presets")
+		presetForm:ControlHelp("Deletes every saved per-model calibration.")
 		function clearAllBtn:DoClick()
 			if not presets then return end
 			VRConfirm(frame, "Delete every saved per-model preset? This cannot be undone.", "Clear All Presets", function()
@@ -921,7 +1252,9 @@ function VRUtilOpenMenu()
 		boneSection:SetExpanded(true)
 		boneSection:ControlHelp("Hide individual bones on your playermodel. Saved per model.")
 		boneSection:CheckBox("Also hide bones parented under hidden bones", "vrmod_bonehider_children")
+		boneSection:ControlHelp("Hiding a bone also hides everything attached below it.")
 		local boneBtn = boneSection:Button("Open Bone Hider")
+		boneSection:ControlHelp("Opens the bone list for your current playermodel.")
 		function boneBtn:DoClick()
 			if vrmod.boneHider then vrmod.boneHider.OpenPanel() end
 		end
@@ -934,7 +1267,9 @@ function VRUtilOpenMenu()
 		scaleSection:SetExpanded(true)
 		scaleSection:ControlHelp("Scale individual bones on your playermodel. Saved per model.")
 		scaleSection:CheckBox("Also scale bones parented under scaled bones", "vrmod_bonescaler_children")
+		scaleSection:ControlHelp("Scaling a bone also scales everything attached below it.")
 		local scaleBtn = scaleSection:Button("Open Bone Scaler")
+		scaleSection:ControlHelp("Opens the bone list for your current playermodel.")
 		function scaleBtn:DoClick()
 			if vrmod.boneScaler then vrmod.boneScaler.OpenPanel() end
 		end
@@ -965,16 +1300,27 @@ function VRUtilOpenMenu()
 		settingsForm:DockMargin(5, 5, 5, 0)
 		settingsForm:SetExpanded(true)
 		settingsForm:CheckBox("Enable Holster System", "vrmod_pouch_enabled")
+		settingsForm:ControlHelp("Store weapons and props in body slots by letting go of them there; grab a slot to take them back out.")
 		settingsForm:CheckBox("Show Entity Names (world)", "vrmod_pouch_visiblename")
+		settingsForm:ControlHelp("Shows what each slot holds as floating text at the slot.")
 		settingsForm:CheckBox("Show Entity Names (hud)", "vrmod_pouch_visiblename_hud")
+		settingsForm:ControlHelp("Shows what each slot holds on your HUD.")
 		settingsForm:CheckBox("Enable Left Hand Weapon Holster", "vrmod_pouch_lefthandwep_enable")
+		settingsForm:ControlHelp("Lets the left hand store and draw weapons too, not just the right.")
+		settingsForm:CheckBox("Holsters Follow Body", "vrmod_holster_follow_body")
+		settingsForm:ControlHelp("Slots turn with your body instead of your head, so looking around doesn't swing them. Uses head direction with floating hands.")
 		settingsForm:CheckBox("Show Holstered Weapon Models", "vrmod_holster_showmodels")
+		settingsForm:ControlHelp("Draws stored weapons at their slots.")
 		settingsForm:NumSlider("Chest Holster Height Offset", "vrmod_pouch_chest_z", -30, 30, 1)
+		settingsForm:ControlHelp("Moves the chest slots up or down, in units.")
 		settingsForm:NumSlider("Prop Max Volume (0=no limit)", "vrmod_holster_prop_maxvolume", 0, 50000, 0)
 		settingsForm:ControlHelp("Props with OBB volume above this are rejected. Ragdolls bypass this limit.")
 		settingsForm:CheckBox("Allow Holstering Ragdolls", "vrmod_holster_ragdolls")
+		settingsForm:ControlHelp("Lets ragdolls be stored in a slot.")
 		settingsForm:CheckBox("Show Ragdoll Models on Holster", "vrmod_holster_ragdoll_models")
+		settingsForm:ControlHelp("Draws a stored ragdoll at its slot.")
 		settingsForm:CheckBox("Persist Holster Across Map Changes", "vrmod_holster_persist")
+		settingsForm:ControlHelp("Keeps what's in your slots when the map changes.")
 
 		local modelForm = vgui.Create("DForm", t)
 		modelForm:SetName("Holster Model")
@@ -988,19 +1334,22 @@ function VRUtilOpenMenu()
 		for s = 1, POUCH_SLOTS do
 			modelForm:CheckBox("Draw on " .. holsterPositions[s].part .. " (" .. holsterPositions[s].side .. ")", "vrmod_holster_model_slot" .. s)
 		end
+		modelForm:ControlHelp("Which slots get the model.")
 		modelForm:NumSlider("Forward offset", "vrmod_holster_model_x", -32, 32, 1)
 		modelForm:NumSlider("Sideways offset", "vrmod_holster_model_y", -32, 32, 1)
 		modelForm:NumSlider("Vertical offset", "vrmod_holster_model_z", -32, 32, 1)
+		modelForm:ControlHelp("Where the model sits relative to each slot's grip point, in units.")
 		modelForm:NumSlider("Pitch", "vrmod_holster_model_p", -180, 180, 0)
 		modelForm:NumSlider("Yaw", "vrmod_holster_model_yaw", -180, 180, 0)
-		modelForm:ControlHelp("Rotation is applied on top of your body yaw, so the holster turns with you.")
 		modelForm:NumSlider("Roll", "vrmod_holster_model_r", -180, 180, 0)
+		modelForm:ControlHelp("Rotation is applied on top of your body yaw, so the holster turns with you.")
 		local hmReset = modelForm:Button("Reset Holster Model")
+		modelForm:ControlHelp("Puts every Holster Model setting back to its default.")
 		function hmReset:DoClick()
-			RunConsoleCommand("vrmod_holster_model_enabled", "1")
-			RunConsoleCommand("vrmod_holster_model", "models/weapons/w_eq_eholster.mdl")
-			for s = 1, POUCH_SLOTS do RunConsoleCommand("vrmod_holster_model_slot" .. s, "1") end
-			for _, s in ipairs({"x", "y", "z", "p", "yaw", "r"}) do RunConsoleCommand("vrmod_holster_model_" .. s, "0") end
+			local l = {"vrmod_holster_model_enabled", "vrmod_holster_model", "vrmod_holster_model_x", "vrmod_holster_model_y",
+				"vrmod_holster_model_z", "vrmod_holster_model_p", "vrmod_holster_model_yaw", "vrmod_holster_model_r"}
+			for s = 1, POUCH_SLOTS do l[#l + 1] = "vrmod_holster_model_slot" .. s end
+			ResetCvars(l)
 		end
 
 		local sizeForm = vgui.Create("DForm", t)
@@ -1011,6 +1360,7 @@ function VRUtilOpenMenu()
 		for i = 1, POUCH_SLOTS do
 			sizeForm:NumSlider(holsterPositions[i].part .. " (" .. holsterPositions[i].side .. ")", "vrmod_pouch_size_" .. i, 1, 100, 0)
 		end
+		sizeForm:ControlHelp("How close a hand has to be to each slot to use it, in units (default 9 head, 6 chest).")
 
 		local slotForm = vgui.Create("DForm", t)
 		slotForm:SetName("Weapon Slots")
@@ -1020,6 +1370,7 @@ function VRUtilOpenMenu()
 		for i = 1, POUCH_SLOTS do
 			slotForm:TextEntry(holsterPositions[i].part .. " (" .. holsterPositions[i].side .. ")", "vrmod_pouch_weapon_" .. i)
 		end
+		slotForm:ControlHelp("Weapon class held in each slot. Filled in when you holster a weapon; clear one to empty the slot.")
 	end
 
 	-- ─────────────── Client > HUD/UI ───────────────
@@ -1027,69 +1378,47 @@ function VRUtilOpenMenu()
 		local t = vgui.Create("DScrollPanel", clientSheet)
 		clientSheet:AddSheet("HUD/UI", t, "icon16/layers.png")
 
-		local function AddSl(lbl, cv, mn, mx, dec, py)
-			local s = vgui.Create("DNumSlider", t)
-			s:SetPos(20, py)
-			s:SetSize(370, 25)
-			s:SetDark(true)
-			s:SetText(lbl)
-			s:SetMin(mn)
-			s:SetMax(mx)
-			s:SetDecimals(dec)
-			s:SetConVar(cv)
-		end
+		-- A DForm like every other tab (was hand-placed at fixed pixel
+		-- positions, with a 525px spacer holding the Arm HUD section below)
+		local PLACE_CVARS = {"vrmod_hudmode", "vrmod_hudattach", "vrmod_hudarmscale", "vrmod_hudcrt", "vrmod_hudarm_x",
+			"vrmod_hudarm_y", "vrmod_hudarm_z", "vrmod_hudarm_p", "vrmod_hudarm_yaw", "vrmod_hudarm_r"}
+		local hud = vgui.Create("DForm", t)
+		hud:SetName("HUD")
+		hud:Dock(TOP)
+		hud:DockMargin(5, 5, 5, 0)
+		hud:SetExpanded(true)
+		hud:CheckBox("Enable HUD", "vrmod_hud")
+		hud:ControlHelp("Shows the game's HUD (health, ammo and so on) on a panel in VR.")
+		hud:NumSlider("HUD Curve", "vrmod_hudcurve", -100, 100, 0)
+		hud:ControlHelp("How far the front HUD panel wraps around you. 0 = flat.")
+		hud:NumSlider("HUD Distance", "vrmod_huddistance", 1, 100, 0)
+		hud:ControlHelp("How far in front of you the front HUD floats.")
+		hud:NumSlider("HUD Scale", "vrmod_hudscale", 0.01, 0.1, 2)
+		hud:ControlHelp("Size of the front HUD panel.")
+		hud:NumSlider("HUD Transparency", "vrmod_hudtestalpha", 0, 255, 0)
+		hud:ControlHelp("Darkness of the backing behind the HUD. 0 = no backing.")
+		hud:CheckBox("HUD only while pressing menu key", "vrmod_hud_visible_quickmenukey")
+		hud:ControlHelp("Keeps the HUD hidden until you hold the quick menu button.")
+		hud:CheckBox("[Menu & UI Red Outline]", "vrmod_ui_outline")
+		hud:ControlHelp("Outlines every VR menu and UI panel in red, to see where their edges are.")
 
-		local cY = 10
-		local cb = t:Add("DCheckBoxLabel")
-		cb:SetPos(20, cY)
-		cb:SetDark(true)
-		cb:SetText("Enable HUD")
-		cb:SetConVar("vrmod_hud")
-		cb:SizeToContents()
-		AddSl("HUD Curve", "vrmod_hudcurve", -100, 100, 0, 30)
-		AddSl("HUD Distance", "vrmod_huddistance", 1, 100, 0, 55)
-		AddSl("HUD Scale", "vrmod_hudscale", 0.01, 0.1, 2, 80)
-		AddSl("HUD Transparency", "vrmod_hudtestalpha", 0, 255, 0, 105)
-		cY = 135
-		local cb2 = t:Add("DCheckBoxLabel")
-		cb2:SetPos(20, cY)
-		cb2:SetDark(true)
-		cb2:SetText("HUD only while pressing menu key")
-		cb2:SetConVar("vrmod_hud_visible_quickmenukey")
-		cb2:SizeToContents()
-		cY = 165
-		local cb3 = t:Add("DCheckBoxLabel")
-		cb3:SetPos(20, cY)
-		cb3:SetDark(true)
-		cb3:SetText("[Menu & UI Red Outline]")
-		cb3:SetConVar("vrmod_ui_outline")
-		cb3:SizeToContents()
-
-		-- Font selector
-		local fontLabel = t:Add("DLabel")
-		fontLabel:SetPos(20, 185)
-		fontLabel:SetDark(true)
-		fontLabel:SetText("Weapon Menu Font")
-		fontLabel:SizeToContents()
-		local fontDropdown = vgui.Create("DComboBox", t)
-		fontDropdown:SetPos(160, 185)
-		fontDropdown:SetSize(200, 20)
+		local fontDropdown = hud:ComboBox("Weapon Menu Font")
 		local hudFonts = {"Trebuchet MS", "Arial", "Verdana", "Tahoma", "Roboto", "Courier New", "Impact"}
-		for _, f in ipairs(hudFonts) do fontDropdown:AddChoice(f) end
+		for _, fnt in ipairs(hudFonts) do fontDropdown:AddChoice(fnt) end
 		fontDropdown:SetValue(GetConVar("vrmod_hud_font") and GetConVar("vrmod_hud_font"):GetString() or "Trebuchet MS")
 		fontDropdown.OnSelect = function(_, _, val) RunConsoleCommand("vrmod_hud_font", val) end
+		hud:ControlHelp("Font used by the weapon selection menu.")
 
 		-- Color selector
-		local modeDropdown = vgui.Create("DComboBox", t)
-		modeDropdown:SetPos(20, 210)
-		modeDropdown:SetSize(200, 30)
+		local modeDropdown = hud:ComboBox("Color")
 		modeDropdown:SetValue("Beam Color")
 		modeDropdown:AddChoice("Beam Color")
 		modeDropdown:AddChoice("Laser Color")
 		modeDropdown:AddChoice("HUD Color")
-		local mixer = vgui.Create("DColorMixer", t)
-		mixer:SetPos(20, 245)
-		mixer:SetSize(360, 200)
+		hud:ControlHelp("Which colour the picker edits. Beam: the menu pointer beam. Laser: the weapon laser pointer. HUD: the weapon menu.")
+		local mixer = vgui.Create("DColorMixer")
+		hud:AddItem(mixer)
+		mixer:SetTall(200)
 		mixer:SetPalette(true)
 		mixer:SetAlphaBar(true)
 		mixer:SetWangs(true)
@@ -1114,13 +1443,10 @@ function VRUtilOpenMenu()
 			RunConsoleCommand(cvarName, string.format("%d,%d,%d,%d", col.r, col.g, col.b, col.a))
 		end
 
-		local btn2 = vgui.Create("DButton", t)
-		btn2:SetText("Set Defaults")
-		btn2:SetPos(190, 475)
-		btn2:SetSize(160, 30)
+		local btn2 = hud:Button("Set Defaults")
+		hud:ControlHelp("Puts every HUD and HUD Placement setting, and the three colours, back to default.")
 		btn2.DoClick = function()
 			RunConsoleCommand("vrmod_hud", "1")
-			RunConsoleCommand("vrmod_hudmode", "0")
 			RunConsoleCommand("vrmod_hudcurve", "60")
 			RunConsoleCommand("vrmod_huddistance", "60")
 			RunConsoleCommand("vrmod_hudscale", "0.05")
@@ -1131,109 +1457,67 @@ function VRUtilOpenMenu()
 			RunConsoleCommand("vrmod_laser_color", "255,0,0,255")
 			RunConsoleCommand("vrmod_hud_color", "255,250,0,255")
 			RunConsoleCommand("vrmod_hud_font", "Trebuchet MS")
-			RunConsoleCommand("vrmod_hudattach", "0")
-			RunConsoleCommand("vrmod_hudarmscale", "0.05")
-			RunConsoleCommand("vrmod_hudcrt", "0.15")
-			RunConsoleCommand("vrmod_hudarm_x", "5")
-			RunConsoleCommand("vrmod_hudarm_y", "-3")
-			RunConsoleCommand("vrmod_hudarm_z", "1")
-			RunConsoleCommand("vrmod_hudarm_p", "0")
-			RunConsoleCommand("vrmod_hudarm_yaw", "180")
-			RunConsoleCommand("vrmod_hudarm_r", "90")
+			ResetCvars(PLACE_CVARS)
 		end
 
-		-- Arm HUD Section
-		local armSpacer = vgui.Create("DPanel", t)
-		armSpacer:Dock(TOP)
-		armSpacer:SetTall(525)
-		armSpacer.Paint = nil
-		armSpacer:SetMouseInputEnabled(false)
 
 		local armSection = vgui.Create("DForm", t)
-		armSection:SetName("Arm HUD")
+		armSection:SetName("HUD Placement")
 		armSection:Dock(TOP)
 		armSection:DockMargin(5, 5, 5, 5)
 		armSection:SetExpanded(true)
 
+		-- Rows only Arm modes use, hidden in Front mode (UpdateArmControlsVisibility)
+		local armRows = {}
+		local function Arm(p) armRows[#armRows + 1] = p:GetParent() end
 		local hudModeCombo = armSection:ComboBox("HUD Placement", "vrmod_hudmode")
-		hudModeCombo:AddChoice("Front (default)", "0")
+		hudModeCombo:AddChoice("Front", "0")
 		hudModeCombo:AddChoice("Left Arm", "1")
-		hudModeCombo:AddChoice("Right Arm", "2")
-		local curMode = GetConVar("vrmod_hudmode")
-		local curModeVal = curMode and curMode:GetString() or "0"
-		if curModeVal == "1" then hudModeCombo:ChooseOptionID(2)
-		elseif curModeVal == "2" then hudModeCombo:ChooseOptionID(3)
-		else hudModeCombo:ChooseOptionID(1) end
+		hudModeCombo:AddChoice("Right Arm (default)", "2")
+		armSection:ControlHelp("Front floats the HUD ahead of you. Left or Right Arm puts it on that forearm, like a watch.")
 
 		local hudAttachCombo = armSection:ComboBox("Attach To", "vrmod_hudattach")
+		Arm(hudAttachCombo)
 		hudAttachCombo:AddChoice("Forearm (bone)", "0")
 		hudAttachCombo:AddChoice("Hand (controller)", "1")
-		local curAttach = GetConVar("vrmod_hudattach")
-		local curAttachVal = curAttach and curAttach:GetString() or "0"
-		if curAttachVal == "1" then hudAttachCombo:ChooseOptionID(2)
-		else hudAttachCombo:ChooseOptionID(1) end
-		armSection:ControlHelp("Forearm tracks the player model's arm bone. Hand tracks the VR controller directly.")
-		armSection:NumSlider("Arm HUD Scale", "vrmod_hudarmscale", 0.01, 0.15, 4)
-		armSection:NumSlider("CRT Distortion", "vrmod_hudcrt", 0, 0.5, 2)
-		armSection:ControlHelp("Barrel distortion for arm HUD. 0 = flat.")
-		armSection:NumSlider("Offset X (along arm)", "vrmod_hudarm_x", -20, 20, 2)
-		armSection:NumSlider("Offset Y (left/right)", "vrmod_hudarm_y", -20, 20, 2)
-		armSection:NumSlider("Offset Z (up/down)", "vrmod_hudarm_z", -20, 20, 2)
-		armSection:NumSlider("Pitch", "vrmod_hudarm_p", -180, 180, 1)
-		armSection:NumSlider("Yaw", "vrmod_hudarm_yaw", -180, 180, 1)
-		armSection:NumSlider("Roll", "vrmod_hudarm_r", -180, 180, 1)
-		local interactCombo = armSection:ComboBox("Interactive Button", "vrmod_hudinteract")
-		interactCombo:AddChoice("Reload", "0")
-		interactCombo:AddChoice("Quick Menu", "1")
-		interactCombo:AddChoice("Disabled", "2")
-		local curInteract = GetConVar("vrmod_hudinteract")
-		local curInteractVal = curInteract and curInteract:GetString() or "0"
-		if curInteractVal == "1" then interactCombo:ChooseOptionID(2)
-		elseif curInteractVal == "2" then interactCombo:ChooseOptionID(3)
-		else interactCombo:ChooseOptionID(1) end
-		armSection:ControlHelp("Hold this button to activate the HUD pointer. Set to Disabled to turn off.")
-		local armRestoreBtn = armSection:Button("Restore Arm HUD Defaults")
-		function armRestoreBtn:DoClick()
-			RunConsoleCommand("vrmod_hudmode", "0")
-			RunConsoleCommand("vrmod_hudattach", "0")
-			RunConsoleCommand("vrmod_hudarmscale", "0.05")
-			RunConsoleCommand("vrmod_hudcrt", "0.15")
-			RunConsoleCommand("vrmod_hudarm_x", "5")
-			RunConsoleCommand("vrmod_hudarm_y", "-3")
-			RunConsoleCommand("vrmod_hudarm_z", "1")
-			RunConsoleCommand("vrmod_hudarm_p", "0")
-			RunConsoleCommand("vrmod_hudarm_yaw", "180")
-			RunConsoleCommand("vrmod_hudarm_r", "90")
-			RunConsoleCommand("vrmod_hudinteract", "0")
-		end
+		Arm(armSection:ControlHelp("Forearm tracks the player model's arm bone. Hand tracks the VR controller directly."))
+		Arm(armSection:NumSlider("Arm HUD Scale", "vrmod_hudarmscale", 0.01, 0.15, 4))
+		Arm(armSection:ControlHelp("Size of the arm HUD."))
+		Arm(armSection:NumSlider("CRT Distortion", "vrmod_hudcrt", 0, 0.5, 2))
+		Arm(armSection:ControlHelp("Barrel distortion for arm HUD. 0 = flat."))
+		Arm(armSection:NumSlider("Offset X (along arm)", "vrmod_hudarm_x", -20, 20, 2))
+		Arm(armSection:NumSlider("Offset Y (left/right)", "vrmod_hudarm_y", -20, 20, 2))
+		Arm(armSection:NumSlider("Offset Z (up/down)", "vrmod_hudarm_z", -20, 20, 2))
+		Arm(armSection:ControlHelp("Where the arm HUD sits on the arm, in units."))
+		Arm(armSection:NumSlider("Pitch", "vrmod_hudarm_p", -180, 180, 1))
+		Arm(armSection:NumSlider("Yaw", "vrmod_hudarm_yaw", -180, 180, 1))
+		Arm(armSection:NumSlider("Roll", "vrmod_hudarm_r", -180, 180, 1))
+		Arm(armSection:ControlHelp("Rotation of the arm HUD, in degrees."))
+		local armRestoreBtn = armSection:Button("Restore HUD Placement Defaults")
+		armSection:ControlHelp("Puts every HUD Placement setting back to its default.")
 
-		-- Show/hide arm-specific controls based on mode
-		local armSpecificItems = {}
-		local function GatherArmItems()
-			table.Empty(armSpecificItems)
-			local children = armSection:GetChildren()
-			local editableItems = {}
-			for _, child in ipairs(children) do
-				if child:GetClassName() == "EditablePanel" or child:GetClassName() == "DPanel" then
-					editableItems[#editableItems + 1] = child
-				end
-			end
-			local hideEnd = #editableItems - 3
-			for i = 2, hideEnd do
-				if editableItems[i] then armSpecificItems[#armSpecificItems + 1] = editableItems[i] end
-			end
-		end
+		-- Show/hide arm-specific rows based on mode. A description row also
+		-- needs descriptions on; vrHidden keeps ShowHelp from re-showing it.
 		local function UpdateArmControlsVisibility()
-			if #armSpecificItems == 0 then GatherArmItems() end
 			local modeCV = GetConVar("vrmod_hudmode")
 			local m = modeCV and modeCV:GetInt() or 0
 			local isArm = (m == 1 or m == 2)
-			for _, item in ipairs(armSpecificItems) do item:SetVisible(isArm) end
+			local help = cv_help:GetBool()
+			for _, row in ipairs(armRows) do
+				if IsValid(row) then
+					row.vrHidden = not isArm
+					row:SetVisible(isArm and (help or not row.vrHelp))
+				end
+			end
 			armSection:InvalidateLayout(true)
 			t:InvalidateLayout(true)
 		end
 		hudModeCombo.OnSelect = function(self, idx, val, data)
 			RunConsoleCommand("vrmod_hudmode", data)
+			timer.Simple(0.05, UpdateArmControlsVisibility)
+		end
+		function armRestoreBtn:DoClick()
+			ResetCvars(PLACE_CVARS)
 			timer.Simple(0.05, UpdateArmControlsVisibility)
 		end
 		timer.Simple(0.1, UpdateArmControlsVisibility)
@@ -1254,19 +1538,29 @@ function VRUtilOpenMenu()
 		form:CheckBox("Weapon menu equips to left hand", "vrmod_weaponmenu_lefthand")
 		form:ControlHelp("Off = right hand (default). A grip press after the menu closes still picks the hand.")
 		form:CheckBox("Disable Pickup", "vr_pickup_disable_client")
-		form:CheckBox("Enable wall collisions", "vrmod_collisions")
+		form:ControlHelp("Turns off grabbing things with your hands.")
 		form:CheckBox("Drop weapon on grip release", "vrmod_weapondrop_enable")
+		form:ControlHelp("Letting go of the grip drops the weapon you're holding.")
 		form:NumSlider("Grip release threshold %", "vrmod_weapondrop_release", 5, 90, 0)
 		form:ControlHelp("Weapon drops when grip squeeze falls below this percent. Lower = must let go more fully before it drops")
 		form:CheckBox("Manual item pickup", "vrmod_manualpickups")
+		form:ControlHelp("Weapons and items on the floor aren't collected by walking over them; pick them up with your hands.")
 		form:CheckBox("Interactive buttons", "vrmod_interactive_buttons")
+		form:ControlHelp("Map buttons, chargers and ammo crates are pressed by grabbing them.")
 		form:CheckBox("Replace weapons with ArcVR on pickup", "vrmod_weapon_swap")
+		form:ControlHelp("Weapons you pick up are swapped for their ArcVR versions, where one exists.")
 		form:CheckBox("Show Pickup halos", "vrmod_pickup_halos")
+		form:ControlHelp("Outlines what each hand would grab: orange for the left, cyan for the right.")
 		form:CheckBox("Disable forced crouch jump", "vrmod_nocrouchjump")
+		form:ControlHelp("The jump button only jumps. Off, it also crouches mid-air, which clears higher ledges.")
 		form:CheckBox("Ragdoll death", "vrmod_deathcam_ragdoll")
+		form:ControlHelp("When you die, your view rides your ragdoll's head. Can cause motion sickness.")
 		form:CheckBox("Ragdoll death follows rotation of head", "vrmod_deathcam_ragdoll_view")
+		form:ControlHelp("Also turns your view with the ragdoll's head. Needs Ragdoll death.")
 		form:CheckBox("Teleportation", "vrmod_allow_teleport_client")
+		form:ControlHelp("Use the teleport button to teleport, where the server allows it.")
 		form:CheckBox("Use Left hand for Teleportation", "vrmod_teleport_use_left")
+		form:ControlHelp("Aim teleports with the left hand instead of the right.")
 
 		-- Weapon menu style
 		local wmCombo = form:ComboBox("Weapon menu style", "vrmod_weaponmenu_style")
@@ -1274,6 +1568,7 @@ function VRUtilOpenMenu()
 		wmCombo:AddChoice("Legacy HL2 Grid", "1")
 		local wmVal = GetConVar("vrmod_weaponmenu_style")
 		wmCombo:ChooseOptionID((wmVal and wmVal:GetInt() or 0) + 1)
+		form:ControlHelp("Radial Wheel picks a weapon by pointing at it. Legacy HL2 Grid uses HL2's slot layout.")
 
 		-- Menu hand
 		if not ConVarExists("vrmod_menu_hand") then CreateClientConVar("vrmod_menu_hand", "0", true, false, "Which hand menus spawn on", 0, 1) end
@@ -1281,12 +1576,7 @@ function VRUtilOpenMenu()
 		mhCombo:AddChoice("Right Hand", "0")
 		mhCombo:AddChoice("Left Hand", "1")
 		mhCombo:ChooseOptionID((GetConVar("vrmod_menu_hand"):GetInt() or 0) + 1)
-
-		-- Pointer hand
-		local phCombo = form:ComboBox("Pointer hand", "vrmod_pointer_hand")
-		phCombo:AddChoice("Right Hand", "0")
-		phCombo:AddChoice("Left Hand", "1")
-		phCombo:ChooseOptionID((GetConVar("vrmod_pointer_hand"):GetInt() or 0) + 1)
+		form:ControlHelp("Which hand the quick menu and weapon menu open on.")
 
 		-- Flashlight
 		if not ConVarExists("vrmod_flashlight_attachment") then CreateClientConVar("vrmod_flashlight_attachment", "0", true, false, "Flashlight source: 0=Right Hand, 1=Left Hand, 2=Head") end
@@ -1297,6 +1587,7 @@ function VRUtilOpenMenu()
 		flCombo:AddChoice("Head", "2")
 		local flCV = GetConVar("vrmod_flashlight_attachment")
 		flCombo:ChooseOptionID((flCV and flCV:GetInt() or 0) + 1)
+		form:ControlHelp("Where the flashlight shines from.")
 
 		-- Two-handed grip aim (foregrip.lua)
 		form:NumSlider("Foregrip aim smoothing", "vrmod_foregrip_smooth", 0, 30, 0)
@@ -1306,27 +1597,47 @@ function VRUtilOpenMenu()
 		form:NumSlider("Stock engage distance", "vrmod_foregrip_stock_dist", 4, 20, 0)
 		form:ControlHelp("How close the gun hand must be to the shoulder to engage the stock")
 
+		-- The fixer adds its own top-level tab (VRMod_Menu); jump to it. The
+		-- standalone window is the fallback if that tab never got built.
 		local adjustBtn = form:Button("Weapon Fixer")
-		function adjustBtn:DoClick() frame:Close() RunConsoleCommand("vrmod_weaponfix_menu") end
+		function adjustBtn:DoClick()
+			local tab = frame.WeaponFixTab
+			if IsValid(tab) then topSheet:SetActiveTab(tab) return end
+			frame:Close()
+			RunConsoleCommand("vrmod_weaponfix_menu")
+		end
+		form:ControlHelp("Goes to the Weapon Fixer tab: per-weapon grip offsets, hand pose, animations, worldmodel mode and manual reload setup.")
 
 		local resetBtn = form:Button("Reset Client Gameplay Defaults")
+		form:ControlHelp("Puts every Client Gameplay setting back to its default.")
 		function resetBtn:DoClick()
-			RunConsoleCommand("vrmod_allow_teleport_client", "0")
-			RunConsoleCommand("vr_pickup_disable_client", "0")
-			RunConsoleCommand("vrmod_weapondrop_enable", "1")
-			RunConsoleCommand("vrmod_weapondrop_release", "40")
-			RunConsoleCommand("vrmod_manualpickups", "1")
-			RunConsoleCommand("vrmod_interactive_buttons", "1")
-			RunConsoleCommand("vrmod_weapon_swap", "1")
-			RunConsoleCommand("vrmod_pickup_halos", "1")
-			RunConsoleCommand("vrmod_collisions", "1")
-			RunConsoleCommand("vrmod_weaponmenu_style", "0")
-			RunConsoleCommand("vrmod_foregrip_smooth", "0")
-			RunConsoleCommand("vrmod_foregrip_stock", "0")
-			RunConsoleCommand("vrmod_foregrip_stock_dist", "10")
-			RunConsoleCommand("vrmod_menu_hand", "0")
-			RunConsoleCommand("vrmod_pointer_hand", "0")
+			ResetCvars({"vrmod_allow_teleport_client", "vr_pickup_disable_client", "vrmod_weapondrop_enable",
+				"vrmod_weapondrop_release", "vrmod_manualpickups", "vrmod_interactive_buttons", "vrmod_weapon_swap",
+				"vrmod_pickup_halos", "vrmod_weaponmenu_style", "vrmod_foregrip_smooth",
+				"vrmod_foregrip_stock", "vrmod_foregrip_stock_dist", "vrmod_menu_hand"})
 		end
+	end
+
+	-- ─────────────── Client > Collisions ───────────────
+	do
+		local t = vgui.Create("DScrollPanel", clientSheet)
+		clientSheet:AddSheet("Collisions", t, "icon16/brick.png")
+		local form = vgui.Create("DForm", t)
+		form:SetName("Hand & Weapon Collisions")
+		form:Dock(TOP)
+		form:DockMargin(5, 5, 5, 0)
+		form:SetExpanded(true)
+		form:CheckBox("Enable wall collisions", "vrmod_collisions")
+		form:ControlHelp("Hands and weapons stop at walls, floors and bodies instead of passing through. A gun pressed into a wall bends its barrel off it.")
+		form:NumSlider("Rounded edges", "vrmod_collision_round", 0, 8, 1)
+		form:ControlHelp("Rounds map brush edges for hands and barrels, so they slide and turn smoothly over a corner instead of snapping face to face. Radius in units; 0 = sharp edges.")
+		form:NumSlider("Muzzle wall clearance", "vrmod_gunwall_clearance", 0, 8, 1)
+		form:ControlHelp("Gap kept between the muzzle and a wall when the barrel bends off it, in units.")
+		form:CheckBox("Predict stops on heavy props", "vrmod_hull_predict")
+		form:ControlHelp("A hand or weapon stops on a prop too heavy to push the moment it touches it, instead of a network round trip later. Needs hand physics on the server.")
+		local resetBtn = form:Button("Reset Collision Defaults")
+		form:ControlHelp("Puts every setting in this section back to its default.")
+		function resetBtn:DoClick() ResetCvars({"vrmod_collisions", "vrmod_collision_round", "vrmod_gunwall_clearance", "vrmod_hull_predict"}) end
 	end
 
 	-- ─────────────── Client > Melee ───────────────
@@ -1339,8 +1650,11 @@ function VRUtilOpenMenu()
 		form:DockMargin(5, 5, 5, 0)
 		form:SetExpanded(true)
 		form:CheckBox("Enable melee", "cl_vrmod_melee")
+		form:ControlHelp("Punches and hand swings deal damage. The server has to allow melee too.")
 		form:CheckBox("Enable kicking", "cl_vrmod_kick")
+		form:ControlHelp("Kicks with full-body foot trackers deal damage. The server has to allow kicking too.")
 		form:CheckBox("Enable headbutting", "cl_vrmod_headbutt")
+		form:ControlHelp("Headbutts deal damage. The server has to allow headbutting too.")
 	end
 
 	-- ─────────────── Client > Vehicles ───────────────
@@ -1348,37 +1662,64 @@ function VRUtilOpenMenu()
 		local t = vgui.Create("DScrollPanel", clientSheet)
 		clientSheet:AddSheet("Vehicles", t, "icon16/car.png")
 		local form = vgui.Create("DForm", t)
-		form:SetName("Motion Driving")
+		form:SetName("Steering Wheel")
 		form:Dock(TOP)
 		form:DockMargin(5, 5, 5, 0)
 		form:SetExpanded(true)
-		form:NumSlider("Pitch Sensitivity", "vrmod_sens_pitch", 0, 5, 2)
-		form:NumSlider("Pitch Smooth", "vrmod_sens_pitch_smooth", 0, 1, 2)
-		form:NumSlider("Yaw Sensitivity", "vrmod_sens_yaw", 0, 5, 2)
-		form:NumSlider("Yaw Smooth", "vrmod_sens_yaw_smooth", 0, 1, 2)
-		form:NumSlider("Roll Sensitivity", "vrmod_sens_roll", 0, 5, 2)
-		form:NumSlider("Roll Smooth", "vrmod_sens_roll_smooth", 0, 1, 2)
-		form:NumSlider("Car Steering Sensitivity", "vrmod_sens_steer_car", 0, 5, 2)
-		form:NumSlider("Car Steering Smooth", "vrmod_sens_steer_car_smooth", 0, 1, 2)
-		form:NumSlider("Car Rotation Range", "vrmod_rot_range_car", 0, 1080, 0)
-		form:NumSlider("Motorcycle Steering Sensitivity", "vrmod_sens_steer_motorcycle", 0, 5, 2)
-		form:NumSlider("Motorcycle Steering Smooth", "vrmod_sens_steer_motorcycle_smooth", 0, 1, 2)
-		form:NumSlider("Motorcycle Rotation Range", "vrmod_rot_range_motorcycle", 0, 1080, 0)
+		form:CheckBox("Enable steering wheel", "vrmod_wheel")
+		form:ControlHelp("Squeeze a grip on the rim to take hold, then turn it to steer. Uses the vehicle's own steering wheel or handlebars when its model has one. Pushing the steer stick takes over once you let go.")
+		form:CheckBox("Virtual wheel when there is none", "vrmod_wheel_virtual")
+		form:ControlHelp("Vehicles without a steering wheel get one drawn in front of you. Plain seats never do.")
+		form:CheckBox("Hands rest on the wheel", "vrmod_wheel_autohands")
+		form:ControlHelp("For driving with the stick or a physical (force feedback) wheel: a hand touching the rim, or behind the wheel, grips it and turns with it. The hands never steer.")
+		form:CheckBox("Driving animation hands", "vrmod_wheel_animhands")
+		form:ControlHelp("A hand at the wheel (touching the rim, or behind and below it, as above) goes where your playermodel's driving animation puts it, as in normal GMod. Move it away and it's yours again. The hands never steer. Overrides the option above.")
+		form:CheckBox("Always show the wheel ring", "vrmod_wheel_show")
+		form:ControlHelp("Draws the grab ring on real wheels too, to check it lines up.")
+		form:NumSlider("Wheel Radius", "vrmod_wheel_radius", 3, 20, 1)
+		form:NumSlider("Wheel Lock", "vrmod_wheel_lock", 30, 450, 0)
+		form:ControlHelp("Rim radius in units, and how far the wheel turns from centre to full lock, in degrees.")
+		form:NumSlider("Handlebar Radius", "vrmod_wheel_bar_radius", 4, 24, 1)
+		form:NumSlider("Handlebar Lock", "vrmod_wheel_bar_lock", 10, 90, 0)
+		form:ControlHelp("The same for motorcycle handlebars: half their width, and their turn to full lock.")
+		local calBtn = form:Button("Calibrate This Vehicle")
+		form:ControlHelp("Seated as the driver: hold the rim at 9 and 3 o'clock and squeeze both grips for a second. Saved per vehicle model, and used over its own wheel or the virtual one. Press again to cancel.")
+		function calBtn:DoClick() RunConsoleCommand("vrmod_wheel_calibrate") end
+		local forgetBtn = form:Button("Forget This Vehicle's Calibration")
+		function forgetBtn:DoClick() RunConsoleCommand("vrmod_wheel_calibrate", "reset") end
 		local resetBtn = form:Button("Reset Defaults")
-		function resetBtn:DoClick()
-			RunConsoleCommand("vrmod_sens_pitch", "1.5")
-			RunConsoleCommand("vrmod_sens_pitch_smooth", "0.1")
-			RunConsoleCommand("vrmod_sens_yaw", "1.25")
-			RunConsoleCommand("vrmod_sens_yaw_smooth", "0.1")
-			RunConsoleCommand("vrmod_sens_roll", "0.15")
-			RunConsoleCommand("vrmod_sens_roll_smooth", "0.1")
-			RunConsoleCommand("vrmod_sens_steer_car", "0.75")
-			RunConsoleCommand("vrmod_sens_steer_car_smooth", "0.154")
-			RunConsoleCommand("vrmod_rot_range_car", "900")
-			RunConsoleCommand("vrmod_sens_steer_motorcycle", "0.30")
-			RunConsoleCommand("vrmod_sens_steer_motorcycle_smooth", "0.15")
-			RunConsoleCommand("vrmod_rot_range_motorcycle", "360")
-		end
+		form:ControlHelp("Puts every steering wheel setting back to its default.")
+		function resetBtn:DoClick() ResetCvars({"vrmod_wheel", "vrmod_wheel_virtual", "vrmod_wheel_show", "vrmod_wheel_radius", "vrmod_wheel_lock", "vrmod_wheel_bar_radius", "vrmod_wheel_bar_lock", "vrmod_wheel_autohands", "vrmod_wheel_animhands"}) end
+
+		local seat = vgui.Create("DForm", t)
+		seat:SetName("Seat")
+		seat:Dock(TOP)
+		seat:DockMargin(5, 5, 5, 0)
+		seat:SetExpanded(true)
+		seat:NumSlider("Forward", "vrmod_seat_x", -40, 40, 1)
+		seat:NumSlider("Left", "vrmod_seat_y", -40, 40, 1)
+		seat:NumSlider("Up", "vrmod_seat_z", -40, 40, 1)
+		seat:ControlHelp("Where your head sits in every vehicle, in units from the seat's eye position.")
+		local adjBtn = seat:Button("Adjust Seat In Headset")
+		seat:ControlHelp("While seated: left stick moves you forward, back and sideways, right stick up and down. Press again (or get out) to save. Also in the quick menu.")
+		function adjBtn:DoClick() RunConsoleCommand("vrmod_seat_adjust") end
+		local fwdBtn = seat:Button("Reset Forward")
+		seat:ControlHelp("Puts your head back at the seat, facing forward. Bindable as vrmod_reset_forward; addons can call vrmod.ResetForward() or hook.Run(\"VRMod_ResetForward\").")
+		function fwdBtn:DoClick() RunConsoleCommand("vrmod_reset_forward") end
+		local seatReset = seat:Button("Reset Defaults")
+		function seatReset:DoClick() ResetCvars({"vrmod_seat_x", "vrmod_seat_y", "vrmod_seat_z"}) end
+
+		local aim = vgui.Create("DForm", t)
+		aim:SetName("Aim Steering")
+		aim:Dock(TOP)
+		aim:DockMargin(5, 5, 5, 0)
+		aim:SetExpanded(true)
+		aim:CheckBox("Steer by aiming your right hand", "vrmod_vehicle_aimsteer")
+		aim:ControlHelp("Halo-style: point where you want to go and the vehicle turns its nose toward it, flipping automatically while reversing. Pushing the steer stick takes over. Ground vehicles only; off while gripping a wheel or pointing at a menu.")
+		aim:NumSlider("Full Lock Angle", "vrmod_vehicle_aimsteer_range", 5, 90, 0)
+		aim:ControlHelp("How far off the nose you aim before steering hits full lock. Lower = twitchier.")
+		aim:NumSlider("Deadzone", "vrmod_vehicle_aimsteer_deadzone", 0, 20, 0)
+		aim:ControlHelp("Aim angle around the nose that drives straight.")
 
 		local entry = vgui.Create("DForm", t)
 		entry:SetName("Getting In and Out")
@@ -1394,13 +1735,11 @@ function VRUtilOpenMenu()
 		entry:CheckBox("Sit down to get in", "vrmod_vehicle_sitenter")
 		entry:ControlHelp("Physically sitting while stood on top of a seat puts you in it. Uses the Sit Height set under Character, and is skipped entirely while seated offset is on.")
 		entry:CheckBox("Stand up to get out", "vrmod_vehicle_sitexit")
+		entry:ControlHelp("Physically standing up gets you out of a seat.")
 		local entryReset = entry:Button("Reset Defaults")
+		entry:ControlHelp("Puts every Getting In and Out setting back to its default.")
 		function entryReset:DoClick()
-			RunConsoleCommand("vrmod_vehicle_gripenter", "1")
-			RunConsoleCommand("vrmod_vehicle_gripamount", "75")
-			RunConsoleCommand("vrmod_vehicle_gripdist", "20")
-			RunConsoleCommand("vrmod_vehicle_sitenter", "1")
-			RunConsoleCommand("vrmod_vehicle_sitexit", "1")
+			ResetCvars({"vrmod_vehicle_gripenter", "vrmod_vehicle_gripamount", "vrmod_vehicle_gripdist", "vrmod_vehicle_sitenter", "vrmod_vehicle_sitexit"})
 		end
 	end
 
@@ -1413,6 +1752,7 @@ function VRUtilOpenMenu()
 		f:Dock(TOP)
 		f:DockMargin(5, 5, 5, 0)
 		f:CheckBox("Enable climbing", "vrmod_brushclimb")
+		f:ControlHelp("Grab walls and other map surfaces to climb them. The server has to allow climbing.")
 		f:CheckBox("Require grip + trigger", "vrmod_brushclimb_requireboth")
 		f:ControlHelp("Both grip and trigger must be held on a hand to grab walls")
 		f:CheckBox("Block floor grabs", "vrmod_brushclimb_nofloor")
@@ -1428,7 +1768,9 @@ function VRUtilOpenMenu()
 		f:NumSlider("Ledge reach", "vrmod_brushclimb_ledgereach", 8, 96, 0)
 		f:ControlHelp("Max height above hand to detect ledge (lower = stricter)")
 		f:CheckBox("Enable ledge vaulting", "vrmod_brushclimb_ledge")
+		f:ControlHelp("Pulling yourself up past a ledge vaults you on top of it.")
 		f:CheckBox("Show landing marker", "vrmod_brushclimb_marker")
+		f:ControlHelp("Shows where a vault would put you.")
 		f:NumSlider("Vault scan range", "vrmod_brushclimb_vaultreach", 16, 128, 0)
 		f:ControlHelp("How far ahead to search for vault targets")
 		f:NumSlider("Vault min distance", "vrmod_brushclimb_vaultmin", 8, 64, 0)
@@ -1440,6 +1782,7 @@ function VRUtilOpenMenu()
 		f:NumSlider("Climb smoothing", "vrmod_brushclimb_smooth", 0, 0.9, 2)
 		f:ControlHelp("0 = exact 1:1 motion; higher softens hand motion but adds lag")
 		f:Button("Reset climbing settings", "vrmod_brushclimb_reset")
+		f:ControlHelp("Puts every climbing setting back to its default.")
 	end
 
 	-- ─────────────── Client > Face Tracking ───────────────
@@ -1452,109 +1795,180 @@ function VRUtilOpenMenu()
 		form:DockMargin(5, 5, 5, 0)
 		form:SetExpanded(true)
 		form:CheckBox("Enable Face Tracking", "ft_enabled")
+		form:ControlHelp("Drives your playermodel's face from a face tracker, through VRCFaceTracking over OSC.")
+		form:CheckBox("Eye Gaze (headset eye tracking)", "ft_gaze")
+		form:ControlHelp("Moves your playermodel's eyes from headset eye tracking (OpenXR, else OSC).")
+		form:CheckBox("Eyes Only (gaze, leave other flexes alone)", "ft_eyesonly")
+		form:ControlHelp("Uses tracking for eye gaze only and leaves every other face flex alone.")
 		form:NumSlider("OSC Port", "ft_port", 1024, 65535, 0)
+		form:ControlHelp("Port VRCFaceTracking sends its OSC data to.")
 		form:NumSlider("Smoothing", "ft_smooth", 0, 0.95, 2)
+		form:ControlHelp("Smooths the face so tracker noise doesn't twitch it. 0 = raw.")
 		form:NumSlider("Net Update Rate (Hz)", "ft_rate", 5, 60, 0)
+		form:ControlHelp("How many times a second your face is sent to other players.")
 		form:NumSlider("Global Multiplier", "ft_multiplier", 0, 5, 2)
+		form:ControlHelp("Scales every face flex. Above 1 exaggerates expressions.")
 		form:CheckBox("Show Debug HUD", "ft_debug")
+		form:ControlHelp("Shows the incoming tracking values on screen.")
 		local btn = form:Button("Open Full Face Tracking Panel")
 		btn.DoClick = function() RunConsoleCommand("ft_menu") end
 		form:ControlHelp("Mapping overrides are saved per playermodel in data/facetracking/.")
 	end
 
 	-- ══════════════════════════════════════════════════════════════════
-	-- SERVER TAB
+	-- SERVER TAB (nested subtabs, as Client). Server convars: changes need
+	-- the host, or the RCON toggle (Client > General).
 	-- ══════════════════════════════════════════════════════════════════
+	local serverPanel = vgui.Create("DPanel", topSheet)
+	serverPanel:Dock(FILL)
+	serverPanel.Paint = nil
+	local serverSheet = vgui.Create("DPropertySheet", serverPanel)
+	serverSheet:SetPadding(1)
+	serverSheet:Dock(FILL)
+	topSheet:AddSheet("Server", serverPanel, "icon16/server.png")
+
+	local function ServerForm(t, name)
+		local f = vgui.Create("DForm", t)
+		f:SetName(name)
+		f:Dock(TOP)
+		f:DockMargin(5, 5, 5, 0)
+		f:SetExpanded(true)
+		return f
+	end
+
+	-- ─────────────── Server > General ───────────────
 	do
-		local t = vgui.Create("DScrollPanel", topSheet)
-		topSheet:AddSheet("Server", t, "icon16/server.png")
+		local t = vgui.Create("DScrollPanel", serverSheet)
+		serverSheet:AddSheet("General", t, "icon16/cog.png")
 
 		-- Server presets
 		BuildPresetPanel(t, PRESET_DIR_SERVER, SERVER_CVARS)
 
-		local netForm = vgui.Create("DForm", t)
-		netForm:SetName("Networking")
-		netForm:Dock(TOP)
-		netForm:DockMargin(5, 5, 5, 0)
-		netForm:SetExpanded(true)
+		local netForm = ServerForm(t, "Networking")
 		netForm:NumSlider("Tracking rate (Hz)", "vrmod_net_tickrate", 10, 100, 0)
 		netForm:ControlHelp("How many times per second tracking is sent/received. Higher = smoother, more bandwidth. Capped at 100.")
 		netForm:NumSlider("Min send movement", "vrmod_net_minsend", 0, 0.1, 3)
 		netForm:ControlHelp("Per-tick movement a hand/part must exceed before an update is sent. 0 = always send (fixes slow parts freezing); higher saves bandwidth by skipping tiny moves.")
 
-		local tpForm = vgui.Create("DForm", t)
-		tpForm:SetName("Teleportation")
-		tpForm:Dock(TOP)
-		tpForm:DockMargin(5, 5, 5, 0)
-		tpForm:SetExpanded(true)
-		tpForm:CheckBox("Allow Teleportation", "vrmod_allow_teleport")
-		tpForm:NumSlider("Max distance", "vrmod_teleport_maxdist", 0, 1000, 0)
+		local poseForm = ServerForm(t, "Poses")
+		poseForm:CheckBox("Allow poses", "vrmod_sv_poses")
+		poseForm:ControlHelp("Lets VR players play their playermodel's animations from the quick menu (Poses). Turning this off stops every active pose. Server setting: needs host or the RCON toggle.")
 
-		local pickupForm = vgui.Create("DForm", t)
-		pickupForm:SetName("Pickup & Physics")
-		pickupForm:Dock(TOP)
-		pickupForm:DockMargin(5, 5, 5, 0)
-		pickupForm:SetExpanded(true)
+		local tpForm = ServerForm(t, "Teleportation")
+		tpForm:CheckBox("Allow Teleportation", "vrmod_allow_teleport")
+		tpForm:ControlHelp("Lets VR players teleport.")
+		tpForm:NumSlider("Max distance", "vrmod_teleport_maxdist", 0, 1000, 0)
+		tpForm:ControlHelp("Furthest a single teleport can go, in units.")
+
+		local resetForm = ServerForm(t, "Defaults")
+		local resetBtn = resetForm:Button("Reset Server Defaults")
+		resetForm:ControlHelp("Resets every setting on the Server tabs: General, Pickup, Combat and Climbing.")
+		function resetBtn:DoClick()
+			ResetCvars({
+				"vrmod_allow_teleport", "vrmod_teleport_maxdist",
+				"vrmod_pickup_limit", "vrmod_pickup_npcs", "vrmod_pickup_no_phys",
+				"vrmod_pickup_weight", "vrmod_pickup_range", "vrmod_selfdamage",
+				"vrmod_pickup_players", "vrmod_pickup_players_adminprotect", "vrmod_hand_physics", "vrmod_hand_interp", "vrmod_foot_physics", "vrmod_foot_force",
+				"vrmod_weight", "vrmod_weight_lag", "vrmod_weight_ramp",
+				"sv_vrmod_melee", "vrmod_melee_damage", "vrmod_melee_velthreshold",
+				"vrmod_melee_delay", "vrmod_melee_speedscale", "vrmod_melee_fist_collisionmodel",
+				"sv_vrmod_kick", "vrmod_kick_damage", "vrmod_kick_velthreshold",
+				"sv_vrmod_headbutt", "vrmod_headbutt_damage", "vrmod_headbutt_velthreshold",
+				"vrmod_physmelee_force", "vrmod_physmelee_damage", "vrmod_physmelee_speed",
+			}, true)
+		end
+	end
+
+	-- ─────────────── Server > Pickup ───────────────
+	do
+		local t = vgui.Create("DScrollPanel", serverSheet)
+		serverSheet:AddSheet("Pickup", t, "icon16/basket.png")
+
+		local pickupForm = ServerForm(t, "Pickup & Physics")
 		pickupForm:CheckBox("Weight limit", "vrmod_pickup_limit")
+		pickupForm:ControlHelp("Only props at or under the Pickup weight can be picked up.")
 		pickupForm:CheckBox("Pickup NPCs", "vrmod_pickup_npcs")
+		pickupForm:ControlHelp("VR players can grab NPCs, which go limp as ragdolls while held.")
 		pickupForm:CheckBox("Disable prop physics", "vrmod_pickup_no_phys")
+		pickupForm:ControlHelp("Held props pass through every player, and drop with player collision off.")
 		pickupForm:NumSlider("Pickup weight", "vrmod_pickup_weight", 1, 100, 0)
+		pickupForm:ControlHelp("Heaviest prop that can be picked up with Weight limit on, in kg. Prop Weight's lag is scaled against it too.")
 		pickupForm:NumSlider("Pickup range", "vrmod_pickup_range", 0.0, 10.0, 1)
+		pickupForm:ControlHelp("How far from a hand something can be grabbed. Times 10 units.")
 		pickupForm:CheckBox("Hand physics props", "vrmod_hand_physics")
 		pickupForm:ControlHelp("Spawns solid physics props on VR players' hands so they can shove objects around. Off despawns them, which also stops hands blocking bullets and movement. Applies live, no rejoin needed.")
+		pickupForm:CheckBox("Foot physics props", "vrmod_foot_physics")
+		pickupForm:ControlHelp("The same physics props on VR players' feet, following the feet the body draws (FBT trackers included), so they can kick and shove objects. Applies live.")
+		pickupForm:NumSlider("Kick push", "vrmod_foot_force", 0.05, 20, 2)
+		pickupForm:ControlHelp("How hard feet push and kick things: scales the foot props' physics mass (1 = a hand's 20kg). Heavier feet also get stopped by fewer props. Applies live.")
+		pickupForm:CheckBox("Interpolate hand poses", "vrmod_hand_interp")
+		pickupForm:ControlHelp("Plays VR players' hand poses back smoothly, slightly behind, instead of jumping to each network packet. Smooths hand props and held props on uneven connections; off reacts a few milliseconds sooner.")
 		pickupForm:CheckBox("Allow grabbing players", "vrmod_pickup_players")
 		pickupForm:ControlHelp("VR players can pick up other players. The target is swapped for a ragdoll and dragged along by it, the same way NPCs are. Hard landings deal fall damage.")
 		pickupForm:CheckBox("Protect higher ranks", "vrmod_pickup_players_adminprotect")
 		pickupForm:ControlHelp("Refuses grabs where the target's usergroup outranks the grabber's. Uses CAMI inheritance when an admin mod provides it, otherwise superadmin > admin > user.")
 
-		local combatForm = vgui.Create("DForm", t)
-		combatForm:SetName("Combat")
-		combatForm:Dock(TOP)
-		combatForm:DockMargin(5, 5, 5, 0)
-		combatForm:SetExpanded(true)
+		local weightForm = ServerForm(t, "Prop Weight")
+		weightForm:CheckBox("Enable prop weight", "vrmod_weight")
+		weightForm:ControlHelp("Heavy held props drag the hand behind the controller, scaled by mass against Pickup weight. Two-hand grips share the load. Off disables it for everyone; a hold in progress eases back to normal.")
+		weightForm:NumSlider("Lag at max weight (s)", "vrmod_weight_lag", 0, 2, 2)
+		weightForm:ControlHelp("How far behind the hand trails at the Pickup weight limit, as a smoothing time. 0 = no lag at any mass.")
+		weightForm:NumSlider("Weight curve", "vrmod_weight_ramp", 0.25, 6, 2)
+		weightForm:ControlHelp("1 = lag grows linearly with mass. Higher keeps light and mid props snappy and saves the drag for the heaviest.")
+	end
+
+	-- ─────────────── Server > Combat ───────────────
+	do
+		local t = vgui.Create("DScrollPanel", serverSheet)
+		serverSheet:AddSheet("Combat", t, "icon16/asterisk_orange.png")
+
+		local combatForm = ServerForm(t, "Combat")
 		combatForm:CheckBox("Self damage", "vrmod_selfdamage")
+		combatForm:ControlHelp("VR players' own bullets can hit their own body and head.")
 		combatForm:CheckBox("Enable melee", "sv_vrmod_melee")
+		combatForm:ControlHelp("Allows hand melee (punches and swings) for every VR player.")
 		combatForm:NumSlider("Melee Damage", "vrmod_melee_damage", 0, 10, 0)
+		combatForm:ControlHelp("Base damage of a punch.")
 		combatForm:NumSlider("Melee Velocity Threshold", "vrmod_melee_velthreshold", 0.1, 10, 1)
+		combatForm:ControlHelp("How fast a hand has to move to count as a hit. Times 50 units/s.")
 		combatForm:NumSlider("Melee Delay", "vrmod_melee_delay", 0.01, 1, 2)
+		combatForm:ControlHelp("Shortest time between two hits from one hand, in seconds.")
 		combatForm:NumSlider("Relative speed multiplier", "vrmod_melee_speedscale", 0.001, 0.05, 3)
-		local defaultModel = "models/props_junk/PopCan01a.mdl"
-		local te = combatForm:TextEntry("Collision Model", "vrmod_melee_fist_collisionmodel")
+		combatForm:ControlHelp("How much extra damage a faster hit deals, up to 5 times.")
+		combatForm:TextEntry("Collision Model", "vrmod_melee_fist_collisionmodel")
+		combatForm:ControlHelp("Model used as the fist's collision shape for punches.")
 		combatForm:CheckBox("Enable kicking", "sv_vrmod_kick")
+		combatForm:ControlHelp("Allows kicks with full-body foot trackers.")
 		combatForm:NumSlider("Kick Damage", "vrmod_kick_damage", 0, 25, 0)
+		combatForm:ControlHelp("Flat damage a kick deals, whatever weapon is held.")
 		combatForm:NumSlider("Kick Velocity Threshold", "vrmod_kick_velthreshold", 0.5, 10, 1)
+		combatForm:ControlHelp("How fast a foot has to move to count as a kick.")
 		combatForm:CheckBox("Enable headbutting", "sv_vrmod_headbutt")
+		combatForm:ControlHelp("Allows headbutts.")
 		combatForm:NumSlider("Headbutt Damage", "vrmod_headbutt_damage", 0, 15, 0)
+		combatForm:ControlHelp("Flat damage a headbutt deals, whatever weapon is held.")
 		combatForm:NumSlider("Headbutt Velocity Threshold", "vrmod_headbutt_velthreshold", 0.5, 10, 1)
+		combatForm:ControlHelp("How fast the headset has to move to count as a headbutt.")
+		combatForm:NumSlider("Weapon swing damage", "vrmod_physmelee_damage", 0, 10, 2)
+		combatForm:ControlHelp("Multiplies weapon swing damage. A swing at the full-damage speed deals the weapon's own damage (HL2 crowbar 10); faster swings up to double.")
+		combatForm:NumSlider("Full-damage swing speed", "vrmod_physmelee_speed", 50, 3000, 0)
+		combatForm:ControlHelp("Weapon tip speed (units/s) that deals full damage. Raise it to make hard swings matter more.")
+		combatForm:NumSlider("Weapon swing push", "vrmod_physmelee_force", 0.05, 20, 2)
+		combatForm:ControlHelp("How hard weapons push and throw things: scales the weapon's physics mass and each hit's force. A heavier weapon also gets stopped by fewer props.")
+	end
 
-		local resetBtn = combatForm:Button("Reset Server Defaults")
-		function resetBtn:DoClick()
-			local defs = {
-				vrmod_allow_teleport = "1", vrmod_teleport_maxdist = "500",
-				vrmod_pickup_limit = "1", vrmod_pickup_npcs = "1", vrmod_pickup_no_phys = "0",
-				vrmod_pickup_weight = "100", vrmod_pickup_range = "3.5", vrmod_selfdamage = "1",
-				vrmod_pickup_players = "0", vrmod_pickup_players_adminprotect = "1",
-				vrmod_hand_physics = "1",
-				sv_vrmod_melee = "1", vrmod_melee_damage = "3", vrmod_melee_velthreshold = "1.5",
-				vrmod_melee_delay = "0.45", vrmod_melee_speedscale = "0.030",
-				vrmod_melee_fist_collisionmodel = defaultModel,
-				sv_vrmod_kick = "1", vrmod_kick_damage = "8", vrmod_kick_velthreshold = "2.0",
-				sv_vrmod_headbutt = "1", vrmod_headbutt_damage = "5", vrmod_headbutt_velthreshold = "2.5",
-			}
-			for name, value in pairs(defs) do
-				RunConsoleCommand(name, value)
-				RconCvar(name, value)
-			end
-		end
+	-- ─────────────── Server > Climbing ───────────────
+	do
+		local t = vgui.Create("DScrollPanel", serverSheet)
+		serverSheet:AddSheet("Climbing", t, "icon16/arrow_up.png")
 
-		local climbForm = vgui.Create("DForm", t)
-		climbForm:SetName("Climbing")
-		climbForm:Dock(TOP)
-		climbForm:DockMargin(5, 5, 5, 0)
-		climbForm:SetExpanded(true)
+		local climbForm = ServerForm(t, "Climbing")
 		climbForm:CheckBox("Allow climbing", "vrmod_sv_climbing")
+		climbForm:ControlHelp("Allows climbing for VR players.")
 		climbForm:CheckBox("Force whitelist ledges", "vrmod_sv_climbing_ledgeonly")
+		climbForm:ControlHelp("Every VR player can only grab near the top edges of surfaces.")
 		climbForm:CheckBox("Force whitelist ladders", "vrmod_sv_climbing_ladderonly")
+		climbForm:ControlHelp("Every VR player can only grab ladders.")
 		climbForm:NumSlider("Throw force", "vrmod_sv_climbing_throw", 0, 10, 1)
 		climbForm:ControlHelp("Momentum multiplier when a player launches off a wall.")
 		climbForm:NumSlider("Throw threshold", "vrmod_sv_climbing_throwmin", 0, 400, 0)
@@ -1578,19 +1992,22 @@ function VRUtilOpenMenu()
 		hullForm:CheckBox("Use reduced collision hull", "vrmod_smallhull")
 		hullForm:ControlHelp("Shrinks the player collision box so you fit through tighter gaps and can stand closer to walls. Height is unchanged.")
 		hullForm:NumSlider("Hull width scale", "vrmod_hullscale", 0.1, 1, 3)
-		hullForm:ControlHelp("1 = GMod default (16u wide). 0.625 = the classic VR hull (10u). 0.1 = smallest (1.6u). Only applies while the reduced hull is enabled.")
-		hullForm:CheckBox("Affects all non-VR players", "vrmod_smallhull_all")
-		hullForm:ControlHelp("Gives every player the reduced hull, not just VR players, so mixed lobbies fit through the same gaps. Server setting: needs host or the RCON toggle. Non-VR players may reach spots the map assumes are sealed.")
-		hullForm:CheckBox("Head anti-clip", "vrmod_anticlip")
-		hullForm:ControlHelp("Pushes your view out of walls when leaning through them in roomscale. Disable if an addon's collision fights it (addons can also override via the VRMod_AllowHeadAntiClip hook).")
+		hullForm:ControlHelp("1 = GMod default (16u wide). 0.625 = the classic VR hull (10u). 0.332 = default. 0.1 = smallest (1.6u). Only applies while the reduced hull is enabled.")
+		-- Rarely touched: out of the way
+		local advSection = vgui.Create("DForm", hullForm)
+		advSection:SetName("Advanced")
+		advSection:SetExpanded(false)
+		hullForm:AddItem(advSection)
+		advSection:CheckBox("Affects all non-VR players", "vrmod_smallhull_all")
+		advSection:ControlHelp("Gives every player the reduced hull, not just VR players, so mixed lobbies fit through the same gaps. Server setting: needs host or the RCON toggle. Non-VR players may reach spots the map assumes are sealed.")
+		advSection:CheckBox("Head anti-clip", "vrmod_anticlip")
+		advSection:ControlHelp("On by default. Your hull follows your hips, so your head can lean past it; this pushes your view back out of walls, doors, windows and solid props instead of letting you look through them. NPCs, players, ragdolls and what you hold don't count. Disable if an addon's collision fights it (addons can also override it with the VRMod_AllowHeadAntiClip hook).")
 
 		local resetBtn = hullForm:Button("Reset Hull Defaults")
+		hullForm:ControlHelp("Puts every hull setting back to its default.")
 		function resetBtn:DoClick()
-			RunConsoleCommand("vrmod_smallhull", "1")
-			RunConsoleCommand("vrmod_hullscale", "0.625")
-			RunConsoleCommand("vrmod_smallhull_all", "0")
-			RconCvar("vrmod_smallhull_all", "0")
-			RunConsoleCommand("vrmod_anticlip", "1")
+			ResetCvars({"vrmod_smallhull", "vrmod_hullscale", "vrmod_anticlip"})
+			ResetCvars({"vrmod_smallhull_all"}, true)
 		end
 	end
 
@@ -1599,62 +2016,55 @@ function VRUtilOpenMenu()
 	-- DEBUG TAB
 	-- ══════════════════════════════════════════════════════════════════
 	do
-		local t = vgui.Create("DPanel", topSheet)
+		local t = vgui.Create("DScrollPanel", topSheet)
 		topSheet:AddSheet("Debug", t, "icon16/bug.png")
-		local y = 10
-		local function AddCB(lbl, cv)
-			local cb = t:Add("DCheckBoxLabel")
-			cb:SetDark(true)
-			cb:SetText(lbl)
-			cb:SetConVar(cv)
-			cb:SetPos(20, y)
-			cb:SizeToContents()
-			y = y + 20
-		end
-		local function AddLogLevelCB(lbl, cv)
-			local label = vgui.Create("DLabel", t)
-			label:SetPos(20, y)
-			label:SetText(lbl)
-			label:SetDark(true)
-			label:SizeToContents()
-			y = y + 20
-			local combo = vgui.Create("DComboBox", t)
-			combo:SetPos(20, y)
-			combo:SetSize(150, 20)
-			local levelMap = { OFF = 0, ERROR = 1, WARN = 2, INFO = 3, DEBUG = 4 }
-			for name, val in pairs(levelMap) do
-				combo:AddChoice(name, val, val == cv:GetInt())
-			end
-			combo.OnSelect = function(self, index, value, data) RunConsoleCommand(cv:GetName(), data) end
-			y = y + 30
+		local f = vgui.Create("DForm", t)
+		f:SetName("Debug")
+		f:Dock(TOP)
+		f:DockMargin(5, 5, 5, 0)
+		f.Header:SetVisible(false)
+		f.Paint = nil
+		local LEVELS = {{"OFF", 0}, {"ERROR", 1}, {"WARN", 2}, {"INFO", 3}, {"DEBUG", 4}}
+		local function LogLevel(lbl, cv, help)
+			if not cv then return end
+			local combo = f:ComboBox(lbl)
+			for i = 1, #LEVELS do combo:AddChoice(LEVELS[i][1], LEVELS[i][2], LEVELS[i][2] == cv:GetInt()) end
+			combo.OnSelect = function(_, _, _, data) RunConsoleCommand(cv:GetName(), data) end
+			f:ControlHelp(help)
 		end
 		local function ProperSubName(s)
 			if s == "api" then return "API" end
 			if s == "ui" then return "UI" end
 			return s:sub(1, 1):upper() .. s:sub(2)
 		end
-		local function PopulateDebugSettings()
-			local order = vrmod.subsystemOrder or {"api", "utils", "core", "network", "input", "player", "physics", "pickup", "combat", "ui"}
-			for _, subsystem in ipairs(order) do
-				local cvarName = "vrmod_debug_" .. subsystem
-				local cv = GetConVar(cvarName) or vrmod.debug_cvars and vrmod.debug_cvars[subsystem]
-				if cv then AddCB("Debug " .. ProperSubName(subsystem), cvarName) end
-			end
-			if vrmod.debug_cvars then
-				for subsystem, _ in pairs(vrmod.debug_cvars) do
-					if not table.HasValue(order, subsystem) then
-						local cvarName = "vrmod_debug_" .. subsystem
-						local cv = GetConVar(cvarName)
-						if cv then AddCB("Debug " .. ProperSubName(subsystem), cvarName) end
-					end
-				end
-			end
+		local function Sub(subsystem)
+			local cvarName = "vrmod_debug_" .. subsystem
+			if not (GetConVar(cvarName) or vrmod.debug_cvars and vrmod.debug_cvars[subsystem]) then return end
+			local name = ProperSubName(subsystem)
+			f:CheckBox("Debug " .. name, cvarName)
+			f:ControlHelp("Extra debug logging from the " .. name .. " subsystem.")
 		end
-		AddLogLevelCB("Console log level", GetConVar("vrmod_log_console"))
-		AddLogLevelCB("File log level", GetConVar("vrmod_log_file"))
-		PopulateDebugSettings()
-		AddCB("Visible wall collision", "vrmod_debug_collisions")
-		AddCB("Redirect server prints to VR console (can cause lags)", "vrmod_console_redirect")
+		LogLevel("Console log level", GetConVar("vrmod_log_console"), "How much VRMod prints to the console: DEBUG is everything, OFF is nothing.")
+		LogLevel("File log level", GetConVar("vrmod_log_file"), "How much VRMod writes to its log file in data/.")
+		local order = vrmod.subsystemOrder or {"api", "utils", "core", "network", "input", "player", "physics", "pickup", "combat", "ui"}
+		local listed = {}
+		for _, subsystem in ipairs(order) do
+			listed[subsystem] = true
+			Sub(subsystem)
+		end
+		for subsystem in pairs(vrmod.debug_cvars or {}) do
+			if not listed[subsystem] then Sub(subsystem) end
+		end
+		f:CheckBox("Visible wall collision", "vrmod_debug_collisions")
+		f:ControlHelp("Draws the hand and weapon collision shapes, yellow while they touch something.")
+		f:CheckBox("Show server hand props", "vrmod_debug_hull")
+		f:ControlHelp("Draws the server's physics props on each VR hand in red, where the server has them.")
+		f:CheckBox("Log hand contact timing", "vrmod_debug_hullerr")
+		f:ControlHelp("Prints to the console when the server reports a hand or held prop stuck on something, with the round-trip and contact-prediction timing.")
+		f:CheckBox("Grab debug overlay", "vrmod_debug_grab")
+		f:ControlHelp("Draws where a held thing is meant to be on your side and the server's, and logs each grab to the console.")
+		f:CheckBox("Redirect server prints to VR console (can cause lags)", "vrmod_console_redirect")
+		f:ControlHelp("Sends VRMod's server log lines to VR players' consoles.")
 	end
 
 	-- ══════════════════════════════════════════════════════════════════
@@ -1684,19 +2094,31 @@ function VRUtilOpenMenu()
 			end
 			AddSection(t, "Controls", function(f)
 				f:CheckBox("Grip with reload key", "arcticvr_grip_withreloadkey")
+				f:ControlHelp("Use the reload button to grip ArcVR weapons.")
 				f:CheckBox("Magazine bump preload", "arcticvr_mag_bumpreload")
+				f:ControlHelp("Bumping a magazine into the gun loads it.")
 				f:CheckBox("Alternative frontgrip mode", "arcticvr_grip_alternative_mode")
+				f:ControlHelp("ArcVR's alternative two-hand front grip behaviour.")
 				f:NumSlider("Slide magnification", "arcticvr_slide_magnification", 1, 10, 2)
+				f:ControlHelp("Scales how far the slide moves for your hand's pull.")
 				f:NumSlider("Grip magnification", "arcticvr_grip_magnification", 1, 10, 2)
+				f:ControlHelp("Scales how strongly the front grip moves the gun.")
 				f:CheckBox("Disable reload with key", "arcticvr_disable_reloadkey")
+				f:ControlHelp("The reload button no longer reloads ArcVR weapons.")
 				f:CheckBox("Disable grab reload", "arcticvr_disable_grabreload")
+				f:ControlHelp("Grabbing no longer reloads ArcVR weapons.")
 			end)
 			AddSection(t, "Virtual Stock & Fixes", function(f)
 				f:CheckBox("Enable virtual stock", "arcticvr_virtualstock")
+				f:ControlHelp("Steadies two-handed aim as if the gun had a stock against your shoulder.")
 				f:NumSlider("Frontgrip power", "arcticvr_2h_sens", 0, 2, 2)
+				f:ControlHelp("How strongly the front hand steers a two-handed gun.")
 				f:CheckBox("Grenade pin enable", "arcticvr_grenade_pin_enable")
+				f:ControlHelp("Grenades need their pin pulled before they're thrown.")
 				f:CheckBox("Shoot system fix", "arcticvr_shootsys")
+				f:ControlHelp("ArcVR's compatibility fix for its shooting system.")
 				f:CheckBox("Misc client fix", "arcticvr_test_cl_misc_fix")
+				f:ControlHelp("ArcVR's miscellaneous client-side fixes.")
 			end)
 			AddSection(t, "Physical Gunstock", function(f)
 				f:CheckBox("Enable physical gunstock", "arcticvr_physstock_enable")
@@ -1704,28 +2126,45 @@ function VRUtilOpenMenu()
 				f:NumSlider("Pos X (forward)", "arcticvr_physstock_pos_x", -20, 20, 2)
 				f:NumSlider("Pos Y (right)", "arcticvr_physstock_pos_y", -20, 20, 2)
 				f:NumSlider("Pos Z (up)", "arcticvr_physstock_pos_z", -20, 20, 2)
+				f:ControlHelp("Stock position along the gun's axes, in units.")
 				f:NumSlider("Ang pitch", "arcticvr_physstock_ang_p", -45, 45, 2)
 				f:NumSlider("Ang yaw", "arcticvr_physstock_ang_y", -45, 45, 2)
 				f:NumSlider("Ang roll", "arcticvr_physstock_ang_r", -45, 45, 2)
+				f:ControlHelp("Stock rotation, in degrees.")
 			end)
 			AddSection(t, "Mag Pouches", function(f)
 				f:NumSlider("Default pouch distance", "arcticvr_defpouchdist", 0, 200, 2)
+				f:ControlHelp("Reach of the default magazine pouch.")
 				f:CheckBox("Hybrid pouch", "arcticvr_hybridpouch")
+				f:ControlHelp("Adds ArcVR's hybrid magazine pouch.")
 				f:NumSlider("Hybrid pouch distance", "arcticvr_hybridpouchdist", 0, 200, 1)
+				f:ControlHelp("Reach of the hybrid pouch.")
 				f:CheckBox("Head pouch", "arcticvr_headpouch")
+				f:ControlHelp("Adds a magazine pouch at your head.")
 				f:NumSlider("Head pouch distance", "arcticvr_headpouchdist", 0, 200, 1)
+				f:ControlHelp("Reach of the head pouch.")
 				f:CheckBox("Infinite pouch range", "arcticvr_infpouch")
+				f:ControlHelp("Magazines can be taken from the pouch at any distance.")
 			end)
 			AddSection(t, "Server Settings", function(f)
 				f:CheckBox("Allow reload key (all guns)", "arcticvr_allgun_allow_reloadkey")
+				f:ControlHelp("Server: the reload button reloads every ArcVR gun.")
 				f:CheckBox("Allow reload key (client)", "arcticvr_allgun_allow_reloadkey_client")
+				f:ControlHelp("Client side of the reload button setting above.")
 				f:CheckBox("Bump reload (all guns)", "arcticvr_bumpreload_allgun")
+				f:ControlHelp("Server: bump reloading works on every ArcVR gun.")
 				f:CheckBox("Bump reload (client)", "arcticvr_bumpreload_allgun_client")
+				f:ControlHelp("Client side of the bump reload setting above.")
 				f:CheckBox("Normalize default ammo", "arcticvr_defaultammo_normalize")
+				f:ControlHelp("Evens out the ammo ArcVR weapons come with.")
 				f:CheckBox("Alternate physics bullets", "arcticvr_physical_bullets")
+				f:ControlHelp("Uses ArcVR's alternate physical bullets.")
 				f:NumSlider("Mag pickup delay", "arcticvr_net_magtimertime", 0, 1, 2)
+				f:ControlHelp("Delay before a dropped magazine can be picked up, in seconds.")
 				f:CheckBox("Flick reload", "arcticvr_flickreload")
+				f:ControlHelp("Flicking the gun reloads it.")
 				f:CheckBox("Flick reload (dual wield)", "arcticvr_flickreload_dw")
+				f:ControlHelp("Flick reloading while dual wielding.")
 			end)
 		else
 			checks = checks + 1
@@ -1759,6 +2198,7 @@ function VRUtilOpenMenu()
 		importForm:AddItem(typeCombo)
 		typeCombo:AddChoice("Client Preset", PRESET_DIR_CLIENT, true)
 		typeCombo:AddChoice("Server Preset", PRESET_DIR_SERVER)
+		importForm:ControlHelp("Whether the pasted settings are a client or a server preset.")
 
 		local pasteEntry = vgui.Create("DTextEntry")
 		importForm:AddItem(pasteEntry)
@@ -1792,14 +2232,21 @@ function VRUtilOpenMenu()
 	end
 
 	-- ── VRMod_Menu hook ──
-	local hooks = hook.GetTable().VRMod_Menu or {}
-	local names = {}
-	for _, v in ipairs(names) do
-		local func = hooks[v]
-		if isfunction(func) then pcall(func, frame) end
+	-- Sorted by name for a stable tab order, each isolated so one broken addon
+	-- can't take the rest (or the menu) down. String ids only: object-keyed
+	-- hooks can't be sorted against them.
+	local hooks = hook.GetTable().VRMod_Menu
+	if hooks then
+		local names = {}
+		for k in pairs(hooks) do
+			if isstring(k) then names[#names + 1] = k end
+		end
+		table.sort(names)
+		for i = 1, #names do
+			local ok, err = pcall(hooks[names[i]], frame)
+			if not ok then ErrorNoHalt("[VRMod Menu] " .. names[i] .. ": " .. tostring(err) .. "\n") end
+		end
 	end
-	table.sort(names)
-	for _, v in ipairs(names) do hooks[v](frame) end
 	WireServerRcon(frame)
 	return frame
 end

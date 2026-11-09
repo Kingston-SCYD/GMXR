@@ -17,10 +17,166 @@ if CLIENT then
 	end
 
 	CreateClientConVar("vrmod_pickup_halos", "1", true, FCVAR_CLIENTCMD_CAN_EXECUTE + FCVAR_ARCHIVE)
+
+	-- vrmod_debug_grab 1: where a held thing is meant to be, on both sides.
+	-- Per hand: white = raw controller, cyan = hand as drawn (after
+	-- collisions), green = where this client draws the held thing (a
+	-- ragdoll: its grabbed bone), yellow = the server's target for it, red =
+	-- where the server has it, magenta = the hand pose the server drove from.
+	--   corr    hand pushed off the controller by collisions, now
+	--   hand    server's hand vs yours: latency, or "frame" = stale source
+	--   offset  server's grip offset vs this client's: ~0 or the two sides
+	--           anchored the grab to different poses (not valid two-handed)
+	--   sag     server's object off its own target: blocked, or dragged
+	-- Grab press / ack / server pickup also log to console. Userinfo: the
+	-- server only sends its side to players with it on.
+	local cvDbg = CreateClientConVar("vrmod_debug_grab", "0", false, true, "Grab debug: overlay + console log", 0, 1)
+	local dbgSv = {}
+	net.Receive("vrmod_grab_dbg", function()
+		local idx, i = net.ReadUInt(16), net.ReadBool() and 1 or 2
+		local d = dbgSv[i] or {}
+		dbgSv[i] = d
+		d.idx, d.fresh, d.t = idx, net.ReadBool(), SysTime()
+		d.hp, d.ha, d.tp, d.ta, d.sp, d.sa = net.ReadVector(), net.ReadAngle(), net.ReadVector(), net.ReadAngle(), net.ReadVector(), net.ReadAngle()
+	end)
+	local C_RAW, C_FIN, C_CL, C_TGT, C_SV, C_HAND = Color(255, 255, 255), Color(0, 255, 255), Color(0, 255, 0), Color(255, 255, 0), Color(255, 0, 0), Color(255, 0, 255)
+	local BONE_MAX, BONE_MIN, UP4, dbgLines = Vector(1.5, 1.5, 1.5), Vector(-1.5, -1.5, -1.5), Vector(0, 0, 5), {}
+	local function DrawGrabDebug(depth, sky)
+		if depth or sky then return end
+		local tr = g_VR.tracking
+		local hmd = tr and tr.hmd
+		if not hmd then return end
+		local now, wsa, fmt = SysTime(), Angle(0, hmd.ang.y - 90, 90), string.format
+		render.SetColorMaterial()
+		for i = 1, 2 do
+			local left = i == 1
+			local fin = tr[left and "pose_lefthand" or "pose_righthand"]
+			local rp = vrmod.utils.RawHandPose(left)
+			if fin and rp then
+				render.DrawWireframeSphere(rp, 0.6, 6, 6, C_RAW, true)
+				render.DrawWireframeSphere(fin.pos, 0.8, 6, 6, C_FIN, true)
+				render.DrawLine(rp, fin.pos, C_FIN, true)
+				local n = 1
+				dbgLines[1] = fmt("%s corr %.2f", left and "L" or "R", rp:Distance(fin.pos))
+				local ent = g_VR[left and "heldEntityLeft" or "heldEntityRight"]
+				local g = IsValid(ent) and ent.vrmod_grabData
+				g = g and g[left and "left" or "right"]
+				if g then
+					local mn, mx = BONE_MIN, BONE_MAX
+					if ent:GetClass() ~= "prop_ragdoll" then mn, mx = ent:OBBMins(), ent:OBBMaxs() end
+					local cp, ca = LocalToWorld(g.localPos, g.localAng, fin.pos, fin.ang)
+					render.DrawWireframeBox(cp, ca, mn, mx, C_CL, true)
+					local d = dbgSv[i]
+					n = 2
+					if d and d.idx == ent:EntIndex() and now - d.t < 0.5 then
+						render.DrawWireframeBox(d.tp, d.ta, mn, mx, C_TGT, true)
+						render.DrawWireframeBox(d.sp, d.sa, mn, mx, C_SV, true)
+						render.DrawWireframeSphere(d.hp, 0.8, 6, 6, C_HAND, true)
+						render.DrawLine(fin.pos, d.hp, C_HAND, true)
+						local lp = WorldToLocal(d.tp, d.ta, d.hp, d.ha)
+						dbgLines[2] = fmt("hand %.2f %s  offset %.2f  sag %.2f", d.hp:Distance(fin.pos), d.fresh and "fresh" or "FRAME", lp:Distance(g.localPos), d.sp:Distance(d.tp))
+					else
+						dbgLines[2] = "no server data"
+					end
+				end
+				cam.Start3D2D(fin.pos + UP4, wsa, 0.03)
+				surface.SetFont("Trebuchet24")
+				surface.SetTextColor(255, 255, 255)
+				for k = 1, n do
+					surface.SetTextPos(0, (k - 1) * 26)
+					surface.DrawText(dbgLines[k])
+				end
+				cam.End3D2D()
+			end
+		end
+	end
+	local function DbgToggle(on)
+		if on then hook.Add("PostDrawTranslucentRenderables", "vrmod_debug_grab", DrawGrabDebug)
+		else hook.Remove("PostDrawTranslucentRenderables", "vrmod_debug_grab") end
+	end
+	cvars.AddChangeCallback("vrmod_debug_grab", function(_, _, v) DbgToggle(v ~= "0") end, "vrmod_debug_grab")
+	DbgToggle(cvDbg:GetBool())
 	local pickupTargetEntLeft = nil
 	local pickupTargetEntRight = nil
 	local haloTargetsLeft = {}
 	local haloTargetsRight = {}
+
+	-- Held props draw at the hand in their own engine pass, so they keep what
+	-- every other model gets: lighting, projected textures, fog, colour/alpha
+	-- and translucent sorting. Drawing them by hand from a post-opaque hook
+	-- lost that state (NH2's dark maps, lit by a projected flashlight: held
+	-- props went invisible). Gate poses the prop on its first draw each frame
+	-- -- after tracking, hand collisions and net lerp -- with render
+	-- origin/angles only, so GetPos and client collision stay real. The engine
+	-- culls on last frame's pose; a view that skipped it gets the fallback.
+	local heldDraw, posed, drawn = {}, {}, {}
+	local FrameNumber, band, DEPTH = FrameNumber, bit.band, STUDIO_SHADOWDEPTHTEXTURE
+	-- World pose from whichever grips have a hand pose; nil: none (network pose)
+	local function HeldPose(gd)
+		local L, R = gd.left, gd.right
+		local lp, la, rp, ra
+		if gd.isLocal then
+			local t = g_VR.tracking
+			local p = L and t.pose_lefthand
+			if p then lp, la = p.pos, p.ang end
+			p = R and t.pose_righthand
+			if p then rp, ra = p.pos, p.ang end
+		else
+			local nd = g_VR.net[gd.sid]
+			local f = nd and nd.lerpedFrame
+			if not f then return end
+			if L then lp, la = f.lefthandPos, f.lefthandAng end
+			if R then rp, ra = f.righthandPos, f.righthandAng end
+		end
+		if lp and rp then
+			local pA, aA = LocalToWorld(L.localPos, L.localAng, lp, la)
+			local pB, aB = LocalToWorld(R.localPos, R.localAng, rp, ra)
+			pA:Add(pB)
+			pA:Mul(0.5)
+			return pA, LerpAngle(0.5, aA, aB)
+		end
+		if lp then return LocalToWorld(L.localPos, L.localAng, lp, la) end
+		if rp then return LocalToWorld(R.localPos, R.localAng, rp, ra) end
+	end
+	local function Gate(self, flags)
+		local fn = FrameNumber()
+		if posed[self] ~= fn then
+			posed[self] = fn
+			local gd = heldDraw[self]
+			if gd then
+				local p, a = HeldPose(gd)
+				self:SetRenderOrigin(p)
+				self:SetRenderAngles(a)
+				self:InvalidateBoneCache()
+			end
+		end
+		if band(flags or 0, DEPTH) == 0 then drawn[self] = true end
+		self:DrawModel(flags)
+	end
+	-- This hand lets go of ent; the last hand off restores its own drawing
+	local function ClearGrab(ent, left)
+		local gd = ent.vrmod_grabData
+		if not gd then return end
+		gd[left and "left" or "right"] = nil
+		if gd.left or gd.right then return end
+		ent.vrmod_grabData, heldDraw[ent], posed[ent], drawn[ent] = nil, nil, nil, nil
+		if ent.RenderOverride == Gate then ent.RenderOverride = nil end
+		ent:SetRenderOrigin(nil)
+		ent:SetRenderAngles(nil)
+	end
+	-- Per view, after both passes: draw what the engine culled this view
+	hook.Add("PostDrawTranslucentRenderables", "vrmod_held_draw", function(depth, sky)
+		if depth or sky or not next(heldDraw) then return end
+		for ent in pairs(heldDraw) do
+			if not ent:IsValid() then
+				heldDraw[ent], posed[ent], drawn[ent] = nil, nil, nil
+			else
+				if not (drawn[ent] or ent:IsDormant()) then ent:DrawModel() end
+				drawn[ent] = nil
+			end
+		end
+	end)
+
 	-- Cleanup clones only for normal props on drop
 	hook.Add("VRMod_Drop", "vrmod_drop_cooldown", function(ply, ent)
 		if not IsValid(ent) or vrmod.utils.IsIgnoredProp(ent) then return end
@@ -37,9 +193,9 @@ hook.Add("PlayerDeath", "vrmod_pickup_death_cleanup", function(ply)
     if ply ~= LocalPlayer() then return end
     for _, key in ipairs({"heldEntityLeft", "heldEntityRight"}) do
         local ent = g_VR[key]
-        if IsValid(ent) and ent.vrmod_grabData then
-            ent.RenderOverride = nil
-            ent.vrmod_grabData = nil
+        if IsValid(ent) then
+            ClearGrab(ent, true)
+            ClearGrab(ent, false)
         end
         g_VR[key] = nil
     end
@@ -77,8 +233,16 @@ end)
 		end
 	end)
 
-	hook.Add("PostDrawOpaqueRenderables", "vrmod_draw_pickup_halo", function()
-		if not GetConVar("vrmod_pickup_halos"):GetBool() then return end
+	-- Once per frame: this fires in every view (both eyes, spectator, monitors,
+	-- depth/skybox passes) and VR halo.Add keeps one list for the whole frame.
+	local cvHalos = GetConVar("vrmod_pickup_halos")
+	local COL_HALO_L, COL_HALO_R = Color(250, 100, 0), Color(0, 255, 255)
+	local haloFrame = -1
+	hook.Add("PostDrawOpaqueRenderables", "vrmod_draw_pickup_halo", function(depth, sky)
+		if depth or sky then return end
+		local fn = FrameNumber()
+		if fn == haloFrame or not cvHalos:GetBool() then return end
+		haloFrame = fn
 		table.Empty(haloTargetsLeft)
 		table.Empty(haloTargetsRight)
 		local ply = LocalPlayer()
@@ -99,8 +263,8 @@ end)
 
 		if ShouldAddHalo(pickupTargetEntLeft) then haloTargetsLeft[#haloTargetsLeft + 1] = pickupTargetEntLeft end
 		if ShouldAddHalo(pickupTargetEntRight) then haloTargetsRight[#haloTargetsRight + 1] = pickupTargetEntRight end
-		if #haloTargetsLeft > 0 then halo.Add(haloTargetsLeft, Color(250, 100, 0), 1, 1, 1, true, true) end
-		if #haloTargetsRight > 0 then halo.Add(haloTargetsRight, Color(0, 255, 255), 1, 1, 1, true, true) end
+		if #haloTargetsLeft > 0 then halo.Add(haloTargetsLeft, COL_HALO_L, 1, 1, 1, true, true) end
+		if #haloTargetsRight > 0 then halo.Add(haloTargetsRight, COL_HALO_R, 1, 1, 1, true, true) end
 	end)
 
 	function vrmod.Pickup(bLeftHand, bDrop)
@@ -130,16 +294,7 @@ if not IsValid(held) then
 				net.SendToServer()
 				return
 			end
-			if held.vrmod_grabData then
-				local key = bLeftHand and "left" or "right"
-				held.vrmod_grabData[key] = nil
-				if not held.vrmod_grabData.left and not held.vrmod_grabData.right then
-					held:SetRenderOrigin(nil)
-					held:SetRenderAngles(nil)
-					held.RenderOverride = nil
-					held.vrmod_grabData = nil
-				end
-			end
+			ClearGrab(held, bLeftHand)
 			net.Start("vrmod_pickup")
 			net.WriteBool(bLeftHand)
 			net.WriteBool(true)
@@ -170,6 +325,23 @@ end
 					net.WriteBool(bLeftHand)
 					net.WriteBool(false)
 					net.WriteEntity(targetEnt)
+					-- Grip offset measured now, on the raw controller pose (see
+					-- CaptureRawPose), and that pose: the server anchors props
+					-- and ragdoll bones to it. Flagged: senders without it
+					-- (holster draw, left-hand weapon grabs) read false.
+					local rp, ra = vrmod.utils.RawHandPose(bLeftHand)
+					net.WriteBool(rp ~= nil)
+					if rp then
+						local lp, la = vrmod.utils.GrabOffset(targetEnt, rp, ra)
+						net.WriteVector(lp)
+						net.WriteAngle(la)
+						net.WriteVector(rp)
+						net.WriteAngle(ra)
+						if cvDbg:GetBool() then
+							local f = g_VR.tracking[bLeftHand and "pose_lefthand" or "pose_righthand"]
+							print(string.format("[VRMod Grab] press %s %s corr %.2f surf %.2f |off| %.2f", bLeftHand and "L" or "R", tostring(targetEnt), f and rp:Distance(f.pos) or -1, targetEnt:NearestPoint(rp):Distance(rp), lp:Length()))
+						end
+					end
 					net.SendToServer()
 				end
 			end
@@ -188,50 +360,17 @@ end
 		ent.vrmod_grabData = ent.vrmod_grabData or { sid = sid, isLocal = isLocal }
 		ent.vrmod_grabData[bLeftHand and "left" or "right"] = { localPos = localPos, localAng = localAng }
 
-		local gd = ent.vrmod_grabData
-		ent.RenderOverride = function()
-			if not IsValid(ent) or not gd then ent:DrawModel() return end
-			local L, R = gd.left, gd.right
-			if not L and not R then ent:DrawModel() return end
-
-			local lPos, lAng, rPos, rAng
-			if gd.isLocal then
-				if L then
-					local p = g_VR.tracking.pose_lefthand
-					if p then lPos, lAng = p.pos, p.ang end
-				end
-				if R then
-					local p = g_VR.tracking.pose_righthand
-					if p then rPos, rAng = p.pos, p.ang end
-				end
-			else
-				local nd = g_VR.net[gd.sid]
-				local lf = nd and nd.lerpedFrame
-				if lf then
-					if L then lPos, lAng = lf.lefthandPos, lf.lefthandAng end
-					if R then rPos, rAng = lf.righthandPos, lf.righthandAng end
-				end
-			end
-
-			local wpos, wang
-			if L and R and lPos and lAng and rPos and rAng then
-				local pA, aA = LocalToWorld(L.localPos, L.localAng, lPos, lAng)
-				local pB, aB = LocalToWorld(R.localPos, R.localAng, rPos, rAng)
-				wpos = (pA + pB) * 0.5
-				wang = LerpAngle(0.5, aA, aB)
-			elseif L and lPos and lAng then
-				wpos, wang = LocalToWorld(L.localPos, L.localAng, lPos, lAng)
-			elseif R and rPos and rAng then
-				wpos, wang = LocalToWorld(R.localPos, R.localAng, rPos, rAng)
-			end
-
-			if not wpos then ent:DrawModel() return end
-			ent:SetPos(wpos)
-			ent:SetAngles(wang)
-			ent:SetupBones()
-			ent:DrawModel()
+		if isLocal and cvDbg:GetBool() then
+			print(string.format("[VRMod Grab] held %s %s |off| %.2f", bLeftHand and "L" or "R", tostring(ent), localPos:Length()))
 		end
-
+		-- A ragdoll draws its bones where the server's physics has them (world
+		-- space); moving its origin here did nothing but a SetupBones a draw
+		if ent:GetClass() == "prop_ragdoll" then
+			hook.Call("VRMod_Pickup", nil, ply, ent)
+			return
+		end
+		ent.RenderOverride = Gate
+		heldDraw[ent] = ent.vrmod_grabData
 		hook.Call("VRMod_Pickup", nil, ply, ent)
 	end
 
@@ -249,14 +388,7 @@ end
 				local heldKey = bLeftHand and "heldEntityLeft" or "heldEntityRight"
 				if g_VR[heldKey] == ent then g_VR[heldKey] = nil end
 			end
-			if ent.vrmod_grabData then
-				local key = bLeftHand and "left" or "right"
-				ent.vrmod_grabData[key] = nil
-				if not ent.vrmod_grabData.left and not ent.vrmod_grabData.right then
-					ent.RenderOverride = nil
-					ent.vrmod_grabData = nil
-				end
-			end
+			ClearGrab(ent, bLeftHand)
 			hook.Call("VRMod_Drop", nil, ply, ent)
 			return
 		end
@@ -382,98 +514,80 @@ if SERVER then
 		vrmod.utils.ReleasePickupEntry(index, info, handVel)
 	end
 
-	function vrmod.Pickup(ply, bLeftHand, ent)
+	-- hP/hA: the client's raw controller pose at the press, which its
+	-- offset was measured on. Props and ragdoll bones are anchored to that,
+	-- not to a pose a collision had pushed or the network had delayed.
+	-- Trusted near the hand the server has.
+	local WorldToLocal = WorldToLocal
+	function vrmod.Pickup(ply, bLeftHand, ent, cPos, cAng, hP, hA)
 		ply.vrmod_pickup_left_hand = bLeftHand
 		if not vrmod.utils.ValidatePickup(ply, bLeftHand, ent) then return end
 		ent = vrmod.utils.HandleNPCRagdoll(ply, ent)
-		local handPos, handAng = vrmod.utils.GetHandTransform(ply, bLeftHand)
+		if not IsValid(ent) then return end
+		local handPos, handAng, fresh = vrmod.utils.GetHandTransform(ply, bLeftHand)
 		if not handPos or not handAng then return end
-		if ent:GetClass() == "prop_ragdoll" then
-			ent.vrmod_physOffsets = vrmod.utils.BuildRagdollOffsets(ent, handPos, handAng)
-		end
-		-- Use PASSABLE_DOOR for both ragdolls and props so held entities
-		-- never collide with the player or VR hands while being carried
-	local controller = vrmod.utils.InitPickupController()
-	local info = vrmod.utils.CreatePickupInfo(ply, bLeftHand, ent, handPos, handAng)
-	-- Set PASSABLE_DOOR after CreatePickupInfo snapshots the original collision group
-	ent:SetCollisionGroup(COLLISION_GROUP_PASSABLE_DOOR)
+		local dHand = hP and hP:Distance(handPos) or -1
+		local src = fresh and "fresh" or "frame"
+		if hP and dHand <= 64 then handPos, handAng, src = hP, hA, "client" end
+		local rag = ent:GetClass() == "prop_ragdoll"
+		local controller = vrmod.utils.InitPickupController()
+		local info = vrmod.utils.CreatePickupInfo(ply, bLeftHand, ent, handPos, handAng, cPos, cAng)
+		-- After CreatePickupInfo snapshots the original collision group. A
+		-- held prop keeps it, so it still hits other players: its holder
+		-- passes through it by the owner rule (PatchOwnerCollision) and its
+		-- hands by sv_physhands' Held. PASSABLE_DOOR, which every player
+		-- passes through, only where that rule isn't set: ragdolls, and
+		-- vrmod_pickup_no_phys.
+		if rag or GetConVar("vrmod_pickup_no_phys"):GetBool() then ent:SetCollisionGroup(COLLISION_GROUP_PASSABLE_DOOR) end
 		vrmod.utils.AttachPhysicsToController(info, controller)
 
-		-- Two-hand prop grab detection: if both heldItems now reference the
-		-- same non-ragdoll entity, enter two-hand mode.
-		if ent:GetClass() ~= "prop_ragdoll" then
-			local sid = ply:SteamID()
-			local held = g_VR[sid] and g_VR[sid].heldItems
-			if held and held[1] and held[2]
-			   and IsValid(held[1].ent) and held[1].ent == held[2].ent then
+		if not rag then
+			-- Both heldItems on the same prop: two-hand mode
+			local held = g_VR[ply:SteamID()]
+			held = held and held.heldItems
+			if held and held[1] and held[2] and IsValid(held[1].ent) and held[1].ent == held[2].ent then
 				vrmod.utils.SetupTwoHand(ply, ent, held[1], held[2], bLeftHand)
 			end
-		end
-
-		-- Ragdoll grab system:
-		-- Each hand controls the single nearest bone. A per-bone map on the entity
-		-- (ent.vrmod_bone_hand_map) tells PhysicsSimulate which hand's info to use
-		-- for each bone, enabling simultaneous two-hand ragdoll manipulation.
-		-- Connected bones follow naturally via ragdoll joint constraints.
-		if ent:GetClass() == "prop_ragdoll" and IsValid(controller) then
-			-- Initialize per-bone hand map if not present
-			ent.vrmod_bone_hand_map = ent.vrmod_bone_hand_map or {}
-
-			-- Build a set of bone physics indices already claimed by the OTHER hand
-			local claimedByOtherHand = {}
-			for physIdx, otherInfo in pairs(ent.vrmod_bone_hand_map) do
-				if otherInfo and otherInfo ~= info and otherInfo.left ~= bLeftHand then
-					claimedByOtherHand[physIdx] = true
-				end
-			end
-
-			-- Build per-hand offsets so each hand's bones track relative to THAT hand
-			local handOffsets = {}
-			for i = 0, ent:GetPhysicsObjectCount() - 1 do
-				local bonePhys = ent:GetPhysicsObjectNum(i)
-				if IsValid(bonePhys) then
-					local physPos, physAng = bonePhys:GetPos(), bonePhys:GetAngles()
-					local lpos, lang = WorldToLocal(physPos, physAng, handPos, handAng)
-					handOffsets[i] = { localPos = lpos, localAng = lang }
-				end
-			end
-			info.vrmod_physOffsets = handOffsets
-
-			-- Find nearest unclaimed bone to this hand
-			local nearestPhys, nearestIdx, nearestDist, nearestIsRoot
-			for i = 0, ent:GetPhysicsObjectCount() - 1 do
-				local bonePhys = ent:GetPhysicsObjectNum(i)
-				if IsValid(bonePhys) and not claimedByOtherHand[i] then
-					local dist = bonePhys:GetPos():DistToSqr(handPos)
-					if not nearestDist or dist < nearestDist then
-						nearestPhys, nearestIdx, nearestDist, nearestIsRoot = bonePhys, i, dist, (bonePhys == info.phys)
-					end
-				end
-			end
-
-			-- Attach nearest unclaimed bone to this hand
-			local bonePhysList = {}
-			if nearestPhys then
-				if not nearestIsRoot then
-					controller:AddToMotionController(nearestPhys)
-				end
-				nearestPhys:Wake()
-				nearestPhys:SetMass(8)
-				nearestPhys:SetDamping(0, 0)
-				bonePhysList[1] = nearestPhys
-				ent.vrmod_bone_hand_map[nearestIdx] = info
-			end
-			-- Store refs on the info (not entity) for per-hand cleanup on drop
-			info.ragdoll_bone_phys = bonePhysList
-			-- Reduce damping on all bones so connected joints flow freely
+		elseif IsValid(controller) then
+			-- Each hand drives the nearest bone the other hand hasn't claimed;
+			-- ent.vrmod_bone_hand_map tells PhysicsSimulate which hand drives
+			-- which bone, so both hands can hold one ragdoll. Connected bones
+			-- follow through the joints. Offsets for every bone are kept per
+			-- hand: the root rides along on the latest hand's.
+			local map = ent.vrmod_bone_hand_map or {}
+			ent.vrmod_bone_hand_map = map
+			local offsets, best, bestIdx, bestD = {}, nil, nil, nil
 			for i = 0, ent:GetPhysicsObjectCount() - 1 do
 				local bp = ent:GetPhysicsObjectNum(i)
-				if IsValid(bp) then bp:SetDamping(0, 0.5) end
+				if IsValid(bp) then
+					local p = bp:GetPos()
+					local lp, la = WorldToLocal(p, bp:GetAngles(), handPos, handAng)
+					offsets[i] = {localPos = lp, localAng = la}
+					local o = map[i]
+					if not (o and o ~= info and o.left ~= bLeftHand) then
+						local d = p:DistToSqr(handPos)
+						if not bestD or d < bestD then best, bestIdx, bestD = bp, i, d end
+					end
+					bp:SetDamping(0, 0.5) -- connected joints flow freely
+				end
 			end
-			vrmod.logger.Debug("Pickup: Attached " .. #bonePhysList .. " ragdoll bone physics to " .. (bLeftHand and "left" or "right") .. " hand controller for " .. tostring(ent))
+			info.vrmod_physOffsets = offsets
+			info.ragdoll_bone_phys = {best}
+			if best then
+				if best ~= info.phys then controller:AddToMotionController(best) end
+				best:Wake()
+				best:SetMass(8)
+				map[bestIdx] = info
+				-- The grabbed bone's offset: the client's debug draw reads it
+				local o = offsets[bestIdx]
+				info.localPos, info.localAng = o.localPos, o.localAng
+			end
 		end
 
 		vrmod.utils.SendPickupNetMessage(ply, ent, bLeftHand, info.localPos, info.localAng)
+		if ply:GetInfoNum("vrmod_debug_grab", 0) ~= 0 then
+			ply:PrintMessage(HUD_PRINTCONSOLE, string.format("[VRMod Grab] sv %s %s hand=%s (client vs server %.2f) offset=%s |off| %.2f", bLeftHand and "L" or "R", tostring(ent), src, dHand, info.offSrc or "?", info.localPos:Length()))
+		end
 	end
 
 	vrmod.NetReceiveLimited("vrmod_pickup", 10, 400, function(len, ply)
@@ -485,8 +599,10 @@ if SERVER then
 			vrmod.Drop(ply:SteamID(), bLeft)
 		else
 			local ent = net.ReadEntity()
+			local cPos, cAng, hP, hA
+			if net.ReadBool() then cPos, cAng, hP, hA = net.ReadVector(), net.ReadAngle(), net.ReadVector(), net.ReadAngle() end
 			vrmod.logger.Debug("Calling vrmod.Pickup for entity: " .. tostring(ent))
-			vrmod.Pickup(ply, bLeft, ent)
+			vrmod.Pickup(ply, bLeft, ent, cPos, cAng, hP, hA)
 		end
 	end)
 

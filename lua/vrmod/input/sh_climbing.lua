@@ -8,6 +8,7 @@ local COAST_TIMEOUT = 0.35 -- ceiling on the freeze phase of the post-throw hand
 local SETTLE_RATE = 4 -- 1/seconds: the offset built up running ahead of the server eases out over 0.25s
 local LEDGE_SCAN_RATE = 0.1
 local VAULT_STICK_THRESHOLD = 0.5
+local VAULT_FLOOR = 8 -- vault box bottom above the feet; lower than this is a step, not a vault
 local SYNC_INTERVAL = 0.033 -- send position to server ~30hz during climbing
 local HULL_MINS = Vector(-3, -3, 0)
 local HULL_MAXS = Vector(3, 3, 36)
@@ -19,10 +20,12 @@ local tr = {
 	maxs = Vector(GRAB_HULL, GRAB_HULL, GRAB_HULL),
 	mask = MASK_SOLID_BRUSHONLY, filter = nil,
 }
+local boxRes, fitRes = {}, {}
+local boxTr = { start = Vector(), endpos = Vector(), mins = Vector(), maxs = Vector(0, 0, 1), mask = MASK_PLAYERSOLID, output = boxRes }
 local hullTr = {
 	start = Vector(), endpos = Vector(),
 	mins = HULL_MINS, maxs = HULL_MAXS,
-	mask = MASK_PLAYERSOLID, filter = nil,
+	mask = MASK_PLAYERSOLID, filter = nil, output = fitRes,
 }
 local lineTr = { start = Vector(), endpos = Vector(), mask = MASK_PLAYERSOLID, filter = nil }
 
@@ -40,14 +43,14 @@ local SetMoveType = FindMetaTable("Entity").SetMoveType
 
 -- server-authoritative whitelist convars (replicated so clients can read them)
 local sv_climbing_ledgeonly = CreateConVar("vrmod_sv_climbing_ledgeonly", "0", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Force whitelist ledges for all VR players")
-local sv_climbing_ladderonly = CreateConVar("vrmod_sv_climbing_ladderonly", "0", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Force whitelist ladders for all VR players")
+local sv_climbing_ladderonly = CreateConVar("vrmod_sv_climbing_ladderonly", "1", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Force whitelist ladders for all VR players")
 
 -- Throw tuning is gameplay, so it belongs to the server. It used to be a plain
 -- FCVAR_ARCHIVE convar, which on a client is just a client convar: the client
 -- scaled and capped its own launch velocity and the server applied whatever
 -- arrived, so vrmod_brushclimb_throw 10 (or a forged vector) was a free
 -- cross-map launch. Replicated now, and enforced in the net handler.
-local sv_throw = CreateConVar("vrmod_sv_climbing_throw", "2.5", FCVAR_ARCHIVE + FCVAR_REPLICATED + FCVAR_NOTIFY, "Throw force multiplier for climbing momentum", 0, 10)
+local sv_throw = CreateConVar("vrmod_sv_climbing_throw", "1", FCVAR_ARCHIVE + FCVAR_REPLICATED + FCVAR_NOTIFY, "Throw force multiplier for climbing momentum", 0, 10)
 local sv_throwmin = CreateConVar("vrmod_sv_climbing_throwmin", "40", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Minimum release speed that counts as a throw (below this you just let go)", 0, 400)
 local sv_throwmax = CreateConVar("vrmod_sv_climbing_throwmax", "800", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Hard cap on launch speed off a wall", 0, 2000)
 
@@ -55,21 +58,24 @@ if CLIENT then
 
 	g_VR = g_VR or {}
 
-	local convars = vrmod.AddCallbackedConvar("vrmod_brushclimb", nil, "0")
+	local convars = vrmod.AddCallbackedConvar("vrmod_brushclimb", nil, "1")
 	local cv_ledge = CreateClientConVar("vrmod_brushclimb_ledge", "1", true, false, "Enable ledge vaulting while climbing")
 	local cv_marker = CreateClientConVar("vrmod_brushclimb_marker", "1", true, false, "Show landing marker on detected ledges")
 	local cv_ledgeonly = CreateClientConVar("vrmod_brushclimb_ledgeonly", "0", true, false, "Whitelist: only grab near ledge tops")
 	local cv_ladderonly = CreateClientConVar("vrmod_brushclimb_ladderonly", "0", true, false, "Whitelist: only grab ladder surfaces")
-	local cv_ledgereach = CreateClientConVar("vrmod_brushclimb_ledgereach", "48", true, false, "Max height above hand to detect a ledge", 8, 96)
-	local cv_vaultreach = CreateClientConVar("vrmod_brushclimb_vaultreach", "48", true, false, "Horizontal scan range for vault targets", 16, 128)
-	local cv_vaultmin = CreateClientConVar("vrmod_brushclimb_vaultmin", "24", true, false, "Min horizontal distance for vault target", 8, 64)
+	local cv_ledgereach = CreateClientConVar("vrmod_brushclimb_ledgereach", "24", true, false, "Max height above hand to detect a ledge", 8, 96)
+	local cv_vaultreach = CreateClientConVar("vrmod_brushclimb_vaultreach", "31", true, false, "Vault box: far edge, distance ahead of the head", 16, 128)
+	local cv_vaultmin = CreateClientConVar("vrmod_brushclimb_vaultmin", "8", true, false, "Vault box: near edge, distance ahead of the head", 8, 64)
+	local cv_vaultheight = CreateClientConVar("vrmod_brushclimb_vaultheight", "32", true, false, "Vault box: how far above the head it extends", 0, 96)
+	local cv_vaultwidth = CreateClientConVar("vrmod_brushclimb_vaultwidth", "24", true, false, "Vault box: side-to-side width", 8, 64)
+	local cv_vaultdebug = CreateClientConVar("vrmod_brushclimb_vaultdebug", "0", true, false, "Draw the vault box while climbing")
 	local cv_magnet = CreateClientConVar("vrmod_brushclimb_magnet", "1", true, false, "Snap hand to wall surface when grabbing")
 	local cv_magnetoff = CreateClientConVar("vrmod_brushclimb_magnet_offset", "2", true, false, "Palm offset from wall for magnet grab", 0, 8)
-	local cv_reach = CreateClientConVar("vrmod_brushclimb_reach", "2", true, false, "Hand grab reach distance", 0, 32)
+	local cv_reach = CreateClientConVar("vrmod_brushclimb_reach", "3", true, false, "Hand grab reach distance", 0, 32)
 	local cv_ladderreach = CreateClientConVar("vrmod_brushclimb_ladderreach", "24", true, false, "Hand grab reach inside ladder zones (clip brushes removed leave the wall deeper)", 0, 64)
-	local cv_smooth = CreateClientConVar("vrmod_brushclimb_smooth", "0", true, false, "Climb position smoothing (0 = exact 1:1)", 0, 0.9)
+	local cv_smooth = CreateClientConVar("vrmod_brushclimb_smooth", "0.62", true, false, "Climb position smoothing (0 = exact 1:1)", 0, 0.9)
 	local cv_nofloor = CreateClientConVar("vrmod_brushclimb_nofloor", "1", true, false, "Prevent grabbing walkable floors")
-	local cv_requireboth = CreateClientConVar("vrmod_brushclimb_requireboth", "0", true, false, "Require both grip and trigger held to grab walls")
+	local cv_requireboth = CreateClientConVar("vrmod_brushclimb_requireboth", "1", true, false, "Require both grip and trigger held to grab walls")
 	local cv_anticlipgrace = CreateClientConVar("vrmod_brushclimb_anticlipgrace", "0.7", true, false, "Seconds after letting go of a wall before head anti-clip resumes", 0, 5)
 
 	-- Restore every climbing tuning convar to its built-in default in one shot (master enable is left alone).
@@ -77,7 +83,7 @@ if CLIENT then
 		local cvs = {
 			cv_requireboth, cv_nofloor, cv_magnet, cv_magnetoff, cv_reach, cv_smooth,
 			cv_ladderreach, cv_ledge, cv_marker, cv_ledgeonly, cv_ladderonly,
-			cv_ledgereach, cv_vaultreach, cv_vaultmin, cv_anticlipgrace,
+			cv_ledgereach, cv_vaultreach, cv_vaultmin, cv_vaultheight, cv_vaultwidth, cv_vaultdebug, cv_anticlipgrace,
 		}
 		for i = 1, #cvs do RunConsoleCommand(cvs[i]:GetName(), cvs[i]:GetDefault()) end
 		print("[VRMod] Climbing settings reset to defaults")
@@ -206,20 +212,49 @@ if CLIENT then
 	local COLOR_LEDGE = Color(7, 255, 0, 200)
 	local COLOR_HIDDEN = Color(0, 0, 0, 0)
 
-	-- Ladder surface detection: texture match + cached AABB zones (survives entity removal)
+	-- Ladder surface detection: texture match + AABB zones of the map's ladder
+	-- entities. The zones come from the server: this used to scan for them on
+	-- the client at InitPostEntity, but func_useableladder only transmits in
+	-- PVS, so it only ever saw the ladders visible from spawn -- and once the
+	-- whitelist removes the entities, a later join or map load saw none. HL2
+	-- ladders are static props ("**studio**", never a LADDER texture), so the
+	-- zone was their only way through the whitelist. 12u margin: an HL2
+	-- ladder volume is the player's mount path, just in front of the rungs.
 	local string_find, string_upper = string.find, string.upper
 	local ladderZones = {} -- {minx,miny,minz,maxx,maxy,maxz} per ladder entity
-	local function CacheLadderZones()
-		for _, class in ipairs({"func_ladder", "func_useableladder"}) do
-			for _, ent in ipairs(ents.FindByClass(class)) do
-				local pos = ent:GetPos()
-				local mn, mx = ent:GetCollisionBounds()
-				local n = #ladderZones + 1
-				ladderZones[n] = {pos.x+mn.x-8, pos.y+mn.y-8, pos.z+mn.z-8, pos.x+mx.x+8, pos.y+mx.y+8, pos.z+mx.z+8}
-			end
+	local zoneDump = false
+	local function ZoneOf(p)
+		if not p then return "-" end
+		local x, y, z = p.pos.x, p.pos.y, p.pos.z
+		for i = 1, #ladderZones do
+			local b = ladderZones[i]
+			if x >= b[1] and x <= b[4] and y >= b[2] and y <= b[5] and z >= b[3] and z <= b[6] then return "zone " .. i end
 		end
+		return "none"
 	end
-	hook.Add("InitPostEntity", "brushclimb_cache", CacheLadderZones)
+	net.Receive("vrmod_brushclimb_ladderzones", function()
+		local n = net.ReadUInt(12)
+		for i = 1, n do
+			local mn, mx = net.ReadVector(), net.ReadVector()
+			ladderZones[i] = {mn.x - 12, mn.y - 12, mn.z - 12, mx.x + 12, mx.y + 12, mx.z + 12}
+		end
+		for i = n + 1, #ladderZones do ladderZones[i] = nil end
+		if not zoneDump then return end
+		zoneDump = false
+		local t = g_VR.tracking or {}
+		print(("[Brushclimb] client: %d ladder zones; left hand: %s, right hand: %s"):format(n, ZoneOf(t.pose_lefthand), ZoneOf(t.pose_righthand)))
+		for i = 1, n do
+			local b = ladderZones[i]
+			print(("  zone %d: %.0f %.0f %.0f -> %.0f %.0f %.0f"):format(i, b[1], b[2], b[3], b[4], b[5], b[6]))
+		end
+	end)
+	-- Re-requests the zones and dumps both ends: the server prints what it
+	-- found, the client what arrived and which zone each hand is in.
+	concommand.Add("vrmod_brushclimb_ladderzones", function()
+		zoneDump = true
+		net.Start("vrmod_brushclimb_ladderzones")
+		net.SendToServer()
+	end, nil, "Re-request ladder zones from the server and print them")
 
 	local function IsLadderSurface(hx, hy, hz, hitTexture)
 		if hitTexture and string_find(string_upper(hitTexture), "LADDER", 1, true) then return true end
@@ -334,62 +369,91 @@ if CLIENT then
 		return nil
 	end
 
+	-- Vault box: HMD-yaw aligned, in front of and above the head. Near/far
+	-- edges = vaultmin/vaultreach, width = vaultwidth, from VAULT_FLOOR over the
+	-- feet up to vaultheight over the head (pulled under any ceiling).
+	-- Farthest standable point wins: cells are swept far -> near, each with ONE
+	-- flat-plate hull top -> bottom (first hit = highest surface in the cell),
+	-- and inside a walkable cell landing spots are tried far side -> near side.
+	-- A spot must be reachable (clear player-hull path at ledge height from
+	-- over the head) and supported. Typical scan: 1 line + 3 hulls.
+	local boxPos, boxAng, boxMin, boxMax = Vector(), Angle(), Vector(), Vector()
+
+	-- Path first, support last, so fitRes holds the support hit on success.
+	local function CanLand(hx, hy, x, y, z)
+		local s, e = hullTr.start, hullTr.endpos
+		s.x, s.y, s.z = hx, hy, z + 2
+		e.x, e.y, e.z = x, y, z + 2
+		util.TraceHull(hullTr)
+		if fitRes.Hit or fitRes.StartSolid then return false end
+		s.x, s.y = x, y
+		e.z = z - 4
+		util.TraceHull(hullTr)
+		return fitRes.Hit and not fitRes.StartSolid and fitRes.HitNormal.z >= 0.7
+	end
+
 	local function ScanForLedge()
 		if not cv_ledge:GetBool() then return nil end
-
 		local ply = LocalPlayer()
-		lineTr.filter = ply
-		hullTr.filter = ply
+		boxTr.filter, hullTr.filter = ply, ply
+		local hmd = g_VR.tracking.hmd
+		local hp = hmd.pos
+		local hx, hy = hp.x, hp.y
+		local yaw = hmd.ang.yaw
+		_tmpAng.p, _tmpAng.y, _tmpAng.r = 0, yaw, 0
+		local fwd = _tmpAng:Forward()
+		local fx, fy = fwd.x, fwd.y
+		local s = cv_vaultwidth:GetFloat() * 0.5
+		local near, far = cv_vaultmin:GetFloat(), cv_vaultreach:GetFloat()
+		local bottom = g_VR.origin.z + VAULT_FLOOR
 
-		-- use highest grab point as base Z; fall back to origin if grabs are below it
-		local bestZ = g_VR.origin.z
-		local bestNormal = nil
-		for i = 1, 2 do
-			local h = hands[i]
-			if h.grabPos then
-				if h.grabPos.z > bestZ then
-					bestZ = h.grabPos.z
-				end
-				bestNormal = bestNormal or h.wallNormal
-			end
-		end
-		if not bestNormal then return nil end
+		-- top: vaultheight over the head, clamped under a ceiling (hull is 1u tall)
+		local st, en = boxTr.start, boxTr.endpos
+		st.x, st.y, st.z = hx, hy, hp.z
+		en.x, en.y, en.z = hx, hy, hp.z + cv_vaultheight:GetFloat()
+		util.TraceLine(boxTr)
+		local top = boxRes.HitPos.z - 2
 
-		local hmdPos = g_VR.tracking.hmd.pos
-		local hmdX, hmdY = hmdPos.x, hmdPos.y
-		_tmpAng.p, _tmpAng.y, _tmpAng.r = 0, g_VR.tracking.hmd.ang.yaw, 0
-		local hmdFwd = _tmpAng:Forward()
-		local dirs = { hmdFwd, bestNormal }
-		local vaultReach = cv_vaultreach:GetInt()
-		local vaultMinSq = cv_vaultmin:GetFloat() ^ 2
-		for d = 1, 2 do
-			local dir = dirs[d]
-			for dist = 16, vaultReach, 16 do
-				local probeX = hmdX + dir.x * dist
-				local probeY = hmdY + dir.y * dist
+		-- debug box (local frame: x = forward, y = left, z absolute)
+		boxPos.x, boxPos.y, boxAng.y = hx, hy, yaw
+		boxMin.x, boxMin.y, boxMin.z = near, -s, bottom
+		boxMax.x, boxMax.y, boxMax.z = far, s, top
 
-				lineTr.start.x, lineTr.start.y, lineTr.start.z = probeX, probeY, bestZ
-				lineTr.endpos.x, lineTr.endpos.y, lineTr.endpos.z = probeX, probeY, bestZ + 72
-				local upRes = util.TraceLine(lineTr)
-				local topZ = upRes.Hit and (upRes.HitPos.z - 1) or (bestZ + 72)
-
-				lineTr.start.z = topZ
-				lineTr.endpos.z = topZ - 72
-				local downRes = util.TraceLine(lineTr)
-				if downRes.Hit and downRes.HitNormal.z >= 0.7 then
-					local pos = downRes.HitPos
-					local dx, dy = pos.x - hmdX, pos.y - hmdY
-					if dx * dx + dy * dy >= vaultMinSq then
-						hullTr.start.x, hullTr.start.y, hullTr.start.z = pos.x, pos.y, pos.z + 1
-						hullTr.endpos.x, hullTr.endpos.y, hullTr.endpos.z = pos.x, pos.y, pos.z + 2
-						if not util.TraceHull(hullTr).Hit then
-							return pos, downRes.HitNormal, downRes.MatType
-						end
+		if top <= bottom then return nil end
+		local mn, mx = boxTr.mins, boxTr.maxs
+		mn.x, mn.y, mx.x, mx.y = -s, -s, s, s
+		-- landing offsets inside a cell: far side, centre, near side (player hull is 3u half-width)
+		local k = s > 3 and s - 3 or 1
+		local d = far - s
+		repeat
+			local cx, cy = hx + fx * d, hy + fy * d
+			st.x, st.y, st.z = cx, cy, top
+			en.x, en.y, en.z = cx, cy, bottom
+			util.TraceHull(boxTr)
+			if boxRes.Hit and not boxRes.StartSolid and boxRes.HitNormal.z >= 0.7 then
+				local z, mat = boxRes.HitPos.z, boxRes.MatType
+				for o = k, -k, -k do
+					if CanLand(hx, hy, cx + fx * o, cy + fy * o, z) then
+						return fitRes.HitPos, fitRes.HitNormal, mat
 					end
 				end
 			end
-		end
+			d = d - s - s
+		until d + s <= near
 		return nil
+	end
+
+	local function DrawVaultBox(depth, sky)
+		if depth or sky or not refHand then return end
+		render.DrawWireframeBox(boxPos, boxAng, boxMin, boxMax, COLOR_LEDGE, true)
+	end
+
+	local function SyncVaultDebug(on)
+		if on then
+			hook.Add("PostDrawTranslucentRenderables", "brushclimb_vaultbox", DrawVaultBox)
+		else
+			hook.Remove("PostDrawTranslucentRenderables", "brushclimb_vaultbox")
+		end
 	end
 
 	local function CreateMarker()
@@ -871,6 +935,7 @@ if CLIENT then
 			end
 		end)
 		SyncLadderSuppress()
+		SyncVaultDebug(cv_vaultdebug:GetBool())
 	end
 
 	local function DisableClimbing()
@@ -881,6 +946,7 @@ if CLIENT then
 		hook.Remove("PreRender", "brushclimb")
 		hook.Remove("SetupMove", "vrmod_brushclimb_ladder")
 		RemoveMarker()
+		SyncVaultDebug(false)
 		-- always clear ladder suppress on disable (VRMod_Exit leaves convar on)
 		net.Start("vrmod_brushclimb_noladder")
 		net.WriteBool(false)
@@ -924,6 +990,11 @@ if CLIENT then
 		if g_VR.active and convars.vrmod_brushclimb:GetBool() then SyncLadderSuppress() end
 	end, "vrmod_brushclimb_ladderonly")
 
+	cvars.RemoveChangeCallback("vrmod_brushclimb_vaultdebug", "vrmod_brushclimb_vaultdebug")
+	cvars.AddChangeCallback("vrmod_brushclimb_vaultdebug", function(_, _, new)
+		SyncVaultDebug(new ~= "0" and g_VR.active and convars.vrmod_brushclimb:GetBool())
+	end, "vrmod_brushclimb_vaultdebug")
+
 	hook.Add("VRMod_Start", "brushclimb", function()
 		if convars.vrmod_brushclimb:GetBool() then EnableClimbing() end
 	end)
@@ -936,16 +1007,48 @@ elseif SERVER then
 	util.AddNetworkString("vrmod_brushclimb_state")
 	util.AddNetworkString("vrmod_brushclimb_sync")
 	util.AddNetworkString("vrmod_brushclimb_noladder")
+	util.AddNetworkString("vrmod_brushclimb_ladderzones")
 
 	-- engine ladder suppression per player
 	local suppressLadder = {}
 	local laddersRemoved = false
 
+	-- Ladder zones: every ladder entity's world AABB, taken once per map before
+	-- anything removes them. The server sees them all; a client only sees the
+	-- ones in its PVS (see the client receiver).
+	local LADDER_CLASSES = {"func_ladder", "func_useableladder"}
+	local zoneMin, zoneMax, zoneN, zonesBuilt = {}, {}, 0, false
+	local function BuildLadderZones()
+		if zonesBuilt then return end
+		zoneN = 0
+		for i = 1, 2 do
+			for _, ent in ipairs(ents.FindByClass(LADDER_CLASSES[i])) do
+				zoneN = zoneN + 1
+				zoneMin[zoneN], zoneMax[zoneN] = ent:WorldSpaceAABB()
+			end
+		end
+		-- An empty result doesn't latch: whatever was early can try again
+		zonesBuilt = zoneN > 0
+	end
+	hook.Add("InitPostEntity", "vrmod_brushclimb_ladderzones", BuildLadderZones)
+
+	local function SendLadderZones(ply)
+		BuildLadderZones()
+		net.Start("vrmod_brushclimb_ladderzones")
+		net.WriteUInt(zoneN, 12)
+		for i = 1, zoneN do
+			net.WriteVector(zoneMin[i])
+			net.WriteVector(zoneMax[i])
+		end
+		if ply then net.Send(ply) else net.Broadcast() end
+	end
+
 	local function RemoveLadderEntities()
 		if laddersRemoved then return end
 		laddersRemoved = true
-		for _, class in ipairs({"func_ladder", "func_useableladder"}) do
-			for _, ent in ipairs(ents.FindByClass(class)) do ent:Remove() end
+		BuildLadderZones()
+		for i = 1, 2 do
+			for _, ent in ipairs(ents.FindByClass(LADDER_CLASSES[i])) do ent:Remove() end
 		end
 		-- catch late-spawned ladder ents
 		hook.Add("OnEntityCreated", "vrmod_brushclimb_ladder", function(ent)
@@ -968,14 +1071,26 @@ elseif SERVER then
 		end
 	end
 
+	vrmod.NetReceiveLimited("vrmod_brushclimb_ladderzones", 2, 0, function(_, ply)
+		print(("[Brushclimb] server: func_ladder %d, func_useableladder %d, func_ladderendpoint %d | zones %d (built %s) | ladders removed %s"):format(
+			#ents.FindByClass("func_ladder"), #ents.FindByClass("func_useableladder"), #ents.FindByClass("func_ladderendpoint"),
+			zoneN, tostring(zonesBuilt), tostring(laddersRemoved)))
+		SendLadderZones(ply)
+	end)
+
+	-- Sent whenever a client starts climbing or flips its ladder whitelist, so
+	-- the zones ride along exactly when it needs them.
 	vrmod.NetReceiveLimited("vrmod_brushclimb_noladder", 5, 32, function(_, ply)
-		suppressLadder[ply] = net.ReadBool() or nil
+		local on = net.ReadBool()
+		suppressLadder[ply] = on or nil
 		UpdateLadderSuppression()
+		if on then SendLadderZones(ply) end
 	end)
 
 	-- server convar forces ladder suppression for all players
-	cvars.AddChangeCallback("vrmod_sv_climbing_ladderonly", function()
+	cvars.AddChangeCallback("vrmod_sv_climbing_ladderonly", function(_, _, new)
 		UpdateLadderSuppression()
+		if tobool(new) then SendLadderZones() end
 	end, "vrmod_sv_climbing_ladderonly")
 
 	local function ShouldSuppressLadder(ply)

@@ -10,7 +10,13 @@ if CLIENT then
 	local _, convarValues = vrmod.GetConvars()
 	local uioutline = CreateClientConVar("vrmod_ui_outline", 0, true, FCVAR_ARCHIVE, nil, 0, 1)
 	local cv_pointer = CreateClientConVar("vrmod_pointer_hand", "0", true, false, "Which hand points at menus: 0=right 1=left", 0, 1)
-	local cv_float = CreateClientConVar("vrmod_menu_float", "1", true, false, "Menus float in world instead of attaching to hand", 0, 1)
+		-- Placement of hand-attached menus other than the quick menu (spawn and
+	-- context menus, other popups, chat, keyboard, numpad). Was a 0/1 float
+	-- toggle; 0 and 1 keep their meaning, so saved values carry over.
+	-- 0 follow hand, 1 stay where opened at hand, 2 open in front of you
+	-- and stay, 3 follow where you look.
+	local cv_float = CreateClientConVar("vrmod_menu_float", "1", true, false, "Menu placement: 0 follow hand, 1 stay where opened, 2 in front of you, 3 follow where you look", 0, 3)
+	local cv_smooth = CreateClientConVar("vrmod_menu_smooth", "0.3", true, false, "Smoothing for menus that follow the hand or your view (0 = rigid)", 0, 1)
 	local cv_qmfloat = CreateClientConVar("vrmod_quickmenu_float", "0", true, false, "Quick menu floats in world instead of attaching to hand", 0, 1)
 	local cv_menuscale = CreateClientConVar("vrmod_menu_scale", "1", true, false, "Scale multiplier for popup menus", 0.1, 2)
 	local rt_beam = GetRenderTarget("vrmod_rt_beam", 64, 64, false)
@@ -45,6 +51,62 @@ if CLIENT then
 	local prevFocusPanel = nil
 	local floatAnchorPos, floatAnchorAng
 	UpdateBeamColor(convarValues.vrmod_beam_color)
+
+	-- In front of you: a stand-in for the hand, placed so a popup (opened
+	-- at REF on the hand, cl_dermapopups) lands centred VIEW_DIST ahead,
+	-- level, facing you. Other menus keep their offsets from it, so chat
+	-- and its keyboard stay laid out as on the hand. Yaw and pitch only.
+	-- The quad's normal (Up) faces you, x runs right (Forward), y down.
+	-- The popup's size is the desktop's, taken when a menu opens: drawn
+	-- inside an eye, ScrW/ScrH are that render target's (far wider), which
+	-- threw a following menu way off to the left.
+	local VIEW_DIST, POPUP_SCALE = 40, 0.02
+	local INV_P, INV_A = WorldToLocal(vector_origin, angle_zero, Vector(10, 10, 5), Angle(0, -90, 50))
+	local _va, scrW, scrH = Angle(), ScrW(), ScrH()
+	local function ViewAnchor()
+		local hmd = g_VR.tracking.hmd
+		_va:SetUnpacked(hmd.ang.p, hmd.ang.y, 0)
+		local f, r, u = _va:Forward(), _va:Right(), _va:Up()
+		local s = POPUP_SCALE * cv_menuscale:GetFloat() * 0.5
+		local hw, hh = scrW * s, scrH * s
+		local p = hmd.pos + f * VIEW_DIST - r * hw + u * hh
+		f:Negate()
+		return LocalToWorld(INV_P, INV_A, p, r:AngleEx(f))
+	end
+
+	-- Following menus trail their anchor (hand, or the view stand-in) by a
+	-- time constant, smoothed in playspace (origin-relative) so walking,
+	-- teleport and snap turn never drag them. Forward/up lerp + AngleEx:
+	-- gimbal-safe where per-component Euler lerp spins. Stepped once per
+	-- frame: the menus are drawn once per eye.
+	local SMOOTH_MAX = 0.3 -- s, at slider 1
+	local sP, sF, sU, sLive, sFrame, fP, fA = Vector(), Vector(), Vector(), false, -1
+	local exp, RealFrameTime, FrameNumber = math.exp, RealFrameTime, FrameNumber
+	local function FollowAnchor(mode, hand)
+		local n = FrameNumber()
+		if n == sFrame then return fP, fA end
+		sFrame = n
+		local p, a
+		if mode == 3 then p, a = ViewAnchor() else p, a = hand.pos, hand.ang end
+		local tau = cv_smooth:GetFloat() * SMOOTH_MAX
+		if tau <= 0 then
+			sLive, fP, fA = false, p, a
+			return p, a
+		end
+		local org, oa = g_VR.origin, g_VR.originAngle
+		local lp, la = WorldToLocal(p, a, org, oa)
+		if sLive then
+			local k = 1 - exp(-RealFrameTime() / tau)
+			lp:Sub(sP) lp:Mul(k) sP:Add(lp)
+			local v = la:Forward() v:Sub(sF) v:Mul(k) sF:Add(v)
+			v = la:Up() v:Sub(sU) v:Mul(k) sU:Add(v)
+		else
+			sLive = true
+			sP:Set(lp) sF:Set(la:Forward()) sU:Set(la:Up())
+		end
+		fP, fA = LocalToWorld(sP, sF:AngleEx(sU), org, oa)
+		return fP, fA
+	end
 
 	function VRUtilMenuRenderPanel(uid)
 		local m = menus[uid]
@@ -91,6 +153,8 @@ if CLIENT then
 		local tms = render.GetToneMappingScaleLinear()
 		render.SetToneMappingScaleLinear(g_VR.view.dopostprocess and VEC_HALF or VEC_ONE)
 		local menuScale = cv_menuscale:GetFloat()
+		local mode = cv_float:GetInt()
+		local follow = mode == 0 or mode == 3
 		local pPos, pDir = pointerPose.pos, pointerPose.ang:Forward()
 		for _, v in ipairs(menuOrder) do
 			local uid = v.uid
@@ -109,7 +173,12 @@ if CLIENT then
 			elseif uid ~= "heightmenu" then
 				v.scale = 0.02
 				if v.attachment then
-					pos, ang = LocalToWorld(pos, ang, attachPose.pos, attachPose.ang)
+					if follow and uid ~= "miscmenu" then
+						local ap, aa = FollowAnchor(mode, attachPose)
+						pos, ang = LocalToWorld(pos, ang, ap, aa)
+					else
+						pos, ang = LocalToWorld(pos, ang, attachPose.pos, attachPose.ang)
+					end
 				else
 					pos, ang = LocalToWorld(pos, ang, g_VR.origin, g_VR.originAngle)
 				end
@@ -185,6 +254,7 @@ if CLIENT then
 			uid = uid .. n
 		end
 		VRUtilMenuClose(uid)
+		scrW, scrH = ScrW(), ScrH() -- see ViewAnchor
 		local rt = GetRenderTarget("vrmod_rt_ui_" .. uid, width, height, false)
 		local m = {
 			uid = uid,
@@ -221,12 +291,19 @@ if CLIENT then
 		render.PopRenderTarget()
 		-- The quick menu ("miscmenu") has its own float toggle so it can keep
 		-- the classic hand-attached feel while regular popups float, or float too.
-		local floatThis = uid == "miscmenu" and cv_qmfloat:GetBool() or uid ~= "miscmenu" and cv_float:GetBool()
+		-- Staying menus (1, 2) share one anchor taken when the first opens,
+		-- so a set opened together (chat + keyboard) keeps its layout.
+		local mode = cv_float:GetInt()
+		local floatThis = uid == "miscmenu" and cv_qmfloat:GetBool() or uid ~= "miscmenu" and (mode == 1 or mode == 2)
 		if floatThis and attachment and g_VR.tracking then
 			if not floatAnchorPos then
-				local ap = cv_pointer:GetBool() and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
-				floatAnchorPos = Vector(ap.pos)
-				floatAnchorAng = Angle(ap.ang)
+				if uid ~= "miscmenu" and mode == 2 then
+					floatAnchorPos, floatAnchorAng = ViewAnchor()
+				else
+					local ap = cv_pointer:GetBool() and g_VR.tracking.pose_righthand or g_VR.tracking.pose_lefthand
+					floatAnchorPos = Vector(ap.pos)
+					floatAnchorAng = Angle(ap.ang)
+				end
 			end
 			m.worldPos, m.worldAng = LocalToWorld(pos, ang, floatAnchorPos, floatAnchorAng)
 			m.worldFixed = true
@@ -273,6 +350,7 @@ if CLIENT then
 			menusExist = false
 			floatAnchorPos = nil
 			floatAnchorAng = nil
+			sLive = false -- the next follower starts on its anchor
 			gui.EnableScreenClicker(false)
 		end
 	end

@@ -48,7 +48,7 @@ hook.Add("VRMod_Input", "teleport", function(action, pressed)
 					controllerPos, controllerDir = g_VR.tracking.pose_righthand.pos, g_VR.tracking.pose_righthand.ang:Forward()
 				end
 
-				prevPos = controllerPos
+				local prevPos = controllerPos
 				local hit = false
 				for i = 2, 17 do
 					local d = i - 1
@@ -109,6 +109,103 @@ function VRUtilresetVehicleView()
 end
 
 --[[──────────────────────────────────────────────────────────
+  Vehicle seat offset and forward reset
+
+  vrmod_seat_x/y/z: where the head sits against the seat's eyes
+  attachment, forward/left/up, in every vehicle. vrmod_seat_adjust
+  sets it in the headset: left stick moves you level, right stick
+  up and down; the sticks drive nothing else until it's saved
+  (run it again, or get out). Held in seatOff while adjusting,
+  written to the convars once at the end.
+
+  Forward reset re-seats the head at the seat facing forward:
+  vrmod.ResetForward(), hook.Run("VRMod_ResetForward"), or the
+  bindable vrmod_reset_forward. Vehicles only; false elsewhere.
+──────────────────────────────────────────────────────────]]
+local SEAT_CV = {"vrmod_seat_x", "vrmod_seat_y", "vrmod_seat_z"}
+local cvSeat = {
+	CreateClientConVar(SEAT_CV[1], "0", true, false, "Vehicle seat offset: forward (units)", -40, 40),
+	CreateClientConVar(SEAT_CV[2], "0", true, false, "Vehicle seat offset: left (units)", -40, 40),
+	CreateClientConVar(SEAT_CV[3], "0", true, false, "Vehicle seat offset: up (units)", -40, 40),
+}
+local SEAT_SPEED, SEAT_MAX = 12, 40 -- u/s at full stick; clamp
+local seatOff, _seatPos = Vector(), Vector()
+-- The playermodel's eye height in the seat's eyes frame (cl_wheel measures
+-- it each time you sit); nil: the attachment's own, +2
+local seatEyeZ
+local seatAdjust = false
+--[[ Vehicle camera takeover
+Disables everything related to the VR Vehicle camera. Eye Height, turning, you name it, its gutted.
+This exists so gmffb can override the camera for sim racers. also kingston if you see this say "i love drunk driving" :)
+    vrmod.SetVehicleCameraOverride(id, on)   persistent, one flag per addon
+    hook VRMod_VehicleCamera(ply, vehicle)   per frame, return true to take
+    vrmod.IsVehicleCameraOverridden()        state as of this frame
+]]
+local camOwners, camOwned, camTaken = {}, false, false
+function vrmod.SetVehicleCameraOverride(id, on)
+	camOwners[id] = on and true or nil
+	camOwned = next(camOwners) ~= nil
+end
+function vrmod.IsVehicleCameraOverridden() return camTaken end
+local function SeatRefresh()
+	if seatAdjust then return end -- the live value is ahead of the convars
+	seatOff:SetUnpacked(cvSeat[1]:GetFloat(), cvSeat[2]:GetFloat(), cvSeat[3]:GetFloat())
+end
+SeatRefresh()
+for i = 1, 3 do cvars.AddChangeCallback(SEAT_CV[i], SeatRefresh, "vrmod_seat") end
+
+local function SeatClamp(v) return v > SEAT_MAX and SEAT_MAX or v < -SEAT_MAX and -SEAT_MAX or v end
+
+function vrmod.SetSeatAdjust(on)
+	if on == seatAdjust then return end
+	if on and (camTaken or not (g_VR.active and LocalPlayer():InVehicle())) then
+		chat.AddText(Color(255, 190, 60), "[VRMod] ", color_white, camTaken and "The vehicle camera is controlled by another addon." or "Sit in a vehicle in VR first.")
+		return
+	end
+	seatAdjust = on
+	if on then
+		chat.AddText(Color(255, 190, 60), "[VRMod] ", color_white, "Seat adjust: left stick moves you, right stick up/down. Run it again to save.")
+		return
+	end
+	for i = 1, 3 do cvSeat[i]:SetFloat(math.Round(seatOff[i], 1)) end
+	chat.AddText(Color(255, 190, 60), "[VRMod] ", color_white, string.format("Seat saved (%.1f, %.1f, %.1f).", seatOff.x, seatOff.y, seatOff.z))
+end
+concommand.Add("vrmod_seat_adjust", function() vrmod.SetSeatAdjust(not seatAdjust) end)
+
+-- From cl_aimsteer's VRMOD_GetActions wrapper, after the deadzone: the
+-- sticks move the seat, and are spent
+local STICKS = {"vector2_steer", "vector2_walkdirection", "vector2_smoothturn"}
+function vrmod.SeatAdjust(inp)
+	if not seatAdjust then return end
+	if camTaken or not LocalPlayer():InVehicle() then return vrmod.SetSeatAdjust(false) end
+	local l, r, d = inp.vector2_steer, inp.vector2_smoothturn, RealFrameTime() * SEAT_SPEED
+	if l then seatOff.x, seatOff.y = SeatClamp(seatOff.x + l.y * d), SeatClamp(seatOff.y - l.x * d) end
+	if r then seatOff.z = SeatClamp(seatOff.z + r.y * d) end
+	for i = 1, 3 do
+		local s = inp[STICKS[i]]
+		if s then s.x, s.y = 0, 0 end
+	end
+end
+
+-- Re-seats the head with its height at worldEye (the playermodel's eyes)
+function vrmod.SetSeatEye(worldEye)
+	local v = LocalPlayer():GetVehicle()
+	local att = IsValid(v) and v:GetAttachment(v:LookupAttachment("vehicle_driver_eyes"))
+	if not att then return false end
+	seatEyeZ = WorldToLocal(worldEye, zeroAng, att.Pos, att.Ang).z
+	originVehicleLocalPos = nil
+	return true
+end
+
+function vrmod.ResetForward()
+	if camTaken or not (g_VR.active and LocalPlayer():InVehicle()) then return false end
+	originVehicleLocalPos = nil
+	return true
+end
+hook.Add("VRMod_ResetForward", "vrmod_locomotion", vrmod.ResetForward)
+concommand.Add("vrmod_reset_forward", function() vrmod.ResetForward() end)
+
+--[[──────────────────────────────────────────────────────────
   Locomotion start/stop
 
   Roomscale hull tracking (improved proportional):
@@ -129,9 +226,22 @@ local FOLLOW_GAIN = 20
 local function start()
 	local ply = LocalPlayer()
 	local followVec = zeroVec
-	originVehicleLocalPos, originVehicleLocalAng = zeroVec, zeroAng
+	originVehicleLocalPos, originVehicleLocalAng, camTaken = zeroVec, zeroAng, false
 	local snapped = false
 	local ncOn, ncLx, ncLy = false, 0, 0
+
+	-- This frame's turn (deg): smooth, or one snap per stick push
+	local function TurnYaw()
+		local x = g_VR.input.vector2_smoothturn.x
+		if convarValues.smoothTurn then return -x * convarValues.smoothTurnRate * RealFrameTime() end
+		if x > 0.5 or x < -0.5 then
+			if snapped then return 0 end
+			snapped = true
+			return x > 0 and -convarValues.snapTurnAngle or convarValues.snapTurnAngle
+		end
+		snapped = false
+		return 0
+	end
 
 	hook.Add("PreRender", "vrmod_locomotion", function()
 		if not g_VR.threePoints then return end
@@ -139,47 +249,55 @@ local function start()
 		-- Vehicle mode
 		if ply:InVehicle() then
 			local v = ply:GetVehicle()
+			camTaken = camOwned or hook.Run("VRMod_VehicleCamera", ply, v) == true
+			-- false, not nil: re-seats on release, still levels on exit
+			if camTaken then
+				originVehicleLocalPos = false
+				return
+			end
 			local att = v:GetAttachment(v:LookupAttachment("vehicle_driver_eyes"))
 			if not originVehicleLocalPos then
 				local relV, relA = WorldToLocal(g_VR.origin, g_VR.originAngle, g_VR.tracking.hmd.pos, Angle(0, g_VR.tracking.hmd.ang.yaw, 0))
-				g_VR.origin, g_VR.originAngle = LocalToWorld(relV + Vector(7, 0, 2), relA, att.Pos, att.Ang)
+				g_VR.origin, g_VR.originAngle = LocalToWorld(relV + Vector(7, 0, seatEyeZ or 2), relA, att.Pos, att.Ang)
 				originVehicleLocalPos, originVehicleLocalAng = WorldToLocal(g_VR.origin, g_VR.originAngle, att.Pos, att.Ang)
 			end
-			g_VR.origin, g_VR.originAngle = LocalToWorld(originVehicleLocalPos, originVehicleLocalAng, att.Pos, att.Ang)
+			-- Turning, about the head in the seat's frame. Not in Glide
+			-- aircraft: the right stick is their yaw.
+			local gv = ply.GlideGetVehicle and ply:GlideGetVehicle()
+			local vt = IsValid(gv) and Glide and Glide.VEHICLE_TYPE
+			if not (vt and (gv.VehicleType == vt.PLANE or gv.VehicleType == vt.HELICOPTER)) then
+				local yaw = TurnYaw()
+				if yaw ~= 0 then
+					-- seat-space head; the seat offset rides along unrotated
+					local h = WorldToLocal(g_VR.tracking.hmd.pos, zeroAng, att.Pos, att.Ang)
+					_seatPos:Set(originVehicleLocalPos)
+					_seatPos:Add(seatOff)
+					_seatPos:Sub(h)
+					originVehicleLocalPos, originVehicleLocalAng = LocalToWorld(_seatPos, originVehicleLocalAng, h, Angle(0, yaw, 0))
+					originVehicleLocalPos:Sub(seatOff)
+				end
+			end
+			_seatPos:Set(originVehicleLocalPos)
+			_seatPos:Add(seatOff)
+			g_VR.origin, g_VR.originAngle = LocalToWorld(_seatPos, originVehicleLocalAng, att.Pos, att.Ang)
 			return
 		end
 
 		-- Exit vehicle
-		if originVehicleLocalPos then
-			originVehicleLocalPos = nil
+		if originVehicleLocalPos ~= nil then
+			originVehicleLocalPos, seatEyeZ, camTaken = nil, nil, false
 			g_VR.originAngle = Angle(0, g_VR.originAngle.yaw, 0)
 		end
 
 		local origin = g_VR.origin
 
 		-- Turning (smooth or snap)
-		if convarValues.smoothTurn then
-			local amt = -g_VR.input.vector2_smoothturn.x * convarValues.smoothTurnRate * RealFrameTime()
-			if amt ~= 0 then
-				local pos = ply:GetPos()
-				g_VR.origin = LocalToWorld(origin - pos, zeroAng, pos, Angle(0, amt, 0))
-				origin = g_VR.origin
-				g_VR.originAngle.yaw = g_VR.originAngle.yaw + amt
-			end
-		else
-			local axis = g_VR.input.vector2_smoothturn.x
-			if axis > 0.5 or axis < -0.5 then
-				if not snapped then
-					local a = axis > 0 and -convarValues.snapTurnAngle or convarValues.snapTurnAngle
-					local pos = ply:GetPos()
-					g_VR.origin = LocalToWorld(origin - pos, zeroAng, pos, Angle(0, a, 0))
-					origin = g_VR.origin
-					g_VR.originAngle.yaw = g_VR.originAngle.yaw + a
-					snapped = true
-				end
-			else
-				snapped = false
-			end
+		local amt = TurnYaw()
+		if amt ~= 0 then
+			local pos = ply:GetPos()
+			g_VR.origin = LocalToWorld(origin - pos, zeroAng, pos, Angle(0, amt, 0))
+			origin = g_VR.origin
+			g_VR.originAngle.yaw = g_VR.originAngle.yaw + amt
 		end
 
 		-- Follow HMD (proportional hull tracking)
@@ -206,11 +324,18 @@ local function start()
 		end
 		ncOn = false
 
+		-- The hull follows the hips (cl_character's body root, published as
+		-- g_VR.hipRoot when the body draws), not the head: the head can lean
+		-- out over a table or a ledge while the hull stays where the body
+		-- stands, and head anti-clip (sh_hull) keeps it out of walls. Falls
+		-- back to the head when the body isn't drawing (stale for 5+ frames).
 		local hmdPos = g_VR.tracking.hmd.pos
-		followVec = Vector((hmdPos.x - pos.x) * FOLLOW_GAIN, (hmdPos.y - pos.y) * FOLLOW_GAIN, 0)
+		local tgt = g_VR.hipRoot
+		if not tgt or FrameNumber() - (g_VR.hipRootF or 0) > 5 then tgt = hmdPos end
+		followVec = Vector((tgt.x - pos.x) * FOLLOW_GAIN, (tgt.y - pos.y) * FOLLOW_GAIN, 0)
 		if followVec:LengthSqr() > 262144 then
-			origin.x = origin.x + pos.x - hmdPos.x
-			origin.y = origin.y + pos.y - hmdPos.y
+			origin.x = origin.x + pos.x - tgt.x
+			origin.y = origin.y + pos.y - tgt.y
 			origin.z = pos.z
 			return
 		end
@@ -237,6 +362,14 @@ local function start()
 					vel.x = vel.x + fdx * mismatch
 					vel.y = vel.y + fdy * mismatch
 				end
+			elseif tgt ~= hmdPos and FrameNumber() - (g_VR.hipRootF or 0) <= 5 then
+				-- Held back (a prop, a railing): the body leans out over it to
+				-- the head instead (cl_character lean-over), up to what the model
+				-- can reach. Only the gap beyond that pushes the view back.
+				local gap, reach = fLen / FOLLOW_GAIN, g_VR.leanReach or 0
+				local k = gap > reach and (gap - reach) / gap or 0
+				vel.x = vel.x + followVec.x * (1 - k)
+				vel.y = vel.y + followVec.y * (1 - k)
 			end
 		end
 		if vel:Length() < 15 then vel = zeroVec end
@@ -282,8 +415,9 @@ local function stop()
 	hook.Remove("PreRender", "vrmod_locomotion")
 	hook.Remove("VRMod_PreRender", "teleport")
 	if IsValid(tpBeamEnt) then tpBeamEnt:Remove() end
-	vrmod.RemoveInGameMenuItem("Map Browser")
-	vrmod.RemoveInGameMenuItem("Reset Vehicle View")
+	-- Map Browser / Reset Vehicle View belong to cl_buttons, not this option.
+	-- Removing them here only ever "worked" because the old restore pass put
+	-- them back a second later; with a persistent registry it would not.
 end
 
 timer.Simple(0, function() vrmod.AddLocomotionOption("default", start, stop, options) end)

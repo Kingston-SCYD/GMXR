@@ -53,42 +53,34 @@ end
 if SERVER then
 	local sv_redirect = CreateConVar("vrmod_console_redirect", "0", FCVAR_REPLICATED + FCVAR_ARCHIVE, "Redirect VRMod logs to player consoles (0=off, 1=on)")
 	util.AddNetworkString("VRMod_ConsoleMessage")
-	-- Override server-side print
-	local oldPrint = print
-	function print(...)
-		oldPrint(...)
-		local args = {...}
-		for i = 1, #args do
-			args[i] = tostring(args[i])
-		end
-
-		local msg = table.concat(args, " ")
-		if sv_redirect:GetBool() then
-			net.Start("VRMod_ConsoleMessage")
-			net.WriteTable({Color(3, 163, 255), msg})
-			net.Broadcast()
-		end
+	-- Tail-call originals so tracebacks start at the real caller
+	local oldPrint, oldMsgC = print, MsgC
+	local COL_SV = Color(3, 163, 255)
+	local function redirect(t)
+		net.Start("VRMod_ConsoleMessage")
+		net.WriteTable(t)
+		net.Broadcast()
 	end
 
-	-- Override server-side MsgC
-	local oldMsgC = MsgC
-	function MsgC(...)
-		oldMsgC(...)
-		local args = {...}
-		local formattedMsg = {}
-		for _, v in ipairs(args) do
-			if IsColor(v) then
-				table.insert(formattedMsg, v)
-			else
-				table.insert(formattedMsg, tostring(v))
-			end
-		end
-
+	function print(...)
 		if sv_redirect:GetBool() then
-			net.Start("VRMod_ConsoleMessage")
-			net.WriteTable(formattedMsg)
-			net.Broadcast()
+			local n, t = select("#", ...), {...}
+			for i = 1, n do t[i] = tostring(t[i]) end
+			redirect({COL_SV, table.concat(t, " ", 1, n)})
 		end
+		return oldPrint(...)
+	end
+
+	function MsgC(...)
+		if sv_redirect:GetBool() then
+			local t = {...}
+			for i = 1, select("#", ...) do
+				local v = t[i]
+				if not IsColor(v) then t[i] = tostring(v) end
+			end
+			redirect(t)
+		end
+		return oldMsgC(...)
 	end
 end
 
@@ -134,53 +126,41 @@ if CLIENT then
 		addConsoleMessage(msg)
 	end)
 
-	-- Override client-side Error
-	local oldError = Error
+	-- Log first, then tail-call originals so tracebacks start at the real caller
+	local oldError, oldErrorNoHalt, oldPrint, oldMsgC = Error, ErrorNoHalt, print, MsgC
+	local COL_ERR, COL_PRINT, COL_MSGC = Color(255, 0, 0), Color(245, 147, 20), Color(119, 228, 255)
+
 	function Error(...)
-		oldError(...)
-		local args = {...}
-		local msg = "[Lua Error] " .. table.concat(args, " ")
-		addConsoleMessage({Color(255, 0, 0, 255), msg})
+		addConsoleMessage({COL_ERR, "[Lua Error] ", ...})
+		return oldError(...)
 	end
 
-	-- Override client-side ErrorNoHalt
-	local oldErrorNoHalt = ErrorNoHalt
 	function ErrorNoHalt(...)
-		oldErrorNoHalt(...)
-		local args = {...}
-		local msg = "[Lua Error (No Halt)] " .. table.concat(args, " ")
-		addConsoleMessage({Color(255, 0, 0, 255), msg})
+		addConsoleMessage({COL_ERR, "[Lua Error (No Halt)] ", ...})
+		return oldErrorNoHalt(...)
 	end
 
-	-- Override client-side print
-	local oldPrint = print
 	function print(...)
-		oldPrint(...)
-		local args = {...}
-		for i = 1, #args do
-			args[i] = tostring(args[i])
-		end
-
-		local msg = table.concat(args, " ")
-		addConsoleMessage({Color(245, 147, 20), msg})
+		local n, t = select("#", ...), {...}
+		for i = 1, n do t[i] = tostring(t[i]) end
+		addConsoleMessage({COL_PRINT, table.concat(t, " ", 1, n)})
+		return oldPrint(...)
 	end
 
-	-- Override client-side MsgC
-	local oldMsgC = MsgC
 	function MsgC(...)
-		local args = {...}
-		local stringArgs = {}
-		for _, v in ipairs(args) do
-			if type(v) == "string" then table.insert(stringArgs, v) end
+		local t, k = {...}, 0
+		for i = 1, select("#", ...) do
+			local v = t[i]
+			if type(v) == "string" then
+				k = k + 1
+				t[k] = v
+				if string.find(v, "Unknown command:", 1, true) then addConsoleMessage({COL_ERR, "[Unknown Command Error] ", v}) end
+			end
 		end
 
-		local msg = table.concat(stringArgs, " ")
-		for _, v in ipairs(args) do
-			if type(v) == "string" and v:match("Unknown command:") then addConsoleMessage({Color(255, 0, 0, 255), "[Unknown Command Error] " .. v}) end
-		end
-
-		if msg ~= "" then addConsoleMessage({Color(119, 228, 255), msg}) end
-		oldMsgC(...)
+		local msg = table.concat(t, " ", 1, k)
+		if msg ~= "" then addConsoleMessage({COL_MSGC, msg}) end
+		return oldMsgC(...)
 	end
 
 	local function ToggleChat()

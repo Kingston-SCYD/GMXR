@@ -1,82 +1,24 @@
-g_VR = g_VR or {}
-vrmod = vrmod or {}
-vrmod.utils = vrmod.utils or {}
--- Hook blocker: temporary block 3rd party hooks 
-local originalHooks = {}
--- Local: completely block a hook
-local function blockHook(hookName, identifier)
-    local hooks = hook.GetTable()[hookName]
-    if not hooks or not hooks[identifier] then return end
-    originalHooks[hookName] = originalHooks[hookName] or {}
-    if not originalHooks[hookName][identifier] then originalHooks[hookName][identifier] = hooks[identifier] end
-    hook.Add(hookName, identifier, function() end)
-end
-
--- Local: restore a hook entirely
-local function unblockHook(hookName, identifier)
-    if originalHooks[hookName] and originalHooks[hookName][identifier] then hook.Add(hookName, identifier, originalHooks[hookName][identifier]) end
-end
-
--- Local: wrap a hook to block certain actions conditionally
-local function filterHook(hookName, identifier, actionsToBlock, conditionFunc)
-    local hooks = hook.GetTable()[hookName]
-    if not hooks or not hooks[identifier] then return end
-    originalHooks[hookName] = originalHooks[hookName] or {}
-    if not originalHooks[hookName][identifier] then originalHooks[hookName][identifier] = hooks[identifier] end
-    local originalHook = originalHooks[hookName][identifier]
-    hook.Add(hookName, identifier, function(action, pressed)
-        if actionsToBlock[action] and conditionFunc(action, pressed) then
-            return -- block this action for this hook
-        end
-        return originalHook(action, pressed)
-    end)
-end
-
--- Public API: toggle full hook on/off
-function vrmod.utils.ToggleHook(hookName, identifier, state)
-    if state then
-        unblockHook(hookName, identifier)
-    else
-        blockHook(hookName, identifier)
+-- Brush climbing vs. a held weapon: unless the active weapon is empty hands,
+-- the right hand's grab/fire actions are kept from sh_climbing's VRMod_Input
+-- "brushclimb" hook (wrapped). sh_climbing (re)adds that hook on every
+-- VRMod_Start and vrmod_brushclimb change, so the wrap is re-applied a tick
+-- after those. It used to poll from Think every frame on every client and,
+-- wrapping only once, lost the block from the second VR session on.
+if SERVER then return end
+local BLOCK = {boolean_right_pickup = true, boolean_primaryfire = true, boolean_secondaryfire = true}
+local wrapper
+local function Apply()
+    local cv = GetConVar("vrmod_brushclimb")
+    if not (cv and cv:GetBool()) then return end
+    local t = hook.GetTable().VRMod_Input
+    local orig = t and t.brushclimb
+    if not orig or orig == wrapper then return end
+    wrapper = function(action, pressed)
+        if BLOCK[action] and not vrmod.UsingEmptyHands(LocalPlayer()) then return end
+        return orig(action, pressed)
     end
+    hook.Add("VRMod_Input", "brushclimb", wrapper)
 end
-
--- Blocking access to actions inside VRModInput hook
-function vrmod.utils.BlockInputActions(hookName, identifier, actions, condition)
-    filterHook(hookName, identifier, actions, condition)
-end
-
--- Public API: unblock previously filtered hook (restores original)
-function vrmod.utils.UnblockInputActions(hookName, identifier)
-    unblockHook(hookName, identifier)
-end
-
-if CLIENT then
-    local climbBlockerApplied = false
-
-    hook.Add("Think", "vrmod_climbing_hook_blocker_weapon", function()
-        local cv = GetConVar("vrmod_brushclimb")
-        if not cv or not cv:GetBool() then
-            climbBlockerApplied = false
-            return
-        end
-        if climbBlockerApplied then return end
-
-        local hooks = hook.GetTable()["VRMod_Input"]
-        if not hooks or not hooks["brushclimb"] then return end
-        local originalHook = hooks["brushclimb"]
-        local rightHandActions = {
-            ["boolean_right_pickup"] = true,
-            ["boolean_primaryfire"] = true,
-            ["boolean_secondaryfire"] = true
-        }
-
-        hook.Add("VRMod_Input", "brushclimb", function(action, pressed)
-            if rightHandActions[action] and not vrmod.UsingEmptyHands(LocalPlayer()) then
-                return
-            end
-            return originalHook(action, pressed)
-        end)
-        climbBlockerApplied = true
-    end)
-end
+local function Defer() timer.Simple(0, Apply) end
+hook.Add("VRMod_Start", "vrmod_climbing_hook_blocker_weapon", Defer)
+cvars.AddChangeCallback("vrmod_brushclimb", Defer, "vrmod_climbing_hook_blocker_weapon")

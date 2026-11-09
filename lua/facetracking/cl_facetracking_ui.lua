@@ -74,6 +74,8 @@ local function BuildSettings(sheet)
 	end
 
 	AddCheck("Enable Face Tracking", "ft_enabled")
+	AddCheck("Eye Gaze (headset eye tracking)", "ft_gaze")
+	AddCheck("Eyes Only (gaze, leave other flexes alone)", "ft_eyesonly")
 	AddSlider("OSC Port", "ft_port", 1024, 65535, 0)
 	AddSlider("Smoothing", "ft_smooth", 0, 0.95, 2)
 	AddSlider("Net Update Rate (Hz)", "ft_rate", 5, 60, 0)

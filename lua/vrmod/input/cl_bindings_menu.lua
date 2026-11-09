@@ -161,6 +161,29 @@ local CONTROLLER_INPUTS = {
     },
 }
 
+-- Steam Frame: both hands share the trigger/bumper/grip/stick set; the left adds
+-- the d-pad and View, the right the face diamond and Menu.
+do
+    local SHARED = { "grip/pose", "trigger/value", "trigger/click", "bumper/click",
+        "squeeze/value", "squeeze/click", "thumbstick", "thumbstick/click", "thumbstick/touch" }
+    local HANDS = {
+        { "/user/hand/left/",  { "dpad_up/click", "dpad_down/click", "dpad_left/click", "dpad_right/click", "view/click" } },
+        { "/user/hand/right/", { "a/click", "b/click", "x/click", "y/click", "menu/click" } },
+    }
+    local paths, n = {}, 0
+    for h = 1, 2 do
+        local base, extra = HANDS[h][1], HANDS[h][2]
+        for i = 1, #SHARED do n = n + 1; paths[n] = base .. "input/" .. SHARED[i] end
+        for i = 1, #extra do n = n + 1; paths[n] = base .. "input/" .. extra[i] end
+        n = n + 1; paths[n] = base .. "output/haptic"
+    end
+    CONTROLLER_INPUTS["/interaction_profiles/valve/frame_controller_valve"] = {
+        label = "Steam Frame",
+        key   = "valve-frame_controller_valve",
+        paths = paths,
+    }
+end
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Persistence helpers
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +239,12 @@ end
 -- "/user/hand/right/input/trigger/click" → "Right Trigger Click"
 local function PrettyPath(xrPath)
     if not xrPath or xrPath == "" then return "(unbound)" end
+    -- Multi-path default (e.g. Frame trigger + bumper): label every input
+    if istable(xrPath) then
+        local t = {}
+        for i = 1, #xrPath do t[i] = PrettyPath(xrPath[i]) end
+        return table.concat(t, " + ")
+    end
     local hand = ""
     if string.find(xrPath, "/left/") then hand = "L " end
     if string.find(xrPath, "/right/") then hand = "R " end
@@ -510,7 +539,7 @@ function vrmod.OpenBindingsEditor()
                     if choice.value == currentPath then found = true break end
                 end
                 if not found then
-                    combo:AddChoice(PrettyPath(currentPath) .. " (custom)", currentPath, true)
+                    combo:AddChoice(PrettyPath(currentPath) .. (currentPath == defaultPath and "" or " (custom)"), currentPath, true)
                 end
             end
 

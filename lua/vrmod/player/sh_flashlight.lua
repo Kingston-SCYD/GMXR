@@ -4,35 +4,30 @@ if CLIENT then
 	local flashlight = nil
 	local fwd, lastPos, lastAng = Vector(), Vector(1e9, 0, 0), Angle() -- scratch; lastPos far so first frame always updates
 	vrmod.AddCallbackedConvar("vrmod_flashlight_projtex", nil, "1", nil, nil, 0, 1, function(val) return math.floor(tonumber(val) or 0) end)
-	-- Engine flashlight shadow depth (r_flashlightdepthtexture): the depth pass
-	-- re-renders whenever an animated caster (hands/body/props) is in the beam
-	-- and flushes the material queue under mat_queue_mode 2 -- the close-prop /
-	-- pointed-down eye stutter. MUST be committed while no VR session exists:
-	-- changing it in VR reallocates the depth texture and corrupts the shared
-	-- eye RT (RunConsoleCommand also defers a frame, so a "VR start" apply lands
-	-- mid-init). Applied at game load, on change outside VR, and on VR exit.
-	-- The realloc stalls the renderer for roughly a second whichever way it goes.
-	local cvDepth = CreateClientConVar("vrmod_flashlight_depth", "0", true, false, "Engine flashlight shadow depth texture. Freezes the game for about a second when changed; a toggle made in VR applies on exit", 0, 1)
-	-- Held separate from the depth texture because the costs are nothing alike:
-	-- this one only asks the projected texture to cast, is read at creation, and
-	-- allocates nothing. It does nothing on its own unless cvDepth is also on.
-	local cvShadows = CreateClientConVar("vrmod_flashlight_shadows", "0", true, false, "VR flashlight casts shadows (needs vrmod_flashlight_depth 1 to show)", 0, 1)
-	local function ApplyFlashlightDepth()
-		if g_VR.active then return end -- never reallocate the depth RT mid-session; VRMod_Exit re-runs this
-		local on = cvDepth:GetBool()
-		if IsConCommandBlocked("r_flashlightdepthtexture") then
-			if not on then vrmod.logger.Err("r_flashlightdepthtexture is blocked from Lua; add +r_flashlightdepthtexture 0 to launch options") end
-			return
-		end
-		RunConsoleCommand("r_flashlightdepthtexture", on and "1" or "0")
-	end
-	hook.Add("InitPostEntity", "vrmod_flashlight_depth", ApplyFlashlightDepth)
-	cvars.AddChangeCallback("vrmod_flashlight_depth", ApplyFlashlightDepth, "vrmod_flashlight_depth")
-	if IsValid(LocalPlayer()) then ApplyFlashlightDepth() end -- lua autorefresh: InitPostEntity already fired
 	local usingDL, farZ, tanHalf = false, 750, 0.5
 	local endPos, lightPos = Vector(), Vector() -- scratch
 	local trOut = {}
 	local trace = {output = trOut, mask = MASK_SOLID}
+	-- Light origin rides 10u ahead of the hand/muzzle, and the gun/wall pivot
+	-- parks the muzzle ON the wall, so at a wall the origin sat inside the
+	-- brush: a projtex origin in solid stops lighting the face in front of it
+	-- and holds its last state (the "stuck" beam). Trace eye -> origin
+	-- (static brushes only, same test as hand collisions) and stop 6u short,
+	-- past the projtex near plane.
+	local oOut = {}
+	local oTr = {output = oOut, mask = MASK_SOLID_BRUSHONLY}
+	local function LightOrigin(out, eye, pos, ang)
+		out:Set(ang:Forward())
+		out:Mul(10)
+		out:Add(pos)
+		oTr.start, oTr.endpos, oTr.filter = eye, out, vrmod.utils.IsStaticBrush
+		util.TraceLine(oTr)
+		if not oOut.Hit then return end
+		out:Sub(eye)
+		local f = oOut.Fraction - 6 / out:Length()
+		out:Mul(f > 0 and f or 0)
+		out:Add(eye)
+	end
 	net.Receive("vrmod_flashlight", function()
 		local enabled = net.ReadBool()
 		if not flashlight and enabled then
@@ -51,12 +46,9 @@ if CLIENT then
 				trace.filter = LocalPlayer()
 			else
 				flashlight = ProjectedTexture()
-				-- Shadows are opt-in (vrmod_flashlight_shadows, default off) and also need
-				-- vrmod_flashlight_depth: that pass re-renders whenever an animated caster
-				-- (hands/body/props) sits in the beam, and under mat_queue_mode 2 it flushes
-				-- the queue every frame -- the close-prop / pointed-down stutter. Read at
-				-- creation, so a toggle takes effect on the next flashlight switch.
-				flashlight:SetEnableShadows(cvShadows:GetBool())
+				-- Casts like the stock flashlight; whether shadows show is the
+				-- engine's r_flashlightdepthtexture, not ours to manage.
+				flashlight:SetEnableShadows(true)
 				flashlight:SetTexture("effects/flashlight001")
 				flashlight:SetFOV(fov)
 				flashlight:SetFarZ(farZ)
@@ -106,9 +98,7 @@ if CLIENT then
 				if lastPos:DistToSqr(pos) < 0.25 and dp < 0.5 and dp > -0.5 and dy < 0.5 and dy > -0.5 and dr < 0.5 and dr > -0.5 then return end
 				lastPos:Set(pos)
 				lastAng:Set(ang)
-				fwd:Set(ang:Forward())
-				fwd:Mul(10)
-				fwd:Add(pos)
+				LightOrigin(fwd, g_VR.tracking.hmd.pos, pos, ang)
 				flashlight:SetPos(fwd)
 				flashlight:SetAngles(ang)
 				flashlight:Update()
@@ -122,7 +112,6 @@ if CLIENT then
 	end)
 
 	hook.Add("VRMod_Exit", "flashlight", function(ply, steamid)
-		if ply == LocalPlayer() then timer.Simple(0, ApplyFlashlightDepth) end -- commit a deferred in-VR toggle
 		if ply == LocalPlayer() and flashlight then
 			hook.Remove("PreRender", "vrmod_flashlight")
 			if not usingDL then flashlight:Remove() end
@@ -142,21 +131,22 @@ if CLIENT then
 		local function poseFor(ply, lp)
 			if ply == lp then
 				if not (g_VR.active and g_VR.threePoints) then return end
+				local eye = g_VR.tracking.hmd.pos
 				local att = convarValues.vrmod_flashlight_attachment
 				if att == 0 and g_VR.viewModelMuzzle then -- match native VR feel: emit from muzzle
 					local m = g_VR.viewModelMuzzle
 					if g_VR.currentvmi and g_VR.currentvmi.wrongMuzzleAng then
 						local t = g_VR.tracking.pose_righthand
-						return m.Pos, t and t.ang
+						return m.Pos, t and t.ang, eye
 					end
-					return m.Pos, m.Ang
+					return m.Pos, m.Ang, eye
 				end
 				local t = g_VR.tracking[attachments[att + 1]]
-				if t then return t.pos, t.ang end
+				if t then return t.pos, t.ang, eye end
 			else -- remote VR player: networked hand pose (right hand; pref isn't networked)
 				local n = g_VR.net and g_VR.net[ply:SteamID()]
 				local lf = n and n.lerpedFrame
-				if lf then return lf.righthandPos, lf.righthandAng end
+				if lf then return lf.righthandPos, lf.righthandAng, lf.hmdPos end
 			end
 		end
 		local function vrReposition()
@@ -164,11 +154,9 @@ if CLIENT then
 			for _, ply in player_Iterator() do
 				local tex = ply.DynamicFlashlight -- only set by df when flashlight is on
 				if tex then
-					local pos, ang = poseFor(ply, lp)
+					local pos, ang, eye = poseFor(ply, lp)
 					if pos and ang then
-						fwd:Set(ang:Forward())
-						fwd:Mul(10)
-						fwd:Add(pos)
+						LightOrigin(fwd, eye or pos, pos, ang)
 						tex:SetPos(fwd)
 						tex:SetAngles(ang)
 						tex:Update()

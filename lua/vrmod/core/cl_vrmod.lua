@@ -1,6 +1,6 @@
 g_VR = g_VR or {}
 g_VR.vehicle = g_VR.vehicle or {}
-local convars = vrmod.GetConvars()
+local convars, convarValues = vrmod.GetConvars()
 if CLIENT then
 	local cv_linux_mode = CreateClientConVar("vrmod_linux", "0", true, false, "Use Linux/WiVRn startup path")
 	-- Pose prediction scale (%). 100 = runtime default; >100 predicts further
@@ -70,6 +70,7 @@ if CLIENT then
 				end
 			end
 		else
+			g_VR.moduleLoadError = tostring(err)
 			vrmod.logger.Err("Failed to load module:", err)
 		end
 	else
@@ -105,7 +106,11 @@ if CLIENT then
 	local function DrawEye(bLeft, u0, v0, u1, v1)
 		render.PushRenderTarget(g_VR.rtEye)
 		render.Clear(0, 0, 0, 255, true, true) -- kept: depth reset + void/HOM safety
+		-- Marks the headset eye passes for per-eye effects (cl_halos): EyePos()
+		-- alone also matches a spectator camera sitting at an eye.
+		g_VR.eyeRendering = true
 		render.RenderView(g_VR.view)
+		g_VR.eyeRendering = false
 		render.PopRenderTarget()
 		-- No clear on the blit target: the opaque full-viewport
 		-- DrawTexturedRectUV below overwrites every pixel anyway.
@@ -140,6 +145,10 @@ if CLIENT then
 			-- muzzlefix wraps UpdateViewModel to apply its per-weapon muzzle
 			-- angle correction, and calling the inner function skips it.
 			if vrmod.utils.UpdateViewModel then vrmod.utils.UpdateViewModel() end
+			-- Floating hands bone setup, after every VRMod_PreRender hook has
+			-- had its say on the hand pose (see Prime in cl_character_hands).
+			local hp = g_VR.handsPrime
+			if hp then hp() end
 			DrawEye(true, cropL_u0, cropL_v0, cropL_u1, cropL_v1)
 		else
 			g_VR.view.origin = g_VR.eyePosRight
@@ -286,6 +295,8 @@ local currentAng = v.ang
 		local lh, rh = g_VR.tracking.pose_lefthand, g_VR.tracking.pose_righthand
 		local u = vrmod.utils
 		if lh and rh and u then
+			-- Raw controller pose, before any collision: grabs anchor to it
+			u.CaptureRawPose(lh, rh)
 			u.CollisionsPreCheck(lh.pos, rh.pos)
 			local leftGrip, rightGrip = u.GetClimbingGripState()
 			local leftPos, leftAng, rightPos, rightAng = u.UpdateHandCollisions(lh.pos, lh.ang, rh.pos, rh.ang)
@@ -295,7 +306,25 @@ local currentAng = v.ang
 			-- pose and again on the collision-corrected one; the first result
 			-- was always overwritten, so every frame paid for two weapon
 			-- pushout hull traces and two viewmodel bone setups for nothing.
+			-- Gun/wall pivot on whichever hand holds the gun, written back into
+			-- its tracked pose: the viewmodel in either hand, worldmodels through
+			-- the body IK, the network frame and foregrip's off-hand pin all
+			-- follow the gun instead of the raw controller.
+			local gunLeft = u.GunInLeftHand()
+			if not (gunLeft and leftGrip or not gunLeft and rightGrip) then
+				local gp = gunLeft and lh or rh
+				local _, a = u.GunWallPivot(gp.pos, gp.ang, gunLeft)
+				gp.ang = a
+				if not gunLeft then rightAng = a end
+			end
+			-- The server hand props chase this pose...
+			u.SendHandPose(lh, rh)
+			-- ...and where one is pressed on a prop or ragdoll and stuck, the
+			-- hand and weapon stick with it
+			if u.ApplyHullError(lh, rh) then rightPos, rightAng = rh.pos, rh.ang end
 			u.UpdateViewModelPos(rightPos, rightAng)
+			-- Physical melee sweeps the weapon where it ended up
+			if vrmod.PhysMeleeStep then vrmod.PhysMeleeStep() end
 		end
 	end
 
@@ -311,6 +340,21 @@ local currentAng = v.ang
 	local _lastRightGrip = false
 	local _gripPending = {false, false}
 	local _gripCount = {0, 0}
+	-- Boolean actions currently down, as dispatched. ReleaseHeld sends a
+	-- release for each so no +command or hold state outlives the session.
+	local _held = {}
+	local function ReleaseHeld()
+		local inp, ch = g_VR.input, {}
+		g_VR.changedInputs = ch
+		for k in pairs(_held) do
+			_held[k] = nil
+			ch[k] = false
+			if inp then inp[k] = false end
+			hook_Call("VRMod_Input", nil, k, false)
+		end
+		_lastPrimaryFire, _lastSecondaryFire, _lastLeftGrip, _lastRightGrip = false, false, false, false
+		_gripPending[1], _gripPending[2], _gripCount[1], _gripCount[2] = false, false, 0, 0
+	end
 	local _thumbL, _thumbR = 0, 0
 	local _gripL, _gripR = 0, 0
 	local _trigL, _trigR = 0, 0
@@ -360,18 +404,7 @@ local currentAng = v.ang
 		local ok, inp, changed = pcall(VRMOD_GetActions)
 		if not ok or not inp then
 			-- Force release if we can't read actions
-			if _lastPrimaryFire then
-				_lastPrimaryFire = false
-				g_VR.changedInputs = g_VR.changedInputs or {}
-				g_VR.changedInputs.boolean_primaryfire = false
-				hook.Call("VRMod_Input", nil, "boolean_primaryfire", false)
-			end
-			if _lastSecondaryFire then
-				_lastSecondaryFire = false
-				g_VR.changedInputs = g_VR.changedInputs or {}
-				g_VR.changedInputs.boolean_secondaryfire = false
-				hook.Call("VRMod_Input", nil, "boolean_secondaryfire", false)
-			end
+			if next(_held) then ReleaseHeld() end
 			return
 		end
 		g_VR.input, g_VR.changedInputs = inp, changed
@@ -493,10 +526,22 @@ local currentAng = v.ang
 			end
 			inp.skeleton_righthand = _synthR
 		end
+		-- A hand laid on the steering wheel (cl_wheel) closes round the rim
+		local wc = g_VR.wheelCurl
+		if wc then
+			for h = 1, 2 do
+				local k = wc[h]
+				if k > 0 then
+					local c = (h == 1 and inp.skeleton_lefthand or inp.skeleton_righthand).fingerCurls
+					for i = 1, 5 do c[i] = c[i] + (1 - c[i]) * k end
+				end
+			end
+		end
 		local dbg = cv_debug_input:GetBool()
 		for k, v in pairs(g_VR.changedInputs) do
-			if dbg and (v == true or v == false) then
-				print("[VR] " .. (BTN_NAMES[k] or k) .. (v and " PRESSED" or " RELEASED"))
+			if v == true or v == false then
+				_held[k] = v or nil
+				if dbg then print("[VR] " .. (BTN_NAMES[k] or k) .. (v and " PRESSED" or " RELEASED")) end
 			end
 			hook_Call("VRMod_Input", nil, k, v)
 		end
@@ -597,8 +642,8 @@ local currentAng = v.ang
 	end
 
 	-- Notice drawn over an otherwise normal frame while the tick is halted.
-	-- Painted into both eye halves of the shared RT after the world render, the
-	-- same way the death tint is, so nothing about the render path changes --
+	-- Painted into both eye halves of the shared RT after the world render, so
+	-- nothing about the render path changes --
 	-- the game keeps drawing, it just says why it is frozen.
 	local COL_PAUSE_BG = Color(0, 0, 0, 200)
 	local function DrawPausedBanner()
@@ -840,16 +885,9 @@ if _xrPoseLeft and _xrPoseRight then
 		DrawEyeFull(true, di)
 		DrawEyeFull(false, di)
 
-		if pl and not pl:Alive() then
-			render.PushRenderTarget(g_VR.rt, 0, _bandY, g_VR.rtWidth, g_VR.rtHeight)
-			cam.Start2D()
-			surface.SetDrawColor(255, 0, 0, 128)
-			surface.DrawRect(0, 0, g_VR.rtWidth, g_VR.rtHeight)
-			cam.End2D()
-			render.PopRenderTarget()
-		else
-			g_VR.deathTime = nil
-		end
+		-- Death cam (cl_rendering) times its fade from deathTime; clear it on
+		-- respawn. The red death tint that used to be painted here is gone.
+		if pl and pl:Alive() then g_VR.deathTime = nil end
 
 		if _gamePaused then DrawPausedBanner() end
 	end
@@ -864,25 +902,25 @@ if _xrPoseLeft and _xrPoseRight then
 	end
 
 	-- Per-item performance overrides. Each engine convar gets its own vrmod_perf_*
-	-- toggle (default 1 = apply) so they can be enabled/disabled individually in
+	-- toggle (default 1 = apply unless def = "0") so they can be enabled/disabled individually in
 	-- Settings > Rendering. Exposed as vrmod.PerfOverrides so the UI builds from the
 	-- same source. r_3dsky is handled separately since it tracks vrmod_skybox.
 	vrmod.PerfOverrides = {
-		{ toggle = "vrmod_perf_threaded_bones",     cvar = "cl_threaded_bone_setup",     val = "1", label = "Threaded bone setup" },
-		{ toggle = "vrmod_perf_mcore",              cvar = "gmod_mcore_test",            val = "1", label = "Multicore rendering" },
-		{ toggle = "vrmod_perf_mat_queue",          cvar = "mat_queue_mode",             val = "2", label = "Threaded material queue" },
-		{ toggle = "vrmod_perf_no_bloom",           cvar = "mat_disable_bloom",          val = "1", label = "Disable bloom" },
-		{ toggle = "vrmod_perf_no_fancyblend",      cvar = "mat_disable_fancy_blending", val = "1", label = "Disable fancy blending" },
-		{ toggle = "vrmod_perf_no_lightwarp",       cvar = "mat_disable_lightwarp",      val = "1", label = "Disable lightwarp" },
-		{ toggle = "vrmod_perf_no_pspatch",         cvar = "mat_disable_ps_patch",       val = "1", label = "Disable pixel-shader patch" },
-		{ toggle = "vrmod_perf_no_motionblur",      cvar = "mat_motion_blur_enabled",    val = "0", label = "Disable motion blur" },
-		{ toggle = "vrmod_perf_reduce_particles",   cvar = "mat_reduceparticles",        val = "1", label = "Reduce particles" },
-		{ toggle = "vrmod_perf_no_rtt_shadows",     cvar = "r_shadowrendertotexture",    val = "0", label = "Disable RTT shadows" },
-		{ toggle = "vrmod_perf_threaded_particles", cvar = "r_threaded_particles",       val = "1", label = "Threaded particles" },
-		{ toggle = "vrmod_perf_queued_ropes",       cvar = "r_queued_ropes",             val = "1", label = "Queued ropes" },
+		{ toggle = "vrmod_perf_threaded_bones",     cvar = "cl_threaded_bone_setup",     val = "1", label = "Threaded bone setup", desc = "Sets up model bones on worker threads." },
+		{ toggle = "vrmod_perf_mcore",              cvar = "gmod_mcore_test",            val = "1", label = "Multicore rendering", desc = "Splits rendering across CPU cores." },
+		{ toggle = "vrmod_perf_mat_queue",          cvar = "mat_queue_mode",             val = "2", label = "Threaded material queue", desc = "Hands material and draw work to a separate render thread." },
+		{ toggle = "vrmod_perf_no_bloom",           cvar = "mat_disable_bloom",          val = "1", def = "0", label = "Disable bloom", desc = "Turns bloom off." },
+		{ toggle = "vrmod_perf_no_fancyblend",      cvar = "mat_disable_fancy_blending", val = "1", def = "0", label = "Disable fancy blending", desc = "Turns off fancy texture blending." },
+		{ toggle = "vrmod_perf_no_lightwarp",       cvar = "mat_disable_lightwarp",      val = "1", def = "0", label = "Disable lightwarp", desc = "Turns off lightwarp shading on models." },
+		{ toggle = "vrmod_perf_no_pspatch",         cvar = "mat_disable_ps_patch",       val = "1", label = "Disable pixel-shader patch", desc = "Skips the pixel-shader patch (mat_disable_ps_patch)." },
+		{ toggle = "vrmod_perf_no_motionblur",      cvar = "mat_motion_blur_enabled",    val = "0", label = "Disable motion blur", desc = "Turns motion blur off." },
+		{ toggle = "vrmod_perf_reduce_particles",   cvar = "mat_reduceparticles",        val = "1", def = "0", label = "Reduce particles", desc = "Draws fewer particles." },
+		{ toggle = "vrmod_perf_no_rtt_shadows",     cvar = "r_shadowrendertotexture",    val = "0", label = "Disable RTT shadows", desc = "Uses simple blob shadows instead of render-to-texture ones." },
+		{ toggle = "vrmod_perf_threaded_particles", cvar = "r_threaded_particles",       val = "1", label = "Threaded particles", desc = "Simulates particles on worker threads." },
+		{ toggle = "vrmod_perf_queued_ropes",       cvar = "r_queued_ropes",             val = "1", label = "Queued ropes", desc = "Queues rope drawing to the render thread." },
 	}
 	for _, o in ipairs(vrmod.PerfOverrides) do
-		if not GetConVar(o.toggle) then CreateClientConVar(o.toggle, "1", true, false, "Perf override: " .. o.cvar) end
+		if not GetConVar(o.toggle) then CreateClientConVar(o.toggle, o.def or "1", true, false, "Perf override: " .. o.cvar) end
 	end
 	-- Master switch. The UI checkbox and the reset button both referenced this
 	-- but nothing ever created it, so the box was inert and `vrmod_perfoverrides 1`
@@ -926,6 +964,48 @@ if _xrPoseLeft and _xrPoseRight then
 	for _, o in ipairs(vrmod.PerfOverrides) do
 		cvars.AddChangeCallback(o.toggle, QueuePerformanceApply, "vrmod_perf_apply")
 	end
+
+	-- Engine frame-buffer render targets (_rt_FullFrameFB*, the HDR bloom chain,
+	-- _rt_FullFrameDepth) follow the desktop backbuffer, so post-processing and
+	-- refraction ran at desktop resolution and were rescaled into each eye. The
+	-- module re-sizes them to w x h (0 = back to the desktop) at a Present on
+	-- this thread, so mat_queue_mode drops to 0 for those few frames and the
+	-- perf convars put it back. The restore recreates every render target, so
+	-- start waits on it before making the VR ones.
+	local cv_engine_rts = CreateClientConVar("vrmod_engine_rts", "1", true, false, "Size engine frame-buffer render targets (post-processing, refraction, depth) to the headset eye on VR start", 0, 1)
+	-- Follows the post-processing switch (menu or console): those targets are
+	-- what it renders through. Takes effect at the next VR start.
+	cvars.AddChangeCallback("vrmod_postprocess", function(_, _, new) cv_engine_rts:SetBool(new ~= "0") end, "vrmod_engine_rts")
+	local function ResizeEngineRTs(w, h, done)
+		hook.Remove("Think", "vrmod_engine_rts")
+		local fb = render.GetScreenEffectTexture()
+		local tw, th = w > 0 and w or ScrW(), h > 0 and h or ScrH()
+		if not VRMOD_ResizeEngineRTs or fb:Width() == tw and fb:Height() == th then
+			if done then done() end
+			return
+		end
+		local frames = 0
+		hook.Add("Think", "vrmod_engine_rts", function()
+			frames = frames + 1
+			-- Asked once, on the first tick rather than at the call (exit also
+			-- runs from the ShutDown hook, where an archived convar write or a
+			-- restore must not happen), then only polled.
+			if frames == 1 then
+				setConvar(GetConVar("mat_queue_mode"), "mat_queue_mode", "0")
+				VRMOD_ResizeEngineRTs(w, h)
+			end
+			if VRMOD_ResizeEngineRTs() and frames < 60 then return end
+			hook.Remove("Think", "vrmod_engine_rts")
+			ApplyPerformanceConvars()
+			if fb:Width() ~= tw or fb:Height() ~= th then
+				vrmod.logger.Err("Engine render targets stayed " .. fb:Width() .. "x" .. fb:Height() .. " (wanted " .. tw .. "x" .. th .. ")")
+			end
+			if done then done() end
+		end)
+	end
+	-- They outlive the Lua state: a map change while in VR leaves them
+	-- eye-sized on the desktop with no session left to restore them.
+	hook.Add("InitPostEntity", "vrmod_engine_rts", function() if not g_VR.active then ResizeEngineRTs(0, 0) end end)
 
 local function SetupRenderTargets()
     g_VR.desktopView = convars.vrmod_desktopview:GetInt()
@@ -1061,6 +1141,10 @@ end
 			PerformRenderViews()
 		end
 		hook.Add("RenderScene", "vrutil_hook_renderscene", function()
+			-- The desktop spectator pass (utils/sh_speccam) renders a normal
+			-- view mid-frame; stand aside for it instead of it removing and
+			-- re-adding this hook every frame.
+			if g_VR.specCamRendering then return end
 			if DrawErrorOverlay() then
 				-- Still submit: VRUtilClientRender short-circuits to the pause
 				-- card. pcall'd because we are deliberately running the module
@@ -1074,7 +1158,8 @@ end
 				VRUtilClientExit()
 				return true
 			end
-			if convars.vrmod_desktopview:GetInt() > 1 then
+			-- Skipped while the spectator view owns the desktop: it paints over it
+			if convars.vrmod_desktopview:GetInt() > 1 and not g_VR.specCamDesktop then
 				-- Shared RT is 3 frames tall; sample only the band rendered this
 				-- frame (_bandY / frameHeight) and squeeze the vertical crop into it.
 				local band = g_VR.rtHeight > 0 and (_bandY / g_VR.rtHeight) or 0
@@ -1107,7 +1192,6 @@ end
 			hook.Add("CalcViewModelView", "vrutil_hook_calcviewmodelview", function(_, vm, _, _, _, _) return g_VR.viewModelPos, g_VR.viewModelAng end)
 			local blockViewModelDraw = true
 			g_VR.allowPlayerDraw = false
-			local hideplayer = convars.vrmod_floatinghands:GetBool()
 			hook.Add("PostDrawTranslucentRenderables", "vrutil_hook_drawplayerandviewmodel", function(bSky, _)
 				if bSky or not LocalPlayer():Alive() then return end
 				if not g_VR.wmActive then
@@ -1115,9 +1199,12 @@ end
 						blockViewModelDraw = false
 						g_VR.viewModel:DrawModel()
 						blockViewModelDraw = true
+						-- Weapon bases squash it for their VM; the body draws next
+						render.DepthRange(0, 1)
 					end
 					render.SetColorModulation(1, 1, 1)
-					if not hideplayer then
+					-- Read live: floating hands toggles mid-session
+					if convarValues.vrmod_floatinghands == "0" then
 						g_VR.allowPlayerDraw = true
 						cam.Start3D() cam.End3D()
 						local prev = render.GetBlend()
@@ -1151,6 +1238,7 @@ end
 	local function SetupShutdownHooks()
 		function VRUtilClientExit()
 			if not g_VR.active then return end
+			ReleaseHeld() -- before teardown, while handlers still see an active session
 			VRUtilMenuClose()
 			VRUtilNetworkCleanup()
 			vrmod.StopLocomotion()
@@ -1185,6 +1273,7 @@ end
 			g_VR.rtEyeMat = nil
 			g_VR.active = false
 			VRMOD_Shutdown()
+			ResizeEngineRTs(0, 0)
 			vrmod.logger.Info("Ended VR session")
 		end
 		hook.Add("ShutDown", "vrutil_hook_shutdown", function()
@@ -1195,20 +1284,24 @@ end
 	function VRUtilClientStart()
 		if not PerformStartup() then return end
 		local mcoreOn = ApplyPerformanceConvars()
-		if SetupRenderTargets() == false then return end
-		SetupActions()
-		SetupNetworkAndOrigin()
-		SetupScale()
-		SetupViewParams()
-		InitializeTracking()
-		SetupHandSimulation()
-		BindRenderSceneHook()
-		SetupModelAndPlayerHooks()
-		SetupShutdownHooks()
-		vrmod.StartLocomotion()
-		if VRMOD_SetMulticoreMode then VRMOD_SetMulticoreMode(mcoreOn) end
-		if VRMOD_SetPredictionScale then VRMOD_SetPredictionScale(convars.vrmod_predictionscale:GetInt()) end
-		g_VR.active = true
-		vrmod.logger.Info("Started VR session")
+		local w, h = 0, 0
+		if VRMOD_ResizeEngineRTs and cv_engine_rts:GetBool() then w, h = VRMOD_GetRecommendedDims() end
+		ResizeEngineRTs(w, h, function()
+			if SetupRenderTargets() == false then return end
+			SetupActions()
+			SetupNetworkAndOrigin()
+			SetupScale()
+			SetupViewParams()
+			InitializeTracking()
+			SetupHandSimulation()
+			BindRenderSceneHook()
+			SetupModelAndPlayerHooks()
+			SetupShutdownHooks()
+			vrmod.StartLocomotion()
+			if VRMOD_SetMulticoreMode then VRMOD_SetMulticoreMode(mcoreOn) end
+			if VRMOD_SetPredictionScale then VRMOD_SetPredictionScale(convars.vrmod_predictionscale:GetInt()) end
+			g_VR.active = true
+			vrmod.logger.Info("Started VR session")
+		end)
 	end
 end

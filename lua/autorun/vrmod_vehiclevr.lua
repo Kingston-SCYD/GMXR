@@ -9,6 +9,9 @@
                     you into it; physically standing up gets you out again.
                     Reuses vrmod_sitheight, so it triggers at the same head
                     height that already switches the character to its sit pose.
+    One press     : the grip that seated you can't also press use/exit (the
+                    grips carry +use on Touch and Frame) until it lets go, and
+                    the server refuses an engine exit just after a VR entry.
 
     Place in: garrysmod/lua/autorun/
 ]]
@@ -19,7 +22,12 @@ if SERVER then
     -- than trusting it. Generous enough for a hand stretched over a car roof.
     local MAX_REACH_SQR = 200 * 200
     local COOLDOWN = 0.25
-    local nextAct = {}
+    -- Engine +use exits are refused this long after a VR entry. Several
+    -- bindings put +use on the grips, so the squeeze that seated you can go on
+    -- to press use; the client blocks that while the grip is held, this
+    -- covers whatever reaches the server anyway.
+    local EXIT_LOCK = 0.5
+    local nextAct, noExit = {}, {}
 
     local function Gate(ply)
         if not IsValid(ply) or not ply:Alive() then return false end
@@ -38,6 +46,7 @@ if SERVER then
         -- EnterVehicle runs CanPlayerEnterVehicle itself, so gamemode and addon
         -- restrictions still apply -- no need to duplicate the check here.
         ply:EnterVehicle(veh)
+        if ply:InVehicle() then noExit[ply] = CurTime() + EXIT_LOCK end
     end)
 
     net.Receive("vrmod_vehicle_exit", function(_, ply)
@@ -46,12 +55,21 @@ if SERVER then
         ply:ExitVehicle()
     end)
 
-    hook.Add("PlayerDisconnected", "vrmod_vehiclevr", function(ply) nextAct[ply] = nil end)
+    hook.Add("CanExitVehicle", "vrmod_vehiclevr", function(_, ply)
+        local t = noExit[ply]
+        if not t then return end
+        if t > CurTime() then return false end
+        noExit[ply] = nil
+    end)
+
+    hook.Add("PlayerDisconnected", "vrmod_vehiclevr", function(ply) nextAct[ply], noExit[ply] = nil, nil end)
     return
 end
 
 local LocalPlayer, IsValid, CurTime, tonumber = LocalPlayer, IsValid, CurTime, tonumber
 local FindInSphere = ents.FindInSphere
+local PICK = { boolean_left_pickup = true, boolean_right_pickup = false } -- action -> bLeft
+local USE = { boolean_use = true, boolean_exit = true }
 local cv_grip = CreateClientConVar("vrmod_vehicle_gripenter", "1", true, false, "Grip a seat to get into it instead of grabbing it", 0, 1)
 local cv_gripamt = CreateClientConVar("vrmod_vehicle_gripamount", "75", true, false, "How far the grip must close, in percent, before it seats you", 5, 100)
 local cv_sit = CreateClientConVar("vrmod_vehicle_sitenter", "1", true, false, "Physically sitting down on top of a seat puts you in it", 0, 1)
@@ -101,12 +119,20 @@ local function SeatForHand(bLeft)
     return SeatNearHand(p and p.pos)
 end
 
-local function EnterSeat(seat)
+-- Hand (bLeft) whose grip sent you into a seat, until that grip lets go.
+-- Touch and Frame bind +use to the grips (Frame: the end-of-travel click), so
+-- the squeeze that crossed the enter threshold went on to press use -- and use
+-- in a seat is exit: in and straight back out on one press. Use/exit are
+-- refused while it's held.
+local entryHand
+
+local function EnterSeat(seat, bLeft)
     if not IsValid(seat) then return false end
     if hook.Run("VRMod_VehicleEnter", LocalPlayer(), seat) == false then return false end
     net.Start("vrmod_vehicle_enter")
     net.WriteEntity(seat)
     net.SendToServer()
+    if bLeft ~= nil then entryHand = bLeft end
     return true
 end
 
@@ -121,15 +147,12 @@ end
 local pendingSeat
 
 hook.Add("VRMod_AllowDefaultAction", "vrmod_vehiclevr_block", function(action)
-    local bLeft
-    if action == "boolean_left_pickup" then
-        bLeft = true
-    elseif action == "boolean_right_pickup" then
-        bLeft = false
-    else
+    if USE[action] then
+        if entryHand ~= nil then return false end
         return
     end
-
+    local bLeft = PICK[action]
+    if bLeft == nil then return end
     local seat = SeatForHand(bLeft)
     if not seat then return end
     pendingSeat = seat
@@ -145,22 +168,21 @@ local function GripPoll(bLeft, armed, thresh)
     local grip = inp and tonumber(bLeft and inp.vector1_left_squeeze or inp.vector1_right_squeeze)
     -- No analog data on this controller: the boolean hook below covers it.
     if not grip then return false end
+    -- Backstop for a missed release event: a hand this open isn't holding.
+    if grip < 0.1 and entryHand == bLeft then entryHand = nil end
     if armed then return grip >= thresh - 0.1 end
     if grip < thresh then return false end
     local seat = pendingSeat or SeatForHand(bLeft)
     pendingSeat = nil
-    if seat then EnterSeat(seat) end
+    if seat then EnterSeat(seat, bLeft) end
     return true
 end
 
 hook.Add("VRMod_Input", "vrmod_vehiclevr_grip", function(action, pressed)
-    if not pressed then return end
-    local bLeft
-    if action == "boolean_left_pickup" then
-        bLeft = true
-    elseif action == "boolean_right_pickup" then
-        bLeft = false
-    else
+    local bLeft = PICK[action]
+    if bLeft == nil then return end
+    if not pressed then
+        if entryHand == bLeft then entryHand = nil end
         return
     end
 
@@ -170,7 +192,7 @@ hook.Add("VRMod_Input", "vrmod_vehiclevr_grip", function(action, pressed)
     if inp and tonumber(bLeft and inp.vector1_left_squeeze or inp.vector1_right_squeeze) then return end
     local seat = pendingSeat or SeatForHand(bLeft)
     pendingSeat = nil
-    if seat then EnterSeat(seat) end
+    if seat then EnterSeat(seat, bLeft) end
 end)
 
 -- ---------------------------------------------------------------------------
@@ -179,9 +201,11 @@ end)
 local EXIT_HYSTERESIS = 5 -- matches the character system's sit exit margin
 local SETTLE = 1 -- seconds before a state change can reverse itself
 local POLL = 0.1
-local nextPoll, lastChange = 0, 0
+local nextPoll, lastChange, wasIn = 0, 0, false
+local downPos, trOut = Vector(), {}
 local trIn = {
-    output = {}
+    endpos = downPos,
+    output = trOut
 }
 
 -- What are we stood on? GroundEntity covers standing on a seat directly; the
@@ -191,11 +215,11 @@ local function SeatBelow(ply)
     local g = ply:GetGroundEntity()
     if IsValid(g) and g:IsVehicle() then return g end
     local p = ply:GetPos()
+    downPos:SetUnpacked(p.x, p.y, p.z - 40)
     trIn.start = p
-    trIn.endpos = Vector(p.x, p.y, p.z - 40)
     trIn.filter = ply
-    local tr = util.TraceLine(trIn)
-    local e = tr.Entity
+    util.TraceLine(trIn) -- fills trOut; reading the return isn't reliable with output set
+    local e = trOut.Entity
     if IsValid(e) and e:IsVehicle() then return e end
 end
 
@@ -211,17 +235,28 @@ hook.Add("Think", "vrmod_vehiclevr", function()
     local t = CurTime()
     if t < nextPoll then return end
     nextPoll = t + POLL
-    local sitH = SitHeight()
-    if sitH <= 0 then return end -- sit detection disabled outright
     local ply = LocalPlayer()
     if not IsValid(ply) or not ply:Alive() then return end
+    -- Every way in or out (grip, sit, +use, the server) restarts the settle
+    -- window. Only sit-enter used to stamp it, so after a grip entry the first
+    -- poll in the seat could land before locomotion re-seats the origin and
+    -- read the still-standing head as a stand-up.
+    local inV = ply:InVehicle()
+    if inV ~= wasIn then
+        wasIn, lastChange = inV, t
+        return
+    end
+    local sitH = SitHeight()
+    if sitH <= 0 then return end -- sit detection disabled outright
     local hmd = g_VR.tracking and g_VR.tracking.hmd
     if not hmd then return end
     -- Head height over the feet, which in a vehicle is the seat. Same quantity
     -- the character system tests against vrmod_sitheight.
     local headH = hmd.pos.z - ply:GetPos().z
-    if ply:InVehicle() then
-        if cv_stand:GetBool() and headH > sitH + EXIT_HYSTERESIS and t - lastChange > SETTLE then
+    if inV then
+        -- Hands on the wheel keep you in (cl_wheel blocks use/exit the same way).
+        if cv_stand:GetBool() and headH > sitH + EXIT_HYSTERESIS and t - lastChange > SETTLE
+        and not (vrmod.WheelBusy and vrmod.WheelBusy()) then
             lastChange = t
             net.Start("vrmod_vehicle_exit")
             net.SendToServer()
@@ -242,6 +277,6 @@ end)
 
 hook.Add("VRMod_Exit", "vrmod_vehiclevr_exit", function(ply)
     if ply ~= LocalPlayer() then return end
-    pendingSeat = nil
+    pendingSeat, entryHand = nil, nil
     armedL, armedR = false, false
 end)

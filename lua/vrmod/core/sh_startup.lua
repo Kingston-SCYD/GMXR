@@ -27,10 +27,42 @@ end
 
 PatchVRAim()
 
+-- The muzzle as a bullet's source, for shots fired from the gun and nothing
+-- else. Penetration, ricochet and physics-bullet steps (TacRP, ARC9) fire
+-- their follow-up bullet from the exit point, from inside the parent's
+-- callback, owned by the same player. Moving those to the muzzle restarted
+-- them in front of the surface they'd just gone through: they hit it again,
+-- penetrated again, and recursed until the stack overflowed (crash). So a
+-- bullet moves only when it starts where the shooter fires from (the shoot
+-- pos already sits on the muzzle; a mid-flight phys-bullet step doesn't),
+-- and never while a moved bullet's callback runs. The wrapped callback is
+-- xpcall'd so one that errors can't leave the depth stuck. Shared: the
+-- server (VRMod_Bullets) and the client's predicted copy (sh_network).
+vrmod = vrmod or {}
+local MUZ_NEAR, cbDepth = 16 * 16, 0
+function vrmod.MuzzleBullet(data, muz)
+    local src = data.Src
+    if cbDepth > 0 or not src or src:DistToSqr(muz) > MUZ_NEAR then return false end
+    data.Src = muz
+    local cb = data.Callback
+    if cb then
+        data.Callback = function(a, tr, dmg)
+            cbDepth = cbDepth + 1
+            local ok, r = xpcall(cb, debug.traceback, a, tr, dmg)
+            cbDepth = cbDepth - 1
+            if ok then return r end
+            ErrorNoHalt(r, "\n")
+        end
+    end
+    return true
+end
+
 -- VR tracking-based body spheres, shared by self-damage, the MP head hitbox
 -- and the debug overlay so all three agree on geometry. {spine_frac, radius};
 -- index 2 (frac 1.0 = HMD height) is the head sphere reused as the MP hitbox.
-local SD_BODY = {{0.72, 12}, {1.0, 7}, {0.42, 10}}
+-- Body radii were 12/10: 24u/20u across on a ~14u torso swallowed a gun held
+-- at chest or hip, so ordinary aiming clipped your own spheres.
+local SD_BODY = {{0.72, 8}, {1.0, 7}, {0.42, 7}}
 local SD_HEAD = 2
 
 if CLIENT then
@@ -45,12 +77,12 @@ if CLIENT then
     end
 
     vrmod.AddCallbackedConvar("vrmod_althead", nil, "0")
-    vrmod.AddCallbackedConvar("vrmod_althead_auto", nil, "1")
+    vrmod.AddCallbackedConvar("vrmod_althead_auto", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_autostart", nil, "0")
-    vrmod.AddCallbackedConvar("vrmod_scale", nil, "32.7")
-    vrmod.AddCallbackedConvar("vrmod_heightmenu", nil, "1")
-    vrmod.AddCallbackedConvar("vrmod_floatinghands", nil, "0")
-    vrmod.AddCallbackedConvar("vrmod_desktopview", nil, "3")
+    vrmod.AddCallbackedConvar("vrmod_scale", nil, "42.546349")
+    vrmod.AddCallbackedConvar("vrmod_heightmenu", nil, "0")
+    vrmod.AddCallbackedConvar("vrmod_floatinghands", nil, "1")
+    vrmod.AddCallbackedConvar("vrmod_desktopview", nil, "2")
     vrmod.AddCallbackedConvar("vrmod_laserpointer", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_znear", nil, "1")
     vrmod.AddCallbackedConvar("vrmod_renderoffset", nil, "1")
@@ -61,7 +93,10 @@ if CLIENT then
     vrmod.AddCallbackedConvar("vrmod_eyescale", nil, "0.5")
     vrmod.AddCallbackedConvar("vrmod_verticaloffset", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_horizontaloffset", nil, "0")
-    vrmod.AddCallbackedConvar("vrmod_characteryawblend", nil, "1.5")
+    vrmod.AddCallbackedConvar("vrmod_yaw_hip_head", nil, "1")
+    vrmod.AddCallbackedConvar("vrmod_yaw_hip_arms", nil, "0.7")
+    vrmod.AddCallbackedConvar("vrmod_yaw_torso_head", nil, "0.25")
+    vrmod.AddCallbackedConvar("vrmod_yaw_torso_arms", nil, "1")
     vrmod.AddCallbackedConvar("vrmod_postprocess", nil, "0", nil, nil, nil, nil, tobool, function(val) if g_VR.view then g_VR.view.dopostprocess = val end end)
     vrmod.AddCallbackedConvar("vrmod_skybox", nil, "1", nil, nil, nil, nil, tobool, function(val) RunConsoleCommand("r_3dsky", val and "1" or "0") end)
     vrmod.AddCallbackedConvar("vrmod_controlleroffset_x", nil, "-15")
@@ -71,17 +106,17 @@ if CLIENT then
     vrmod.AddCallbackedConvar("vrmod_controlleroffset_yaw", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_controlleroffset_roll", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_smoothturn", "smoothTurn", "1", nil, nil, nil, nil, tobool)
-    vrmod.AddCallbackedConvar("vrmod_smoothturnrate", "smoothTurnRate", "180", nil, nil, nil, nil, tonumber)
+    vrmod.AddCallbackedConvar("vrmod_smoothturnrate", "smoothTurnRate", "190", nil, nil, nil, nil, tonumber)
     vrmod.AddCallbackedConvar("vrmod_snapturnangle", "snapTurnAngle", "45", nil, nil, nil, nil, tonumber)
     vrmod.AddCallbackedConvar("vrmod_crouchthreshold", "crouchThreshold", "40", nil, nil, nil, nil, tonumber)
-vrmod.AddCallbackedConvar("vrmod_nocrouchjump", "noCrouchJump", "0", nil, nil, nil, nil, tobool)
+vrmod.AddCallbackedConvar("vrmod_nocrouchjump", "noCrouchJump", "1", nil, nil, nil, nil, tobool)
     -- Client gameplay convars — previously only referenced by cl_settings.lua
     -- checkboxes but never explicitly created, so they reset every session.
     vrmod.AddCallbackedConvar("vr_pickup_disable_client", nil, "0")
-    vrmod.AddCallbackedConvar("vrmod_weapon_swap", nil, "1")
+    vrmod.AddCallbackedConvar("vrmod_weapon_swap", nil, "0")
     vrmod.AddCallbackedConvar("vrmod_deathcam_ragdoll", nil, "1")
     vrmod.AddCallbackedConvar("vrmod_deathcam_ragdoll_view", nil, "1")
-    vrmod.AddCallbackedConvar("vrmod_weaponmenu_style", nil, "0")
+    vrmod.AddCallbackedConvar("vrmod_weaponmenu_style", nil, "1")
     ----------------------------------------------------------------------------
     concommand.Add("vrmod_start", function(ply, cmd, args)
         if vgui.CursorVisible() then print("vrmod: attempting startup when game is unpaused") end
@@ -205,11 +240,16 @@ vrmod.AddCallbackedConvar("vrmod_nocrouchjump", "noCrouchJump", "0", nil, nil, n
     local COL_SBODY = Color(220, 60, 60)
     local COL_SHEAD = Color(90, 160, 255) -- the shootable MP head hitbox
 
-    local function DrawSDBox(feetZ, cx, cy, spH, scale, bodyCol, headCol)
+    -- Body spheres sit on the feet->HMD midline, the head sphere on the HMD
+    -- itself (same as the server; see VRMod_Bullets).
+    local function DrawSDBox(feetZ, hx, hy, spH, bodyScale, headScale, bodyCol, headCol)
+        local fx, fy = _dbgC.x, _dbgC.y -- caller leaves the feet x/y here
         for i = 1, 3 do
-            local part = SD_BODY[i]
-            _dbgC.x = cx; _dbgC.y = cy; _dbgC.z = feetZ + spH * part[1]
-            render.DrawWireframeSphere(_dbgC, part[2] * scale, 8, 8, i == SD_HEAD and headCol or bodyCol)
+            local head = i == SD_HEAD
+            _dbgC.x = head and hx or (fx + hx) * 0.5
+            _dbgC.y = head and hy or (fy + hy) * 0.5
+            _dbgC.z = feetZ + spH * SD_BODY[i][1]
+            render.DrawWireframeSphere(_dbgC, SD_BODY[i][2] * (head and headScale or bodyScale), 8, 8, head and headCol or bodyCol)
         end
     end
 
@@ -226,7 +266,8 @@ vrmod.AddCallbackedConvar("vrmod_nocrouchjump", "noCrouchJump", "0", nil, nil, n
             local h = g_VR.tracking.hmd.pos -- world space
             local spH = h.z - pp.z
             if spH >= 10 then
-                DrawSDBox(pp.z, (pp.x + h.x) * 0.5, (pp.y + h.y) * 0.5, spH, cv_sdScale:GetFloat(), COL_BODY, COL_HEAD)
+                _dbgC.x, _dbgC.y = pp.x, pp.y
+                DrawSDBox(pp.z, h.x, h.y, spH, cv_sdScale:GetFloat(), srvScale, COL_BODY, COL_HEAD)
             end
         end
 
@@ -242,7 +283,8 @@ vrmod.AddCallbackedConvar("vrmod_nocrouchjump", "noCrouchJump", "0", nil, nil, n
                 local hx, hy, hz = pp.x + f.hmdPos.x, pp.y + f.hmdPos.y, pp.z + f.hmdPos.z
                 local spH = hz - pp.z
                 if spH >= 10 then
-                    DrawSDBox(pp.z, (pp.x + hx) * 0.5, (pp.y + hy) * 0.5, spH, srvScale, COL_SBODY, COL_SHEAD)
+                    _dbgC.x, _dbgC.y = pp.x, pp.y
+                    DrawSDBox(pp.z, hx, hy, spH, srvScale, srvScale, COL_SBODY, COL_SHEAD)
                 end
             end
         end
@@ -262,9 +304,8 @@ elseif SERVER then
         end
     end)
 
-    local cv_selfdmg = CreateConVar("vrmod_selfdamage", "1", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Allow VR players to shoot themselves")
+    local cv_selfdmg = CreateConVar("vrmod_selfdamage", "0", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Allow VR players to shoot themselves")
 
-    local _sdPt, _sdEnd, _sdForce = Vector(), Vector(), Vector()
     local _sdAng0 = Angle(0, 0, 0)
     local _sdDmgCache = {} -- ammo type → resolved damage, filled once per type
 
@@ -274,6 +315,7 @@ elseif SERVER then
     local cv_vrhb      = CreateConVar("vrmod_vrhitbox", "0", FCVAR_ARCHIVE + FCVAR_REPLICATED, "VR players get a tracking-based head hitbox others can shoot in MP", 0, 1)
     local cv_vrhbScale = CreateConVar("vrmod_vrhitbox_scale", "1", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Scale the VR head hitbox radius for ALL players", 0.1, 4)
     local cv_vrhbMult  = CreateConVar("vrmod_vrhitbox_dmgmult", "2", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Damage multiplier for VR head-hitbox hits", 0, 10)
+    local cv_sdKnock   = CreateConVar("vrmod_selfdamage_knockback", "0.25", FCVAR_ARCHIVE + FCVAR_REPLICATED, "Self-damage knockback scale, applied along the bullet (0 = none)", 0, 1)
 
     -- Shared by self-damage and the head hitbox: HL2 C++ weapons set Damage=0,
     -- so fall back to the ammo type's sk_plr_dmg_* convar (resolved once/type).
@@ -291,135 +333,149 @@ elseif SERVER then
         return _sdDmgCache[at]
     end
 
-    -- Seated, Weapon_ShootPosition() is the vehicle view origin rather than
-    -- the gun, so bullets leave your head. EntityFireBullets hook order is
-    -- undefined, so each consumer resolves the real source itself instead of
-    -- relying on another hook having already corrected data.Src.
-    local function BulletSrc(ply, data)
-        if not ply:InVehicle() then return data.Src end
-        local vrd = g_VR[ply:SteamID()]
-        local mz = vrd and vrd.muzzlePos
-        return mz and not mz:IsZero() and mz or data.Src
-    end
-
-    -- Self-damage: DistanceToLine against body spheres from VR tracking frame.
-    -- Does NOT modify bullet data — won't eat other EntityFireBullets hooks.
-    hook.Add("EntityFireBullets", "VRMod_SelfDamage", function(ent, data)
-        if not cv_selfdmg:GetBool() then return end
-        local ply = ent:IsPlayer() and ent
-            or IsValid(data.Attacker) and data.Attacker:IsPlayer() and data.Attacker
-            or ent.GetOwner and ent:GetOwner()
-        if not IsValid(ply) or not ply:IsPlayer() then return end
-        local vrd = g_VR[ply:SteamID()]
-        if not vrd or not vrd.latestFrame or not vrd.latestFrame.hmdPos then return end
-        local pp, hmd = ply:GetPos(), vrd.latestFrame.hmdPos
-        local hx, hy, hz = pp.x + hmd.x, pp.y + hmd.y, pp.z + hmd.z
-        if ply:InVehicle() then
-            local veh = ply:GetVehicle()
-            if not IsValid(veh) then return end
-            local wp = LocalToWorld(hmd, _sdAng0, pp, veh:GetAngles())
-            hx, hy, hz = wp.x, wp.y, wp.z
-        end
-        local spH = hz - pp.z
-        if spH < 10 then return end
-        -- Per-player local size: userinfo client convar, read server-side.
-        local sdScale = math.Clamp(ply:GetInfoNum("vrmod_selfdamage_scale", 1), 0.1, 4)
-        local src, dir, maxD = BulletSrc(ply, data), data.Dir, data.Distance or 56756
-        _sdEnd.x = src.x + dir.x * maxD; _sdEnd.y = src.y + dir.y * maxD; _sdEnd.z = src.z + dir.z * maxD
-        _sdPt.x = (pp.x + hx) * 0.5; _sdPt.y = (pp.y + hy) * 0.5
-        for i = 1, 3 do
-            _sdPt.z = pp.z + spH * SD_BODY[i][1]
-            local d, hitPt, frac = util.DistanceToLine(src, _sdEnd, _sdPt)
-            if d < SD_BODY[i][2] * sdScale and frac * maxD > 1.5 then
-                local dmgAmt = ResolveBulletDamage(data)
-                local dmg = DamageInfo()
-                dmg:SetAttacker(ply)
-                local wep = ply:GetActiveWeapon()
-                dmg:SetInflictor(IsValid(wep) and wep or ply)
-                dmg:SetDamage(dmgAmt)
-                dmg:SetDamageType(DMG_BULLET)
-                dmg:SetDamagePosition(hitPt)
-                local f = data.Force or 1
-                _sdForce.x = dir.x * f; _sdForce.y = dir.y * f; _sdForce.z = dir.z * f
-                dmg:SetDamageForce(_sdForce)
-                ply:TakeDamageInfo(dmg)
-                return
-            end
-        end
-    end)
-
-    -- MP head hitbox — nearest OTHER VR player's HEAD sphere along the ray wins.
-    local _hbEnd, _hbC, _hbForce = Vector(), Vector(), Vector()
-    hook.Add("EntityFireBullets", "VRMod_VRHeadHitbox", function(ent, data)
-        if not cv_vrhb:GetBool() then return end
-        local ply = ent:IsPlayer() and ent
-            or IsValid(data.Attacker) and data.Attacker:IsPlayer() and data.Attacker
-            or ent.GetOwner and ent:GetOwner()
-        if not IsValid(ply) or not ply:IsPlayer() then return end
-        local src, dir, maxD = BulletSrc(ply, data), data.Dir, data.Distance or 56756
-        _hbEnd.x = src.x + dir.x * maxD; _hbEnd.y = src.y + dir.y * maxD; _hbEnd.z = src.z + dir.z * maxD
-        local headR = SD_BODY[SD_HEAD][2] * cv_vrhbScale:GetFloat()
-        local best, bestFrac, bestPt
-        for _, v in ipairs(player.GetHumans()) do
-            local vrd = v ~= ply and v:Alive() and g_VR[v:SteamID()]
-            local f = vrd and vrd.latestFrame
-            if f and f.hmdPos then
-                local pp, hmd = v:GetPos(), f.hmdPos
-                local hx, hy, hz = pp.x + hmd.x, pp.y + hmd.y, pp.z + hmd.z
-                if v:InVehicle() then
-                    local veh = v:GetVehicle()
-                    if IsValid(veh) then
-                        local wp = LocalToWorld(hmd, _sdAng0, pp, veh:GetAngles())
-                        hx, hy, hz = wp.x, wp.y, wp.z
-                    end
-                end
-                local spH = hz - pp.z
-                if spH >= 10 then
-                    _hbC.x = (pp.x + hx) * 0.5; _hbC.y = (pp.y + hy) * 0.5; _hbC.z = pp.z + spH
-                    local d, hitPt, frac = util.DistanceToLine(src, _hbEnd, _hbC)
-                    if d < headR and frac * maxD > 1.5 and (not best or frac < bestFrac) then
-                        best, bestFrac, bestPt = v, frac, hitPt
-                    end
-                end
-            end
-        end
-        if not best then return end
+    local _bEnd, _bC, _bForce = Vector(), Vector(), Vector()
+    local function Hit(ply, victim, data, dir, pt, mult)
         local dmg = DamageInfo()
         dmg:SetAttacker(ply)
         local wep = ply:GetActiveWeapon()
         dmg:SetInflictor(IsValid(wep) and wep or ply)
-        dmg:SetDamage(ResolveBulletDamage(data) * cv_vrhbMult:GetFloat())
+        dmg:SetDamage(ResolveBulletDamage(data) * mult)
         dmg:SetDamageType(DMG_BULLET)
-        dmg:SetDamagePosition(bestPt)
-        local force = data.Force or 1
-        _hbForce.x = dir.x * force; _hbForce.y = dir.y * force; _hbForce.z = dir.z * force
-        dmg:SetDamageForce(_hbForce)
-        best:TakeDamageInfo(dmg)
-    end)
+        dmg:SetDamagePosition(pt)
+        local f = data.Force or 1
+        _bForce.x, _bForce.y, _bForce.z = dir.x * f, dir.y * f, dir.z * f
+        dmg:SetDamageForce(_bForce)
+        if victim ~= ply then victim:TakeDamageInfo(dmg) return end
+        -- Self hit: the engine's walk knockback ignores the damage force and
+        -- aims from the inflictor's centre, and the carried gun doesn't sit
+        -- at the hand server-side, so the shove pointed at wherever the
+        -- server thought the gun was. Keep its magnitude, scale it, re-aim
+        -- it down the bullet (always away from the muzzle).
+        local v0 = victim:GetVelocity()
+        victim:TakeDamageInfo(dmg)
+        if not victim:Alive() then return end
+        local v1 = victim:GetVelocity()
+        local dx, dy, dz = v1.x - v0.x, v1.y - v0.y, v1.z - v0.z
+        local k = (dx * dx + dy * dy + dz * dz) ^ 0.5 * cv_sdKnock:GetFloat()
+        v0.x, v0.y, v0.z = v0.x + dir.x * k, v0.y + dir.y * k, v0.z + dir.z * k
+        victim:SetLocalVelocity(v0)
+    end
 
-    hook.Add("EntityFireBullets", "VRMod_NoShootOwnVehicle", function(ply, data)
-        if not ply:IsPlayer() or not ply:InVehicle() then return end
-        local veh = ply:GetVehicle()
-        if not IsValid(veh) then return end
-        -- This hook already returns true, so it is the one that commits the
-        -- corrected source to the engine.
-        data.Src = BulletSrc(ply, data)
-        while IsValid(veh:GetParent()) do veh = veh:GetParent() end
-        local ignore = {veh}
-        for _, c in ipairs(veh:GetChildren()) do ignore[#ignore + 1] = c end
-        if constraint then
-            for _, c in ipairs(constraint.GetTable(veh) or {}) do
-                if IsValid(c.Ent1) then ignore[#ignore + 1] = c.Ent1 end
-                if IsValid(c.Ent2) then ignore[#ignore + 1] = c.Ent2 end
+    -- ONE EntityFireBullets hook for everything VRMod does to a bullet:
+    -- muzzle source, self-damage, the VR head hitbox and seated shots.
+    --
+    -- They used to be four hooks, and two of them return true to commit
+    -- their edits. hook.Call stops at the first non-nil return and the order
+    -- is undefined, so whichever committing hook happened to iterate first
+    -- silently starved the rest -- self-damage and the head hitbox just never
+    -- ran for some sessions. One hook, one fixed order, one return.
+    --
+    -- Hit test: the nearest sphere along the ray wins, over
+    --  * every OTHER VR player's head (vrmod_vrhitbox, the headshot
+    --    fallback), and
+    --  * the shooter's own body AND head (vrmod_selfdamage). Your head is the
+    --    same sphere others shoot -- centre on the HMD, vrmod_vrhitbox_scale,
+    --    vrmod_vrhitbox_dmgmult -- so a self headshot counts as a headshot.
+    -- The head used to sit on the feet->HMD midline like the body spheres;
+    -- with the hull up to ~15u from the headset (locomotion deadzone) that
+    -- put a 7u sphere beside your head, and point-blank shots at it missed.
+    hook.Add("EntityFireBullets", "VRMod_Bullets", function(ent, data)
+        -- Its traces may hit what it holds (sh_pickup_util's ShouldCollide).
+        -- Here, not a hook of its own: this one can end the chain.
+        ent.vrFiring = true
+        -- own = fired by the shooter's held gun: the only bullets whose
+        -- source moves to the muzzle (a player-owned SENT keeps its own).
+        local ply, own = ent, true
+        if not ent:IsPlayer() then
+            ply = ent:GetOwner()
+            if IsValid(ply) and ply:IsPlayer() then
+                own = ply:GetActiveWeapon() == ent
+            else
+                ply, own = data.Attacker, false
+                if not (IsValid(ply) and ply:IsPlayer()) then return end
             end
         end
-        local ig = data.IgnoreEntity
-        if not ig then
-            data.IgnoreEntity = ignore
-        else
-            if not istable(ig) then ig = {ig} data.IgnoreEntity = ig end
-            for _, e in ipairs(ignore) do ig[#ig + 1] = e end
+        local vrd = g_VR[ply:SteamID()]
+        -- sh_network keeps muzzlePos nil unless it is a plausible world muzzle.
+        -- Moved only for shots from the gun: vrmod.MuzzleBullet.
+        local mz = own and vrd and vrd.muzzlePos
+        local src, dir, maxD = mz or data.Src, data.Dir, data.Distance or 56756
+
+        local selfOn, hbOn = vrd and cv_selfdmg:GetBool(), cv_vrhb:GetBool()
+        if selfOn or hbOn then
+            _bEnd.x, _bEnd.y, _bEnd.z = src.x + dir.x * maxD, src.y + dir.y * maxD, src.z + dir.z * maxD
+            local headR = SD_BODY[SD_HEAD][2] * cv_vrhbScale:GetFloat()
+            local sdScale = selfOn and math.Clamp(ply:GetInfoNum("vrmod_selfdamage_scale", 1), 0.1, 4)
+            local best, bestFrac, bestPt, bestHead
+            for _, v in ipairs(player.GetHumans()) do
+                local isSelf = v == ply
+                local vd = (isSelf and selfOn or not isSelf and hbOn) and v:Alive() and (isSelf and vrd or g_VR[v:SteamID()])
+                local f = vd and vd.latestFrame
+                local hmd = f and f.hmdPos
+                if hmd then
+                    local pp = v:GetPos()
+                    local hx, hy, hz = pp.x + hmd.x, pp.y + hmd.y, pp.z + hmd.z
+                    if v:InVehicle() then
+                        local veh = v:GetVehicle()
+                        if IsValid(veh) then
+                            local wp = LocalToWorld(hmd, _sdAng0, pp, veh:GetAngles())
+                            hx, hy, hz = wp.x, wp.y, wp.z
+                        end
+                    end
+                    local spH = hz - pp.z
+                    if spH >= 10 then
+                        -- Others: head only. Self: all three.
+                        for i = isSelf and 1 or SD_HEAD, isSelf and 3 or SD_HEAD do
+                            local head = i == SD_HEAD
+                            if head then
+                                _bC.x, _bC.y = hx, hy
+                            else
+                                _bC.x, _bC.y = (pp.x + hx) * 0.5, (pp.y + hy) * 0.5
+                            end
+                            _bC.z = pp.z + spH * SD_BODY[i][1]
+                            local d, pt, frac = util.DistanceToLine(src, _bEnd, _bC)
+                            if d < (head and headR or SD_BODY[i][2] * sdScale) and frac * maxD > 1.5 and (not best or frac < bestFrac) then
+                                best, bestFrac, bestPt, bestHead = v, frac, pt, head
+                            end
+                        end
+                    end
+                end
+            end
+            if best then Hit(ply, best, data, dir, bestPt, bestHead and cv_vrhbMult:GetFloat() or 1) end
         end
-        return true, data
+
+        local commit = mz and vrmod.MuzzleBullet(data, mz) or false
+        -- Seated: don't shoot your own vehicle (or what's welded to it).
+        if own and ply:InVehicle() then
+            local veh = ply:GetVehicle()
+            if IsValid(veh) then
+                while IsValid(veh:GetParent()) do veh = veh:GetParent() end
+                local ignore = {veh}
+                for _, c in ipairs(veh:GetChildren()) do ignore[#ignore + 1] = c end
+                if constraint then
+                    for _, c in ipairs(constraint.GetTable(veh) or {}) do
+                        if IsValid(c.Ent1) then ignore[#ignore + 1] = c.Ent1 end
+                        if IsValid(c.Ent2) then ignore[#ignore + 1] = c.Ent2 end
+                    end
+                end
+                local ig = data.IgnoreEntity
+                if not ig then
+                    data.IgnoreEntity = ignore
+                else
+                    if not istable(ig) then ig = {ig} data.IgnoreEntity = ig end
+                    for _, e in ipairs(ignore) do ig[#ig + 1] = e end
+                end
+                commit = true
+            end
+        end
+        if not commit then return end
+        -- Returning true ends the chain, so sv_physhands' hand pass-through
+        -- (VRHand_PassBullets) would be starved whenever it iterates after
+        -- us: point-blank rounds start inside your own hand prop and die.
+        -- It's idempotent, so call it directly.
+        local t = hook.GetTable().EntityFireBullets
+        local pb = t and t.VRHand_PassBullets
+        if pb then pb(ply, data) end
+        return true
     end)
 end

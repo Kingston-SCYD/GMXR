@@ -1,55 +1,39 @@
-g_VR = g_VR or {}
-vrmod = vrmod or {}
-vrmod.utils = vrmod.utils or {}
+-- Math helpers. Angle deltas inline math.AngleDifference(a, b), which is
+-- exactly (a - b + 180) % 360 - 180 behind two Lua calls; |d| < t is -t < d < t.
+local U = vrmod.utils
+local AUnpack, Angle = FindMetaTable("Angle").Unpack, Angle
 
-function vrmod.utils.VecAlmostEqual(v1, v2, threshold)
+function U.VecAlmostEqual(v1, v2, threshold)
     if not v1 or not v2 then return false end
-    return v1:DistToSqr(v2) < (threshold or 0.05) ^ 2
+    threshold = threshold or 0.05
+    return v1:DistToSqr(v2) < threshold * threshold
 end
 
-function vrmod.utils.AngAlmostEqual(a1, a2, threshold)
+function U.AngAlmostEqual(a1, a2, threshold)
     if not a1 or not a2 then return false end
     threshold = threshold or 0.5 -- degrees
-    return math.abs(math.AngleDifference(a1.p, a2.p)) < threshold and math.abs(math.AngleDifference(a1.y, a2.y)) < threshold and math.abs(math.AngleDifference(a1.r, a2.r)) < threshold
+    local p1, y1, r1 = AUnpack(a1)
+    local p2, y2, r2 = AUnpack(a2)
+    local d = (p1 - p2 + 180) % 360 - 180
+    if not (d < threshold and d > -threshold) then return false end
+    d = (y1 - y2 + 180) % 360 - 180
+    if not (d < threshold and d > -threshold) then return false end
+    d = (r1 - r2 + 180) % 360 - 180
+    return d < threshold and d > -threshold
 end
 
--- OPTIMIZATION: delegate to native C method instead of manual field access
--- Old: return v.x * v.x + v.y * v.y + v.z * v.z
--- The native method avoids 6 Lua field lookups and 3 multiplications
-function vrmod.utils.LengthSqr(v)
-    return v:LengthSqr()
+-- current + (target - current) * s, one allocation instead of three
+function U.SmoothVector(current, target, smoothingFactor)
+    local d = target - current
+    d:Mul(smoothingFactor)
+    d:Add(current)
+    return d
 end
 
--- OPTIMIZATION: use native operator instead of Vector() constructor
--- Old: return Vector(a.x - b.x, a.y - b.y, a.z - b.z)
--- Native (a - b) is implemented in C and avoids 6 Lua field lookups + alloc
-function vrmod.utils.SubVec(a, b)
-    return a - b
-end
-
--- OPTIMIZATION: native vector addition (kept for backward compatibility)
-function vrmod.utils.AddVec(a, b)
-    return a + b
-end
-
--- OPTIMIZATION: native vector-scalar multiplication (kept for backward compatibility)
-function vrmod.utils.MulVec(v, s)
-    return v * s
-end
-
-function vrmod.utils.SmoothVector(current, target, smoothingFactor)
-    return current + (target - current) * smoothingFactor
-end
-
-function vrmod.utils.LerpAngleWrap(factor, current, target)
-    local diff = math.AngleDifference(target, current) -- handles ±180 wrap
-    return current + diff * factor
-end
-
-function vrmod.utils.SmoothAngle(current, target, smoothingFactor)
-    local diff = target - current
-    diff.p = math.NormalizeAngle(diff.p)
-    diff.y = math.NormalizeAngle(diff.y)
-    diff.r = math.NormalizeAngle(diff.r)
-    return current + diff * smoothingFactor
+function U.SmoothAngle(current, target, smoothingFactor)
+    local cp, cy, cr = AUnpack(current)
+    local tp, ty, tr = AUnpack(target)
+    return Angle(cp + ((tp - cp + 180) % 360 - 180) * smoothingFactor,
+        cy + ((ty - cy + 180) % 360 - 180) * smoothingFactor,
+        cr + ((tr - cr + 180) % 360 - 180) * smoothingFactor)
 end

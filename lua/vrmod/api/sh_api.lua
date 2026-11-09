@@ -1,9 +1,4 @@
 local addonVersion = 200
-if system.IsLinux() then
-	requiredModuleVersion = 23
-else
-	requiredModuleVersion = 21
-end
 
 g_VR = g_VR or {}
 vrmod = vrmod or {}

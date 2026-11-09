@@ -30,34 +30,12 @@
 	persisted; measured against mirror mode 1). `vrmod_lh_dbg` toggles triage prints. Holster hand match
 	reads g_VR.gunInLeftHand (sh_holster patched); flag mirrored onto
 	ArcticVR.GunInLeftHand for non-ArcVR weapons. Right-release drop
-	suppressed via g_VR.antiDrop. Server: DropWeapon spawns from the left.
+	suppressed via g_VR.antiDrop. Left release drops through
+	vrmod.SendWeaponDrop(true), which sends the gun's pose as drawn, so the
+	server needs no idea which hand holds it.
 ]]
 g_VR = g_VR or {}
-if SERVER then
-	util.AddNetworkString("vrmod_lh")
-	local leftHeld = {}
-	net.Receive("vrmod_lh", function(_, ply) leftHeld[ply] = net.ReadBool() end)
-	hook.Add("PlayerDisconnected", "vrmod_lefthand", function(ply) leftHeld[ply] = nil end)
-	local function WrapDrop()
-		local orig = net.Receivers and net.Receivers.dropweapon
-		if not orig or orig == vrmod._lhDropWrap then return end
-		local function wrap(len, ply)
-			if not leftHeld[ply] then return orig(len, ply) end
-			local rp, ra = vrmod.GetRightHandPos, vrmod.GetRightHandAng
-			vrmod.GetRightHandPos, vrmod.GetRightHandAng = vrmod.GetLeftHandPos, vrmod.GetLeftHandAng
-			local ok, err = pcall(orig, len, ply)
-			vrmod.GetRightHandPos, vrmod.GetRightHandAng = rp, ra
-			if not ok then ErrorNoHalt(err .. "\n") end
-		end
-
-		vrmod._lhDropWrap = wrap
-		net.Receive("DropWeapon", wrap)
-	end
-
-	WrapDrop()
-	hook.Add("InitPostEntity", "vrmod_lefthand", WrapDrop)
-	return
-end
+if SERVER then return end
 
 -- ── CLIENT ──────────────────────────────────────────────────────────────
 g_VR.gunInLeftHand = false
@@ -132,14 +110,7 @@ hook_Add("VRMod_Input", "vrmod_lefthand_input", function(action, pressed)
 			if not dropenable:GetBool() or g_VR.antiDrop and not ourAnti then return end
 			local hs = vrmod_holster
 			if hs and (hs.IsHandInHolster(true) or hs.IsStoreSuppressed and hs.IsStoreSuppressed(true)) then return end
-			local wpn = LocalPlayer():GetActiveWeapon()
-			if not IsValid(wpn) then return end
-			net.Start("DropWeapon")
-			net.WriteBool(true)
-			net.WriteVector(vrmod.GetLeftHandVelocity() * 2.5)
-			net.WriteVector(vrmod.GetLeftHandAngularVelocity() * 2.5)
-			net.WriteBool(not (hs and hs.CountWeapon) or hs.CountWeapon(wpn:GetClass()) <= 1)
-			net.SendToServer()
+			vrmod.SendWeaponDrop(true)
 		end
 	elseif action == "boolean_right_pickup" and pressed then
 		pendingLeft, pendingT = false, CurTime()
@@ -192,7 +163,7 @@ end
 -- Commit on the frame the equip lands; weapon changes without a recent
 -- grip press (or, with the option on, a recent weapon-menu close) reset to
 -- right. 1 GetActiveWeapon + 2 compares per frame.
-local lastWep, lastSent = NULL, false
+local lastWep = NULL
 hook_Add("VRMod_Tracking", "vrmod_lefthand", function()
 	local mf = g_VR.menuFocus == "weaponmenu"
 	if mf ~= menuOpen then
@@ -239,13 +210,6 @@ hook_Add("VRMod_Tracking", "vrmod_lefthand", function()
 		elseif arcSet and (not left or arcWep) then
 			arc.GunInLeftHand, arcSet = false, false
 		end
-	end
-
-	if left ~= lastSent then
-		lastSent = left
-		net.Start("vrmod_lh")
-		net.WriteBool(left)
-		net.SendToServer()
 	end
 end)
 

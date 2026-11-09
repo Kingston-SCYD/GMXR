@@ -59,8 +59,7 @@ enum ELuaRefIndex{
 typedef struct action {
 	XrAction handle = XR_NULL_HANDLE;
 	XrSpace space = XR_NULL_HANDLE;
-	//char fullname[MAX_STR_LEN];
-	int luaRefs[2];
+	int luaRefs[2] = { -1, -1 };          // vector2: [0] its {x,y} table; pose: [0] pose table, [1] its Matrix
 	char name[XR_MAX_ACTION_NAME_SIZE];
 	XrActionType type;
 	class VMatrix* poseMatrix = nullptr; // pose actions: cached pointer into the Matrix userdata held by luaRefs[1]
@@ -72,14 +71,6 @@ typedef struct actionSet {
 	XrActionSet handle = XR_NULL_HANDLE;
 	char name[XR_MAX_ACTION_SET_NAME_SIZE];
 } actionSet;
-
-typedef struct {
-	void* handle;
-	int eType;
-} vrTexture;
-
-//#define PushMatrix(mtx) LUA->PushUserType(&(mtx.m), GarrysMod::Lua::Type::MATRIX);
-
 // Placeholder for VMatrix in Source SDK
 class VMatrix {
 	public:
@@ -157,6 +148,45 @@ PFN_xrDestroyHandTrackerEXT pfnDestroyHandTrackerEXT = nullptr;
 PFN_xrLocateHandJointsEXT   pfnLocateHandJointsEXT = nullptr;
 int                     g_luaRefFingerCurls[2] = { -1, -1 };   // reusable Lua tables for L/R fingerCurls
 int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua tables for L/R skeleton_{left,right}hand
+bool                    g_skelLinked[2]        = { false, false }; // skeleton_{left,right}hand linked into the action table
+
+// Composition layer: the fixed fields are set once in ShareTextureFinish;
+// SubmitFrame only writes each eye's pose, FOV and sampled extent.
+XrCompositionLayerProjectionView g_projectViews[2];
+XrCompositionLayerProjection     g_layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION, nullptr, 0, XR_NULL_HANDLE, 2, g_projectViews};
+
+// XR_EXT_eye_gaze_interaction. Module-owned set/action, invisible to Lua's
+// action table: GetPoses never walks it, and it is located against VIEW space
+// so gaze comes out head-relative with no matrix work on the Lua side.
+bool                    g_hasEyeGazeExt = false;
+XrActionSet             g_gazeSet    = XR_NULL_HANDLE;
+XrAction                g_gazeAction = XR_NULL_HANDLE;
+XrSpace                 g_gazeSpace  = XR_NULL_HANDLE;
+
+// Frees a registry reference if one is held, leaving it at -1.
+static void Unref(GarrysMod::Lua::ILuaBase* LUA, int& ref) {
+	if (ref != -1) {
+		LUA->ReferenceFree(ref);
+		ref = -1;
+	}
+}
+
+// Arms / disarms the 14-byte patch over the engine's texture allocator
+// (IDirect3DDevice9::CreateTexture, or glGenTextures); the byte writer is per
+// platform, below.
+bool WriteCreateTextureBytes(const char* bytes);
+
+void ArmCreateTextureHook() {
+	if (!g_createTexturePatched)
+		g_createTexturePatched = WriteCreateTextureBytes(g_createTexturePatchBytes);
+}
+
+void UnpatchCreateTexture() {
+	if (g_createTexturePatched) {
+		WriteCreateTextureBytes(g_createTextureOrigBytes);
+		g_createTexturePatched = false;
+	}
+}
 
 #ifdef _WIN32
 
@@ -182,19 +212,6 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 	// hijacked and corrupt whatever it creates next.
 	bool WriteCreateTextureBytes(const char* bytes) {
 		return g_createTexture != NULL && WriteProcessMemory(GetCurrentProcess(), (LPVOID)g_createTexture, (LPCVOID)bytes, 14, NULL) != 0;
-	}
-
-	void ArmCreateTextureHook() {
-		if (g_createTexturePatched)
-			return;
-		g_createTexturePatched = WriteCreateTextureBytes(g_createTexturePatchBytes);
-	}
-
-	void UnpatchCreateTexture() {
-		if (!g_createTexturePatched)
-			return;
-		WriteCreateTextureBytes(g_createTextureOrigBytes);
-		g_createTexturePatched = false;
 	}
 
 	HRESULT APIENTRY CreateTextureHook(IDirect3DDevice9* pDevice, UINT w, UINT h, UINT levels, DWORD usage, D3DFORMAT format, D3DPOOL pool, IDirect3DTexture9** tex, HANDLE* shared_handle) {
@@ -230,6 +247,149 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 		return hr;
 	};
 
+	// ---- Engine frame-buffer render targets --------------------------------
+	// RT_SIZE_FULL_FRAME_BUFFER / HDR and the clamp modes size the engine's own
+	// render targets (_rt_FullFrameFB*, the bloom chain, _rt_FullFrameDepth) from
+	// the shader device's backbuffer, and only re-size them on a resource
+	// restore. gmod's material system predates SetRenderTargetFrameBufferSize-
+	// Overrides, so it is emulated: the backbuffer size the device reports is
+	// pointed at the request for one release/reacquire, then put back. Nothing
+	// resets the swapchain, so only the restored render targets ever see it.
+	//
+	// Shared-depth targets (MATERIAL_RT_DEPTH_SHARED: water reflection and
+	// refraction, _rt_FullFrameFB, most addon targets) draw with the window's
+	// depth buffer, and the shader API clamps their viewport to it, so grown
+	// past the window only their top-left was ever drawn -- black water. A
+	// bigger device depth buffer broke the desktop instead. The engine already
+	// gives each such target its own depth when they can't share: with MSAA
+	// (DoRenderTargetsNeedSeparateDepthBuffer reads the present parameters'
+	// MultiSampleType). The grow restore alone claims MSAA, so they come back
+	// with depth of their own size; the restore to the desktop reads the real
+	// value and shares again. Nothing in that restore creates a surface from
+	// MultiSampleType: their depth is always made single-sampled.
+	//
+	// That restore recreates EVERY render target, so it only runs from Present
+	// on the Lua thread -- a frame boundary with the material system single-
+	// threaded (Lua drops mat_queue_mode to 0 for it) -- and ShareTextureBegin
+	// cancels anything still pending before the VR ones exist.
+	typedef void (__thiscall* DevFn)(void*);
+	typedef void (__thiscall* DevDimsFn)(void*, int*, int*);
+	enum { SD_RELEASE = 0, SD_REACQUIRE = 1, SD_BBDIMS = 3, SD_PRESENT = 9 }; // IShaderDevice slots
+	void*                   g_shaderDevice = NULL;  // ShaderDevice001, see ShaderDevice()
+	void*                   g_presentOrig = NULL;
+	D3DPRESENT_PARAMETERS*  g_pp = NULL;           // the device's present parameters
+	bool                    g_ppFull = false;       // all of it confirmed, not just the size
+	int                     g_rtsW = 0, g_rtsH = 0; // requested size; 0 = the real backbuffer
+	bool                    g_rtsPending = false;
+	DWORD                   g_luaThread = 0;
+
+	inline void** DevVT() { return *(void***)g_shaderDevice; }
+
+	// On demand, not just in Init: a fresh Lua state (map change) has to put the
+	// engine RTs back to the desktop size without ever starting VR.
+	void* ShaderDevice() {
+		if (g_shaderDevice == NULL) {
+			HMODULE hMod = GetModuleHandleA("shaderapidx9.dll");
+			CreateInterfaceFn ci = hMod ? (CreateInterfaceFn)GetProcAddress(hMod, "CreateInterface") : NULL;
+			if (ci) g_shaderDevice = ci("ShaderDevice001", NULL);
+		}
+		return g_shaderDevice;
+	}
+
+	// IsUsingGraphics (slot 5) is `return g_pD3DDevice != NULL`; its operand is the device.
+	IDirect3DDevice9* D3D9Device() {
+		if (ShaderDevice() == NULL)
+			return NULL;
+		# ifdef _WIN64
+			DWORD_PTR fnAddr = (DWORD_PTR)DevVT()[5];
+			return *(IDirect3DDevice9**)(fnAddr + 8 + (*(DWORD_PTR*)(fnAddr + 3) & 0xFFFFFFFF));
+		# else
+			return **(IDirect3DDevice9***)((DWORD_PTR)DevVT()[5] + 2);
+		# endif
+	}
+
+	void SetPresentSlot(void* fn) {
+		void** slot = DevVT() + SD_PRESENT;
+		DWORD prot;
+		if (VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &prot)) {
+			*slot = fn;
+			VirtualProtect(slot, sizeof(void*), prot, &prot);
+		}
+	}
+
+	void CancelEngineRTResize() {
+		if (!g_rtsPending)
+			return;
+		g_rtsPending = false;
+		SetPresentSlot(g_presentOrig);
+	}
+
+	// Found by experiment rather than by decoding the getter: each adjacent
+	// (w, h) match in the device object is nudged and the getter re-asked until
+	// its answer follows. The getter returns m_PresentParameters' backbuffer
+	// size, so the match heads that D3DPRESENT_PARAMETERS; the rest of it is
+	// trusted only once it agrees with the real backbuffer's format and
+	// multisampling. Lua thread, frame boundary: nothing else is reading.
+	D3DPRESENT_PARAMETERS* FindPresentParams() {
+		DevDimsFn get = (DevDimsFn)DevVT()[SD_BBDIMS];
+		int w, h, tw, th;
+		get(g_shaderDevice, &w, &h);
+		MEMORY_BASIC_INFORMATION mbi;
+		if (w <= 0 || h <= 0 || !VirtualQuery(g_shaderDevice, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT
+			|| !(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+			return NULL;
+		int* p = (int*)g_shaderDevice;
+		int* end = (int*)((char*)mbi.BaseAddress + mbi.RegionSize - sizeof(D3DPRESENT_PARAMETERS));
+		if (end > p + 4096) end = p + 4096; // 16 KB: far past any device member
+		for (; p < end; p++) {
+			if (p[0] != w || p[1] != h) continue;
+			p[0] = w + 1; p[1] = h + 1;
+			get(g_shaderDevice, &tw, &th);
+			p[0] = w; p[1] = h;
+			if (tw != w + 1 || th != h + 1) continue;
+
+			D3DPRESENT_PARAMETERS* pp = (D3DPRESENT_PARAMETERS*)p;
+			IDirect3DDevice9* dev = D3D9Device();
+			IDirect3DSurface9* bb;
+			D3DSURFACE_DESC d;
+			if (dev != NULL && SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb))) {
+				g_ppFull = SUCCEEDED(bb->GetDesc(&d)) && d.Format == pp->BackBufferFormat
+					&& d.MultiSampleType == pp->MultiSampleType && d.MultiSampleQuality == pp->MultiSampleQuality;
+				bb->Release();
+			}
+			return pp;
+		}
+		return NULL;
+	}
+
+	// x86 thiscall == fastcall with an unused edx; x64 never reads the 2nd arg.
+	void __fastcall PresentHook(void* self, void*) {
+		((DevFn)g_presentOrig)(self);
+		// A render-thread Present (queued mode) waits for mat_queue_mode 0
+		if (!g_rtsPending || GetCurrentThreadId() != g_luaThread)
+			return;
+		if (g_pp == NULL)
+			g_pp = FindPresentParams();
+		if (g_pp != NULL) {
+			UINT w = g_pp->BackBufferWidth, h = g_pp->BackBufferHeight;
+			D3DMULTISAMPLE_TYPE ms = g_pp->MultiSampleType;
+			if (g_rtsW > 0 && g_rtsH > 0) {
+				g_pp->BackBufferWidth = g_rtsW;
+				g_pp->BackBufferHeight = g_rtsH;
+				// Separate depth for shared-depth targets, when they outgrow the
+				// window's (real MSAA already gives them their own)
+				if (g_ppFull && ms == D3DMULTISAMPLE_NONE && ((UINT)g_rtsW > w || (UINT)g_rtsH > h))
+					g_pp->MultiSampleType = D3DMULTISAMPLE_2_SAMPLES;
+			}
+			((DevFn)DevVT()[SD_RELEASE])(self);
+			((DevFn)DevVT()[SD_REACQUIRE])(self);
+			g_pp->BackBufferWidth = w;
+			g_pp->BackBufferHeight = h;
+			g_pp->MultiSampleType = ms;
+		}
+		CancelEngineRTResize(); // done, or unsupported: Lua reads the result off the RT
+	}
+
 #else
 
 	#define XR_USE_GRAPHICS_API_OPENGL
@@ -262,19 +422,6 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 		return true;
 	}
 
-	void ArmCreateTextureHook() {
-		if (g_createTexturePatched)
-			return;
-		g_createTexturePatched = WriteCreateTextureBytes(g_createTexturePatchBytes);
-	}
-
-	void UnpatchCreateTexture() {
-		if (!g_createTexturePatched)
-			return;
-		WriteCreateTextureBytes(g_createTextureOrigBytes);
-		g_createTexturePatched = false;
-	}
-
 	// glGenTextures carries no usage or dimensions, so the D3D path's filter has
 	// nothing to test here -- first capture wins, as before. Guarding on
 	// GL_INVALID_VALUE at least stops a second call clobbering a good capture.
@@ -289,6 +436,8 @@ int                     g_luaRefSkeleton[2]    = { -1, -1 };   // reusable Lua t
 
 		return;
 	}
+
+	inline void CancelEngineRTResize() {}
 
 #endif
 
@@ -353,49 +502,10 @@ void ClearPrototypeFunctions()
 	pfnLocateHandJointsEXT = nullptr;
 }
 
-QAngle QuatToAngle(XrQuaternionf q) {
-	float q0 = q.x;
-    float q1 = q.y;
-    float q2 = q.z;
-    float q3 = q.w;
-
-    float t2 = 2.0*(q0*q2 - q1*q3);
-	if(t2 > 1.0)
-		t2 = 1.0;
-    else if(t2 < -1.0)
-		t2 = -1.0;
-
-	QAngle out;
-
-    if(t2 == 1)
-	{
-        out.x = asin(t2);
-        out.y = 0;
-        out.z = -atan2(q0, q1);
-	} else if(t2 == -1) {
-        out.x = asin(t2);
-        out.y = 0;
-        out.z = atan2(q0, q1);
-	} else {
-        out.x = asin(t2);
-        out.y = atan2(2.0*(q0*q1 + q2*q3), q0*q0 - q1*q1 - q2*q2 + q3*q3);
-        out.z = atan2(2.0*(q0*q3 + q1*q2), q0*q0 + q1*q1 - q2*q2 - q3*q3);
-	}
-
-	// x -> z
-	// y -> x
-	// z -> y
-	q0 = out.x;
-	out.x = out.z * RAD2DEG;
-	out.z = out.y * RAD2DEG;
-	out.y = q0 * RAD2DEG;
-
-    return out;
-}
-
 char* GetResultString(const char* form, XrResult result) {
-	char resStr[MAX_STR_LEN];
-	xrResultToString(g_Instance,result,resStr);
+	char resStr[XR_MAX_RESULT_STRING_SIZE];
+	if(XR_FAILED(xrResultToString(g_Instance,result,resStr)))
+		snprintf(resStr, sizeof(resStr), "XrResult %d", (int) result);
 
 	static char str[MAX_STR_LEN];
 	snprintf(str, MAX_STR_LEN, form, resStr);
@@ -406,148 +516,84 @@ void PrintConsoleText(const char* str, GarrysMod::Lua::ILuaBase *LUA) {
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1, "print");
 	LUA->PushString(str);
-	LUA->PCall(1, 0, 0);
-	LUA->Pop();
+	LUA->Pop(LUA->PCall(1, 0, 0) ? 2 : 1); // _G, plus the error if print failed
 }
-
-
 
 XrResult RefreshInstance() {
-	XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO,nullptr};
-
-	std::vector<const char*> extensions = {};
-
+	// Required: graphics binding and clock conversion (plus debug utils)
+	const char* exts[8];
+	uint32_t n = 0;
 	#ifdef _WIN32
-		extensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
-		extensions.push_back(XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME);
+		exts[n++] = XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
+		exts[n++] = XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME;
 	#else
-		extensions.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
-		extensions.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
+		exts[n++] = XR_KHR_OPENGL_ENABLE_EXTENSION_NAME;
+		exts[n++] = XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME;
 	#endif
 	#ifdef DEBUG
-		extensions.push_back(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
+		exts[n++] = XR_EXT_DEBUG_UTILS_EXTENSION_NAME;
 	#endif
 
-	// Enumerate available extensions and conditionally enable tracker support
-	g_hasTrackerExtension = false;
-	g_hasHandTracking = false;
-	g_hasFrameController = false;
-	uint32_t extCount = 0;
-	if(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extCount, nullptr) == XR_SUCCESS && extCount > 0)
+	// Optional: enabled only when the runtime offers them
+	static const struct { const char* name; bool* flag; } opt[] = {
+		{ XR_HTCX_VIVE_TRACKER_INTERACTION_EXTENSION_NAME, &g_hasTrackerExtension },
+		{ XR_EXT_HAND_TRACKING_EXTENSION_NAME,             &g_hasHandTracking },
+		{ XR_VALVE_FRAME_CONTROLLER_EXT_NAME,              &g_hasFrameController },
+		{ XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME,      &g_hasEyeGazeExt },
+	};
+	for(const auto& o : opt) *o.flag = false;
+
+	uint32_t count = 0;
+	if(xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr) == XR_SUCCESS && count > 0)
 	{
-		std::vector<XrExtensionProperties> extProps(extCount, {XR_TYPE_EXTENSION_PROPERTIES, nullptr});
-		if(xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, extProps.data()) == XR_SUCCESS)
-		{
-			for(uint32_t i = 0; i < extCount; i++)
-			{
-				if(strcmp(extProps[i].extensionName, XR_HTCX_VIVE_TRACKER_INTERACTION_EXTENSION_NAME) == 0)
-				{
-					extensions.push_back(XR_HTCX_VIVE_TRACKER_INTERACTION_EXTENSION_NAME);
-					g_hasTrackerExtension = true;
-				}
-				else if(strcmp(extProps[i].extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
-				{
-					extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
-					g_hasHandTracking = true;
-				}
-				else if(strcmp(extProps[i].extensionName, XR_VALVE_FRAME_CONTROLLER_EXT_NAME) == 0)
-				{
-					extensions.push_back(XR_VALVE_FRAME_CONTROLLER_EXT_NAME);
-					g_hasFrameController = true;
-				}
-			}
-		}
+		std::vector<XrExtensionProperties> props(count, {XR_TYPE_EXTENSION_PROPERTIES, nullptr});
+		if(xrEnumerateInstanceExtensionProperties(nullptr, count, &count, props.data()) == XR_SUCCESS)
+			for(uint32_t i = 0; i < count; i++)
+				for(const auto& o : opt)
+					if(!*o.flag && strcmp(props[i].extensionName, o.name) == 0)
+					{
+						exts[n++] = o.name;
+						*o.flag = true;
+					}
 	}
 
-	createInfo.enabledExtensionCount = (uint32_t) extensions.size();
-	createInfo.enabledExtensionNames = extensions.data();
-
-	std::vector<const char*> apiLayers = {};
-	#ifdef DEBUG
-		//apiLayers.push_back("XR_APILAYER_LUNARG_core_validation");
-	#endif
-	createInfo.enabledApiLayerCount = apiLayers.size();
-	createInfo.enabledApiLayerNames = apiLayers.data();
-
-	XrApplicationInfo appInfo;
-	appInfo.apiVersion = XR_CURRENT_API_VERSION;
-	strcpy(appInfo.applicationName, "Garry's Mod");
-	appInfo.applicationVersion = 1;
-	strcpy(appInfo.engineName, "");
-	appInfo.engineVersion = 0;
-
-	createInfo.applicationInfo = appInfo;
-	createInfo.createFlags = 0;
+	XrInstanceCreateInfo createInfo{XR_TYPE_INSTANCE_CREATE_INFO};
+	createInfo.enabledExtensionCount = n;
+	createInfo.enabledExtensionNames = exts;
+	strcpy(createInfo.applicationInfo.applicationName, "Garry's Mod");
+	createInfo.applicationInfo.applicationVersion = 1;
+	createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
 
 	XrResult result = xrCreateInstance(&createInfo,&g_Instance);
-	if(XR_FAILED(result))
-		return result;
-	
-	SetupPrototypeFunctions();
+	if(XR_SUCCEEDED(result))
+		SetupPrototypeFunctions();
 	return result;
 }
-
 #ifdef DEBUG
 GarrysMod::Lua::ILuaBase* debugLuaHandle = nullptr;
 XrDebugUtilsMessengerEXT debugGlobalMessenger = XR_NULL_HANDLE;
-XrBool32 handleXRError(
+// XRAPI_CALL: the loader calls this __stdcall on 32-bit Windows
+XrBool32 XRAPI_CALL handleXRError(
 	XrDebugUtilsMessageSeverityFlagsEXT severity,
 	XrDebugUtilsMessageTypeFlagsEXT type,
 	const XrDebugUtilsMessengerCallbackDataEXT* callbackData,
 	void* userData
 )
 {
-	char output[MAX_STR_LEN] = "XRMod DEBUG: ";
+	const char* t =
+		type == XR_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT     ? "General " :
+		type == XR_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT  ? "Validation " :
+		type == XR_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT ? "Performance " :
+		type == XR_DEBUG_UTILS_MESSAGE_TYPE_CONFORMANCE_BIT_EXT ? "Conformance " : "";
+	const char* s =
+		severity == XR_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT ? "(Verbose) " :
+		severity == XR_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT    ? "(Info) " :
+		severity == XR_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ? "(Warning) " :
+		severity == XR_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT   ? "(Error) " : "";
 
-	switch (type)
-	{
-		case XR_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT :
-		{
-			strcat(output,"General ");
-			break;
-		}
-		case XR_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT :
-		{
-			strcat(output,"Validation ");
-			break;
-		}
-		case XR_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT :
-		{
-			strcat(output,"Performance ");
-			break;
-		}
-		case XR_DEBUG_UTILS_MESSAGE_TYPE_CONFORMANCE_BIT_EXT :
-		{
-			strcat(output,"Conformance ");
-			break;
-		}
-	}
-
-	switch (severity)
-	{
-		case XR_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT :
-		{
-			strcat(output,"(Verbose) ");
-			break;
-		}
-		case XR_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT :
-		{
-			strcat(output,"(Info) ");
-			break;
-		}
-		case XR_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT :
-		{
-			strcat(output,"(Warning) ");
-			break;
-		}
-		case XR_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT :
-		{
-			strcat(output,"(Error) ");
-			break;
-		}
-	}
-
-	strcat(output,callbackData->message);
+	// snprintf, not strcat: validation messages run far past the buffer
+	char output[MAX_STR_LEN];
+	snprintf(output, MAX_STR_LEN, "XRMod DEBUG: %s%s%s", t, s, callbackData->message);
 	if(debugLuaHandle != nullptr)
 		PrintConsoleText(output,debugLuaHandle);
 
@@ -556,23 +602,18 @@ XrBool32 handleXRError(
 
 bool CreateDebugMessenger(GarrysMod::Lua::ILuaBase *LUA)
 {
-	XrDebugUtilsMessengerEXT debugMessenger;
+	XrDebugUtilsMessengerCreateInfoEXT info{XR_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,nullptr};
+	info.messageSeverities = XR_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+	info.messageTypes = XR_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_TYPE_CONFORMANCE_BIT_EXT;
+	info.userCallback = handleXRError;
 
-    XrDebugUtilsMessengerCreateInfoEXT debugMessengerCreateInfo{XR_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,nullptr};
-    debugMessengerCreateInfo.messageSeverities = XR_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
-    debugMessengerCreateInfo.messageTypes = XR_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_TYPE_CONFORMANCE_BIT_EXT;
-    debugMessengerCreateInfo.userCallback = (PFN_xrDebugUtilsMessengerCallbackEXT) handleXRError;
-    debugMessengerCreateInfo.userData = nullptr;
-
-	PFN_xrCreateDebugUtilsMessengerEXT xrCreateDebugUtilsMessengerEXT = (PFN_xrCreateDebugUtilsMessengerEXT) getXRFunction("xrCreateDebugUtilsMessengerEXT");
-
-	if(XR_FAILED(xrCreateDebugUtilsMessengerEXT(g_Instance, &debugMessengerCreateInfo, &debugMessenger)))
+	PFN_xrCreateDebugUtilsMessengerEXT create = (PFN_xrCreateDebugUtilsMessengerEXT) getXRFunction("xrCreateDebugUtilsMessengerEXT");
+	if(create == nullptr || XR_FAILED(create(g_Instance, &info, &debugGlobalMessenger)))
 	{
+		debugGlobalMessenger = XR_NULL_HANDLE;
 		PrintConsoleText("XRMod Error: Failed to create debug messenger",LUA);
 		return false;
 	}
-
-	debugGlobalMessenger = debugMessenger;
 	return true;
 }
 #endif
@@ -599,37 +640,46 @@ void DestroyInstance() {
 	ClearPrototypeFunctions();
 }
 
-void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
-	// Never leave the engine's texture allocator hooked across a session teardown.
-	UnpatchCreateTexture();
+static void EyeGaze_Destroy() {
+	if(g_gazeSpace != XR_NULL_HANDLE)  { xrDestroySpace(g_gazeSpace);      g_gazeSpace  = XR_NULL_HANDLE; }
+	if(g_gazeAction != XR_NULL_HANDLE) { xrDestroyAction(g_gazeAction);    g_gazeAction = XR_NULL_HANDLE; }
+	if(g_gazeSet != XR_NULL_HANDLE)    { xrDestroyActionSet(g_gazeSet);    g_gazeSet    = XR_NULL_HANDLE; }
+}
 
-	// Destroy hand trackers before session
+void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
+	// Never leave the engine's texture allocator (or Present) hooked across a
+	// session teardown or a module unload.
+	UnpatchCreateTexture();
+	CancelEngineRTResize();
+	EyeGaze_Destroy();
+
+	// Hand trackers go before the session
 	for(int i = 0; i < 2; i++)
 	{
-		if(g_handTrackers[i] != XR_NULL_HANDLE)
-		{
-			if(pfnDestroyHandTrackerEXT)
-				pfnDestroyHandTrackerEXT(g_handTrackers[i]);
-			g_handTrackers[i] = XR_NULL_HANDLE;
-		}
-		if(g_luaRefFingerCurls[i] != -1) { LUA->ReferenceFree(g_luaRefFingerCurls[i]); g_luaRefFingerCurls[i] = -1; }
-		if(g_luaRefSkeleton[i] != -1)    { LUA->ReferenceFree(g_luaRefSkeleton[i]);    g_luaRefSkeleton[i] = -1; }
+		if(g_handTrackers[i] != XR_NULL_HANDLE && pfnDestroyHandTrackerEXT)
+			pfnDestroyHandTrackerEXT(g_handTrackers[i]);
+		g_handTrackers[i] = XR_NULL_HANDLE;
+		Unref(LUA, g_luaRefFingerCurls[i]);
+		Unref(LUA, g_luaRefSkeleton[i]);
+		g_skelLinked[i] = false;
 	}
 
 	if(g_Session != XR_NULL_HANDLE)
 	{
 		// Polite OpenXR exit handshake: request exit, drain events until the
 		// runtime reaches STOPPING, end the session there, then wait for
-		// EXITING. Calling xrEndSession on a running session (old behavior)
-		// errors out and leaves the runtime treating gmod as abnormally
-		// terminated instead of cleanly disconnected.
+		// EXITING. xrEndSession on a running session errors out and leaves the
+		// runtime treating gmod as abnormally terminated instead of cleanly
+		// disconnected.
 		if(g_SessionStarted)
 		{
 			xrRequestExitSession(g_Session);
 			bool stopping = false;
+			XrEventDataBuffer eventData;
 			for(int i = 0; i < 200; i++) // ~1s cap
 			{
-				XrEventDataBuffer eventData{XR_TYPE_EVENT_DATA_BUFFER,nullptr};
+				eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+				eventData.next = nullptr;
 				XrResult r = xrPollEvent(g_Instance,&eventData);
 				if(r == XR_EVENT_UNAVAILABLE)
 				{
@@ -665,80 +715,41 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 	for(int i = 0; i < g_actionCount; i++)
 	{
 		action* act = &g_actions[i];
-
 		xrDestroyAction(act->handle);
-		act->handle = XR_NULL_HANDLE;
-		strcpy(act->name,"");
-
 		if(act->space != XR_NULL_HANDLE)
-		{
 			xrDestroySpace(act->space);
-			act->space = XR_NULL_HANDLE;
-		}
-
-		for(int j = 0; j < 2; j++)
-			LUA->ReferenceFree(act->luaRefs[j]);
-
-		act->poseMatrix = nullptr;
-		act->poseLinked = false;
-		act->boundSources = -1;
+		Unref(LUA, act->luaRefs[0]);
+		Unref(LUA, act->luaRefs[1]);
+		*act = action(); // handles, name, refs, pose cache and haptic count back to defaults
 	}
 	g_actionCount = 0;
 
-	if(g_luaRefHmdMatrix != -1) { LUA->ReferenceFree(g_luaRefHmdMatrix); g_luaRefHmdMatrix = -1; }
+	Unref(LUA, g_luaRefHmdMatrix);
 	g_hmdMatrix = nullptr;
 	g_hmdLinked = false;
-
 	for(int i = 0; i < 2; i++)
 	{
-		if(g_luaRefEyeMatrix[i] != -1) { LUA->ReferenceFree(g_luaRefEyeMatrix[i]); g_luaRefEyeMatrix[i] = -1; }
+		Unref(LUA, g_luaRefEyeMatrix[i]);
 		g_eyeMatrix[i] = nullptr;
 	}
 
 	for(int i = 0; i < g_actionSetCount; i++)
 	{
-		actionSet* set = &g_actionSets[i];
-
-		xrDestroyActionSet(set->handle);
-		set->handle = XR_NULL_HANDLE;
-		strcpy(set->name,"");
+		xrDestroyActionSet(g_actionSets[i].handle);
+		g_actionSets[i] = actionSet();
 	}
 	g_actionSetCount = 0;
+	g_activeActionSetCount = 0; // entries are rewritten before they are read again
 
-	for(int i = 0; i < g_activeActionSetCount; i++)
-	{
-		g_activeActionSets[i].actionSet = XR_NULL_HANDLE;
-		g_activeActionSets[i].subactionPath = XR_NULL_PATH;
-	}
-	g_activeActionSetCount = 0;
-
-
-	if(g_SpaceStage != XR_NULL_HANDLE)
-	{
-		xrDestroySpace(g_SpaceStage);
-		g_SpaceStage = XR_NULL_HANDLE;
-	}
-
-	if(g_SpaceView != XR_NULL_HANDLE)
-	{
-		xrDestroySpace(g_SpaceView);
-		g_SpaceView = XR_NULL_HANDLE;
-	}
-
-	if(g_Swapchain != XR_NULL_HANDLE)
-	{
-		xrDestroySwapchain(g_Swapchain);
-		g_Swapchain = XR_NULL_HANDLE;
-	}
-	
+	if(g_SpaceStage != XR_NULL_HANDLE) { xrDestroySpace(g_SpaceStage);    g_SpaceStage = XR_NULL_HANDLE; }
+	if(g_SpaceView != XR_NULL_HANDLE)  { xrDestroySpace(g_SpaceView);     g_SpaceView  = XR_NULL_HANDLE; }
+	if(g_Swapchain != XR_NULL_HANDLE)  { xrDestroySwapchain(g_Swapchain); g_Swapchain  = XR_NULL_HANDLE; }
 	g_SwapchainImages.clear();
 
 	g_FrameState.shouldRender = XR_FALSE;
 	g_FrameState.predictedDisplayPeriod = 0;
 	g_FrameState.predictedDisplayTime = 0;
-
 	g_lastPredictedFrameTime = 0;
-
 
 	for(int i = 0; i < g_luaRefCount; i++)
 		LUA->ReferenceFree(g_luaRefs[i]);
@@ -750,20 +761,24 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 	g_frameCounter = 0; // re-prime the pipeline on session restart
 
 	#ifdef _WIN32
+		// Released, not just dropped: the opened shared texture holds the D3D11
+		// device and the engine render target's memory, so every VR restart
+		// used to leak a 3-band eye target's worth of VRAM.
+		if (g_d3d11Texture != NULL) {
+			g_d3d11Texture->Release();
+			g_d3d11Texture = NULL;
+		}
 		if (g_d3d11Device != NULL) {
 			g_d3d11DeviceContext->Release();
 			g_d3d11DeviceContext = NULL;
 			g_d3d11Device->Release();
 			g_d3d11Device = NULL;
 		}
-
 		if (g_pEventQuery != NULL) {
 			g_pEventQuery->Release();
 			g_pEventQuery = NULL;
 		}
 		g_eventQueryIssued = false;
-
-		g_d3d11Texture = NULL;
 		g_pD3D9Device = NULL;
 		g_sharedTexture = NULL;
 	#else
@@ -772,8 +787,6 @@ void ClearSession(GarrysMod::Lua::ILuaBase *LUA) {
 
 	g_SystemId = XR_NULL_SYSTEM_ID;
 }
-
-// Doesn't need changing
 LUA_FUNCTION(GetVersion) {
 	LUA->PushNumber(XRMOD_MODULE_VERSION);
 
@@ -795,7 +808,6 @@ LUA_FUNCTION(HasHandTracking) {
 	return 1;
 }
 
-// Done
 LUA_FUNCTION(IsHMDPresent) {
 	if(g_Instance == XR_NULL_HANDLE) {
 		if(XR_FAILED(RefreshInstance()))
@@ -940,11 +952,18 @@ void InitializeSession(GarrysMod::Lua::ILuaBase *LUA) {
 			}
 		}
 
-		// Pre-allocate reusable Lua tables for finger curls
+		// Reusable tables, wired once: skeleton = { fingerCurls = {...} }.
+		// GetActions links each skeleton into the action table on its first
+		// active frame.
 		for(int i = 0; i < 2; i++)
 		{
-			LUA->CreateTable(); g_luaRefSkeleton[i] = LUA->ReferenceCreate();
-			LUA->CreateTable(); g_luaRefFingerCurls[i] = LUA->ReferenceCreate();
+			LUA->CreateTable();                          // skeleton
+			LUA->CreateTable();                          // fingerCurls
+			LUA->Push(-1);
+			g_luaRefFingerCurls[i] = LUA->ReferenceCreate();
+			LUA->SetField(-2, "fingerCurls");
+			g_luaRefSkeleton[i] = LUA->ReferenceCreate();
+			g_skelLinked[i] = false;
 		}
 
 		if(g_handTrackers[0] != XR_NULL_HANDLE || g_handTrackers[1] != XR_NULL_HANDLE)
@@ -952,7 +971,6 @@ void InitializeSession(GarrysMod::Lua::ILuaBase *LUA) {
 	}
 }
 
-// Hopefully this works
 LUA_FUNCTION(Init) {
 	if (g_Instance == XR_NULL_HANDLE)
 	{
@@ -989,17 +1007,8 @@ LUA_FUNCTION(Init) {
 	}
 
 	#ifdef _WIN32
-		HMODULE hMod = GetModuleHandleA("shaderapidx9.dll");
-		if (hMod == NULL) LUA->ThrowError("GetModuleHandleA failed");
-		CreateInterfaceFn CreateInterface = (CreateInterfaceFn)GetProcAddress(hMod, "CreateInterface");
-		if (CreateInterface == NULL) LUA->ThrowError("GetProcAddress failed");
-
-		# ifdef _WIN64
-			DWORD_PTR fnAddr = ((DWORD_PTR**)CreateInterface("ShaderDevice001", NULL))[0][5];
-			g_pD3D9Device = *(IDirect3DDevice9**)(fnAddr + 8 + (*(DWORD_PTR*)(fnAddr + 3) & 0xFFFFFFFF));
-		# else
-			g_pD3D9Device = **(IDirect3DDevice9***)(((DWORD_PTR**)CreateInterface("ShaderDevice001", NULL))[0][5] + 2);
-		# endif
+		g_pD3D9Device = D3D9Device();
+		if (g_pD3D9Device == NULL) LUA->ThrowError("XRMod Error: ShaderDevice001 unavailable");
 
 		g_createTexture = ((CreateTexture**)g_pD3D9Device)[0][23];
 	#else
@@ -1040,16 +1049,10 @@ LUA_FUNCTION(CreateActionSet) {
 
 	const char* setName = LUA->GetString(-3);
 	actionSet* set = nullptr;
-	for(int i = 0; i < g_actionSetCount; i++)
-	{
+	for(int i = 0; i < g_actionSetCount && set == nullptr; i++)
 		if(strcmp(g_actionSets[i].name, setName) == 0)
-		{
 			set = &g_actionSets[i];
-			break;
-		}
-	}
 
-	// Action set does not exist
 	if(set == nullptr)
 	{
 		if(g_actionSetCount >= MAX_ACTIONSETS)
@@ -1060,28 +1063,26 @@ LUA_FUNCTION(CreateActionSet) {
 		XrActionSetCreateInfo createInfo{XR_TYPE_ACTION_SET_CREATE_INFO,nullptr};
 		strncpy(createInfo.actionSetName,setName,XR_MAX_ACTION_SET_NAME_SIZE);
 		strncpy(createInfo.localizedActionSetName,LUA->GetString(-2),XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE);
-		createInfo.priority = 0;
 
 		XrResult result = xrCreateActionSet(g_Instance,&createInfo,&(set->handle));
 		if(result != XR_SUCCESS)
 			LUA->ThrowError(GetResultString("XRMod Error: Failed to create action set (%s)",result));
-		
+
 		strncpy(set->name,setName,XR_MAX_ACTION_SET_NAME_SIZE);
 		g_actionSetCount++;
 	}
 
-	// -1: ActionsTable
-	// -2: SetName
+	static const struct { const char* name; XrActionType type; } kTypes[] = {
+		{ "boolean",   XR_ACTION_TYPE_BOOLEAN_INPUT },
+		{ "float",     XR_ACTION_TYPE_FLOAT_INPUT },
+		{ "vector2f",  XR_ACTION_TYPE_VECTOR2F_INPUT },
+		{ "pose",      XR_ACTION_TYPE_POSE_INPUT },
+		{ "vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT },
+	};
 
-	LUA->PushNil(); // First Key in table
-	// -1: nil
-	// -2: ActionsTable
-	// -3: SetName
+	// Stack while iterating: setName, localizedSetName, actions, key, value
+	LUA->PushNil();
 	while(LUA->Next(-2) != 0) {
-		// -1: Value (subtable)
-		// -2: Key (replaces nil)
-		// -3: ActionsTable
-		// -4: SetName
 		bool failed = false;
 		if(g_actionCount >= MAX_ACTIONS)
 		{
@@ -1090,10 +1091,8 @@ LUA_FUNCTION(CreateActionSet) {
 		}
 
 		XrActionCreateInfo createInfo{XR_TYPE_ACTION_CREATE_INFO,nullptr};
-		createInfo.countSubactionPaths = 0;
-		createInfo.subactionPaths = nullptr;
 
-		if(LUA->GetType(-2) == GarrysMod::Lua::Type::STRING) // Key of this table (action name)
+		if(LUA->GetType(-2) == GarrysMod::Lua::Type::STRING) // key: the action name
 			strncpy(createInfo.actionName, LUA->GetString(-2), XR_MAX_ACTION_NAME_SIZE);
 		else
 		{
@@ -1102,43 +1101,20 @@ LUA_FUNCTION(CreateActionSet) {
 		}
 
 		LUA->GetField(-1,"type");
-		// -1: Value2 (value of "type")
-		// -2: Value (subtable)
-		// -3: Key (replaces nil)
-		// -4: ActionsTable
-		// -5: SetName
-		if(LUA->GetType(-1) == GarrysMod::Lua::Type::STRING)
-		{
-			const char* strType = LUA->GetString(-1);
-
-			if(strcmp(strType, "boolean") == 0)
-				createInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
-			else if(strcmp(strType, "float") == 0)
-				createInfo.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
-			else if(strcmp(strType, "vector2f") == 0)
-				createInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
-			else if(strcmp(strType, "pose") == 0)
-				createInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
-			else if(strcmp(strType, "vibration") == 0)
-				createInfo.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
-			else
-			{
-				failed = true;
-				PrintConsoleText("XRMod: Failed to create action: Invalid action type", LUA);
-			}
-		} else
+		const char* strType = LUA->GetType(-1) == GarrysMod::Lua::Type::STRING ? LUA->GetString(-1) : nullptr;
+		int t = 0;
+		while(strType != nullptr && t < 5 && strcmp(strType, kTypes[t].name) != 0)
+			t++;
+		if(strType == nullptr || t == 5)
 		{
 			failed = true;
-			PrintConsoleText("XRMod: Failed to create action: Type is not a string", LUA);
+			PrintConsoleText(strType ? "XRMod: Failed to create action: Invalid action type" : "XRMod: Failed to create action: Type is not a string", LUA);
 		}
+		else
+			createInfo.actionType = kTypes[t].type;
 		LUA->Pop();
-		// -1: Value (subtable)
-		// -2: Key (replaces nil)
-		// -3: ActionsTable
-		// -4: SetName
 
 		LUA->GetField(-1,"localizedActionName");
-		// Same order as previous
 		if(LUA->GetType(-1) == GarrysMod::Lua::Type::STRING)
 			strncpy(createInfo.localizedActionName, LUA->GetString(-1), XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
 		else
@@ -1146,69 +1122,59 @@ LUA_FUNCTION(CreateActionSet) {
 			failed = true;
 			PrintConsoleText("XRMod: Failed to create action: Localized name is not a string", LUA);
 		}
-		LUA->Pop();
+		LUA->Pop(2); // the localized name and this action's subtable; the key stays for Next
 
-		LUA->Pop(); // Pop this subtable to prepare for next iteration
-		// -1: Key (replaces nil)
-		// -2: ActionsTable
-		// -3: SetName
+		if(failed)
+			continue;
 
-		if(!failed)
+		action* act = &g_actions[g_actionCount];
+		XrResult result = xrCreateAction(set->handle,&createInfo,&(act->handle));
+		if(XR_FAILED(result))
 		{
-			action* act = &g_actions[g_actionCount];
-			XrResult result = xrCreateAction(set->handle,&createInfo,&(act->handle));
+			// Non-fatal: report and skip so one bad action (duplicated or
+			// invalid name) can't abort startup mid-iteration and leave the Lua
+			// stack unbalanced -- and say WHICH action failed.
+			char str[MAX_STR_LEN];
+			snprintf(str, MAX_STR_LEN, "XRMod: Failed to create action '%s' (Error Code %d)", createInfo.actionName, (int) result);
+			PrintConsoleText(str, LUA);
+			continue;
+		}
+
+		act->type = createInfo.actionType;
+		strncpy(act->name, createInfo.actionName, XR_MAX_ACTION_NAME_SIZE);
+		act->space = XR_NULL_HANDLE;
+		act->luaRefs[0] = act->luaRefs[1] = -1;
+		act->poseMatrix = nullptr;
+		act->poseLinked = false;
+		act->boundSources = -1;
+
+		if(act->type == XR_ACTION_TYPE_POSE_INPUT)
+		{
+			XrActionSpaceCreateInfo spaceCreateInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO,nullptr};
+			spaceCreateInfo.action = act->handle;
+			spaceCreateInfo.poseInActionSpace = XR_IDENTITYPOSE;
+			result = xrCreateActionSpace(g_Session,&spaceCreateInfo,&(act->space));
 			if(XR_FAILED(result))
-			{
-				// Non-fatal: report and skip so one bad action (duplicated or
-				// invalid name) can't abort startup mid-iteration and leave
-				// the Lua stack unbalanced. Also names the culprit -- the old
-				// ThrowError never said WHICH action failed.
-				char str[MAX_STR_LEN];
-				snprintf(str, MAX_STR_LEN, "XRMod: Failed to create action '%s' (Error Code %d)", createInfo.actionName, (int) result);
-				PrintConsoleText(str, LUA);
-				continue;
-			}
+				PrintConsoleText(GetResultString("XRMod Error: Failed to create action space (%s)",result),LUA);
 
-			act->type = createInfo.actionType;
-			strncpy(act->name, createInfo.actionName, XR_MAX_ACTION_NAME_SIZE);
-
-			if(createInfo.actionType == XR_ACTION_TYPE_POSE_INPUT)
-			{
-				XrActionSpaceCreateInfo spaceCreateInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO,nullptr};
-				spaceCreateInfo.action = act->handle;
-				spaceCreateInfo.poseInActionSpace = XR_IDENTITYPOSE;
-				spaceCreateInfo.subactionPath = XR_NULL_PATH;
-
-				result = xrCreateActionSpace(g_Session,&spaceCreateInfo,&(act->space));
-				if(XR_FAILED(result))
-					PrintConsoleText(GetResultString("XRMod Error: Failed to create action space (%s)",result),LUA);
-			} else act->space = XR_NULL_HANDLE;
-
+			// Pose table populated once; luaRefs[1] keeps the Matrix userdata
+			// alive so the cached pointer stays valid
+			LUA->CreateTable();
+			act->poseMatrix = InitPoseTableFields(LUA, &act->luaRefs[1]);
+			act->luaRefs[0] = LUA->ReferenceCreate();
+		}
+		else if(act->type == XR_ACTION_TYPE_VECTOR2F_INPUT)
+		{
+			// Reused {x, y} table. Booleans, floats and vibrations need none.
 			LUA->CreateTable();
 			act->luaRefs[0] = LUA->ReferenceCreate();
-
-			act->poseMatrix = nullptr;
-			act->poseLinked = false;
-
-			if(createInfo.actionType == XR_ACTION_TYPE_POSE_INPUT)
-			{
-				// Pre-populate the pose table once; luaRefs[1] keeps the Matrix
-				// userdata alive so the cached pointer stays valid
-				LUA->ReferencePush(act->luaRefs[0]);
-				act->poseMatrix = InitPoseTableFields(LUA, &act->luaRefs[1]);
-				LUA->Pop();
-			} else {
-				LUA->CreateTable();
-				act->luaRefs[1] = LUA->ReferenceCreate();
-			}
-
-			g_actionCount++;
 		}
+
+		g_actionCount++;
 	}
 
 	return 0;
 }
-
 action* GetActionFromName(const char* actionName) {
 	for(int i = 0; i < g_actionCount; i++) {
 		if(strcmp(g_actions[i].name,actionName) == 0)
@@ -1295,52 +1261,94 @@ LUA_FUNCTION(SuggestBindings) {
 	return 1;
 }
 
+// Built once per session, just before attach (suggestions and actions are
+// frozen after it). Gated on the system property, not only the extension: a
+// runtime can expose the extension for a headset that has no eye tracker.
+static void EyeGaze_Create(GarrysMod::Lua::ILuaBase* LUA) {
+	if(g_gazeSet != XR_NULL_HANDLE || g_Session == XR_NULL_HANDLE) return;
+	// Every gate reports: SteamVR hides the extension, or reports no support,
+	// until eye tracking sharing is allowed in Steam Link's settings.
+	if(!g_hasEyeGazeExt)
+	{
+		PrintConsoleText("XRMod: Eye gaze off (runtime does not offer XR_EXT_eye_gaze_interaction)", LUA);
+		return;
+	}
+
+	XrSystemEyeGazeInteractionPropertiesEXT gazeProps{XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT,nullptr};
+	XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES,&gazeProps};
+	if(XR_FAILED(xrGetSystemProperties(g_Instance,g_SystemId,&props)) || !gazeProps.supportsEyeGazeInteraction)
+	{
+		PrintConsoleText("XRMod: Eye gaze off (runtime reports this system has no eye gaze)", LUA);
+		return;
+	}
+
+	XrActionSetCreateInfo setInfo{XR_TYPE_ACTION_SET_CREATE_INFO,nullptr};
+	strcpy(setInfo.actionSetName, "eyegaze");
+	strcpy(setInfo.localizedActionSetName, "Eye Gaze");
+	XrResult r = xrCreateActionSet(g_Instance,&setInfo,&g_gazeSet);
+
+	if(XR_SUCCEEDED(r))
+	{
+		XrActionCreateInfo actInfo{XR_TYPE_ACTION_CREATE_INFO,nullptr};
+		actInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+		strcpy(actInfo.actionName, "gaze");
+		strcpy(actInfo.localizedActionName, "Eye Gaze");
+		r = xrCreateAction(g_gazeSet,&actInfo,&g_gazeAction);
+	}
+	if(XR_SUCCEEDED(r))
+	{
+		XrActionSuggestedBinding binding{g_gazeAction, CreateXrPath("/user/eyes_ext/input/gaze_ext/pose")};
+		XrInteractionProfileSuggestedBinding suggested{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING,nullptr};
+		suggested.interactionProfile = CreateXrPath("/interaction_profiles/ext/eye_gaze_interaction");
+		suggested.countSuggestedBindings = 1;
+		suggested.suggestedBindings = &binding;
+		r = xrSuggestInteractionProfileBindings(g_Instance,&suggested);
+	}
+	if(XR_SUCCEEDED(r))
+	{
+		XrActionSpaceCreateInfo spaceInfo{XR_TYPE_ACTION_SPACE_CREATE_INFO,nullptr};
+		spaceInfo.action = g_gazeAction;
+		spaceInfo.poseInActionSpace = XR_IDENTITYPOSE;
+		r = xrCreateActionSpace(g_Session,&spaceInfo,&g_gazeSpace);
+	}
+	if(XR_FAILED(r))
+	{
+		PrintConsoleText(GetResultString("XRMod: Eye gaze unavailable (%s)",r),LUA);
+		EyeGaze_Destroy();
+	}
+	else
+		PrintConsoleText("XRMod: Eye gaze enabled", LUA);
+}
+
+// The gaze set rides along with whatever Lua activates; xrSyncActions only
+// updates sets in this list.
+static void EyeGaze_Activate() {
+	if(g_gazeSet == XR_NULL_HANDLE || g_activeActionSetCount >= MAX_ACTIONSETS) return;
+	g_activeActionSets[g_activeActionSetCount].actionSet = g_gazeSet;
+	g_activeActionSets[g_activeActionSetCount].subactionPath = XR_NULL_PATH;
+	g_activeActionSetCount++;
+}
+
 LUA_FUNCTION(SetActiveActionSets) {
 	if(g_Instance == XR_NULL_HANDLE)
 		LUA->ThrowError("XRMod Error: Invalid Instance");
 
+	// Each leading string argument names a set to activate
 	g_activeActionSetCount = 0;
-
-	// Loops through all action sets and sets them to the provided arguments (if provided)
-	for (int i = 0; i < MAX_ACTIONSETS; i++) {
-		if (LUA->GetType(i + 1) == GarrysMod::Lua::Type::STRING) {
-			const char* actionSetName = LUA->CheckString(i + 1);
-
-			// Find the action set's index in g_actionSets
-			int actionSetIndex = -1;
-			for (int j = 0; j < g_actionSetCount; j++) {
-				if (strcmp(actionSetName, g_actionSets[j].name) == 0) {
-					g_activeActionSets[g_activeActionSetCount].actionSet = g_actionSets[j].handle;
-					g_activeActionSets[g_activeActionSetCount].subactionPath = XR_NULL_PATH;
-					g_activeActionSetCount++;
-					break;
-				}
+	for(int i = 1; i <= MAX_ACTIONSETS && LUA->GetType(i) == GarrysMod::Lua::Type::STRING; i++)
+	{
+		const char* name = LUA->GetString(i);
+		for(int j = 0; j < g_actionSetCount; j++)
+			if(strcmp(name, g_actionSets[j].name) == 0)
+			{
+				g_activeActionSets[g_activeActionSetCount++] = { g_actionSets[j].handle, XR_NULL_PATH };
+				break;
 			}
-		}
-		else {
-			break;
-		}
 	}
+	EyeGaze_Activate();
 
 	return 0;
 }
-
-void PushMatrixAsTable(GarrysMod::Lua::ILuaBase* LUA, VMatrix* mtx) {
-	LUA->CreateTable();
-
-	for (unsigned int row = 0; row < 4; row++) {
-		LUA->PushNumber(row + 1);
-		LUA->CreateTable();
-
-		for (unsigned int col = 0; col < 4; col++) {
-			LUA->PushNumber(col+1);
-			LUA->PushNumber(mtx->m[row][col]);
-			LUA->SetTable(-3);
-		}
-		LUA->SetTable(-3);
-	}
-}
-
 VMatrix* PushNewMatrix(GarrysMod::Lua::ILuaBase* LUA)
 {
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
@@ -1377,166 +1385,41 @@ VMatrix* InitPoseTableFields(GarrysMod::Lua::ILuaBase* LUA, int* matrixRefOut)
 	return mtx;
 }
 
-void ComposeProjection(XrFovf* fov, float zNear, float zFar, VMatrix *mtx)
+// Pose -> Source-oriented matrix. The rotation columns are the quaternion's
+// rotation of forward (0,0,-1), left (-1,0,0) and up (0,1,0), written straight
+// from its rotation matrix in homogeneous form -- the same result the old
+// per-axis vector rotation produced, unit quaternion or not.
+void ComposeTransform(const XrPosef& pose, VMatrix *mtx)
 {
-	float fLeft = tan(fov->angleLeft);
-	float fRight = tan(fov->angleRight);
-	float fTop = tan(fov->angleUp);
-	float fBottom = tan(fov->angleDown);
+	const float x = pose.orientation.x, y = pose.orientation.y, z = pose.orientation.z, w = pose.orientation.w;
+	const float xx = x*x, yy = y*y, zz = z*z, ww = w*w;
+	const float xy = x*y, xz = x*z, yz = y*z, wx = w*x, wy = w*y, wz = w*z;
+	float (*m)[4] = mtx->m;
 
-	float idx = 1.0f / (fRight - fLeft);
-	float idy = 1.0f / (fBottom - fTop);
-	float idz = 1.0f / (zFar - zNear);
-	float sx = fRight + fLeft;
-	float sy = fBottom + fTop;
-
-	mtx->m[0][0] = 2*idx; mtx->m[0][1] = 0;     mtx->m[0][2] = sx*idx;    mtx->m[0][3] = 0;
-	mtx->m[1][0] = 0;     mtx->m[1][1] = 2*idy; mtx->m[1][2] = sy*idy;    mtx->m[1][3] = 0;
-	mtx->m[2][0] = 0;     mtx->m[2][1] = 0;     mtx->m[2][2] = -zFar*idz; mtx->m[2][3] = -zFar*zNear*idz;
-	mtx->m[3][0] = 0;     mtx->m[3][1] = 0;     mtx->m[3][2] = -1.0f;     mtx->m[3][3] = 0;
+	m[0][0] = -2.0f*(xz + wy);      m[0][1] = -(ww + xx - yy - zz); m[0][2] = 2.0f*(xy - wz);  m[0][3] = pose.position.x;
+	m[1][0] = -2.0f*(yz - wx);      m[1][1] = -2.0f*(xy + wz);      m[1][2] = ww - xx + yy - zz; m[1][3] = pose.position.y;
+	m[2][0] = -(ww - xx - yy + zz); m[2][1] = -2.0f*(xz - wy);      m[2][2] = 2.0f*(yz + wx);  m[2][3] = pose.position.z;
+	m[3][0] = 0;                    m[3][1] = 0;                    m[3][2] = 0;               m[3][3] = 1;
 }
-
-float dot(Vector* a, Vector* b)
-{
-	return a->x*b->x + a->y*b->y + a->z*b->z;
-}
-
-Vector cross(Vector* a, Vector* b)
-{
-	Vector out;
-	out.x = a->y * b->z - a->z * b->y;
-	out.y = a->z * b->x - a->x * b->z;
-	out.z = a->x * b->y - a->y * b->x;
-	return out;
-}
-
-Vector operator *(float f, Vector v)
-{
-	v.x *= f;
-	v.y *= f;
-	v.z *= f;
-	return v;
-}
-
-Vector operator +(Vector a, Vector b)
-{
-	a.x += b.x;
-	a.y += b.y;
-	a.z += b.z;
-	return a;
-}
-
-void RotateVector(Vector* v, XrQuaternionf q, Vector* out)
-{
-	// Extract the vector part of the quaternion
-    Vector qv;
-	qv.x = q.x;
-	qv.y = q.y;
-	qv.z = q.z;
-	Vector* u = &qv;
-
-    // Extract the scalar part of the quaternion
-    float s = q.w;
-
-    // Do the math
-    *out = 2.0f * dot(u, v) * qv
-           + (s*s - dot(u, u)) * *v
-           + 2.0f * s * cross(u, v);
-}
-
-
-Vector GetForwardVec()
-{
-	Vector v;
-	v.x = 0;
-	v.y = 0;
-	v.z = -1;
-	return v;
-}
-
-Vector GetLeftVec()
-{
-	Vector v;
-	v.x = -1;
-	v.y = 0;
-	v.z = 0;
-	return v;
-}
-
-Vector GetUpVec()
-{
-	Vector v;
-	v.x = 0;
-	v.y = 1;
-	v.z = 0;
-	return v;
-}
-
-const float XrToSource = 1/0.01905;
-const float SourceToXr = 0.01905;
-
-void ComposeTransform(XrPosef pose, VMatrix *mtx)
-{
-	// Translation Component
-	mtx->m[0][3] = pose.position.x;
-	mtx->m[1][3] = pose.position.y;
-	mtx->m[2][3] = pose.position.z;
-
-	// Rotation Component
-	// Extract the values from Q
-    XrQuaternionf q = pose.orientation;
-
-	Vector out;
-
-	Vector vec = GetForwardVec();
-	RotateVector(&vec, q, &out);
-	mtx->m[0][0] = out.x;
-	mtx->m[1][0] = out.y;
-	mtx->m[2][0] = out.z;
-
-	vec = GetLeftVec();
-	RotateVector(&vec, q, &out);
-	mtx->m[0][1] = out.x;
-	mtx->m[1][1] = out.y;
-	mtx->m[2][1] = out.z;
-
-	vec = GetUpVec();
-	RotateVector(&vec, q, &out);
-	mtx->m[0][2] = out.x;
-	mtx->m[1][2] = out.y;
-	mtx->m[2][2] = out.z;
-
-	// Bottom row
-	mtx->m[3][0] = 0;
-	mtx->m[3][1] = 0;
-	mtx->m[3][2] = 0;
-	mtx->m[3][3] = 1;
-}
-
-// Single source of truth for the per-eye texture dimensions.
+// Single source of truth for the per-eye texture dimensions: GetDisplayInfo,
+// ShareTextureBegin, the swapchain, the layer imageRect and every copy box all
+// use what is resolved here. (Deriving them separately once left the render
+// target taller than the swapchain past the height cap, stretching the top
+// rows of each band across the eye's whole FOV.)
 //
-// GetDisplayInfo and ShareTextureBegin used to derive these independently, and
-// only ShareTextureBegin applied the height cap. Lua sizes its render target
-// from GetDisplayInfo's RecommendedWidth/Height, so on any headset recommending
-// more than the cap the render target was TALLER than the swapchain, the
-// composition layer imageRect and every CopySubresourceRegion -- the top
-// g_TextureHeight rows of each band got stretched across the eye's full FOV.
-// That is the "wrong resolution" distortion. Resolve once, in one place, and
-// report the same numbers to everyone.
-//
-// scalePercent: 100 (or <= 0) for native. Values are frozen once the swapchain
-// exists, since its extents and the copy boxes are already sized from them.
+// scalePercent: 100 (or <= 0) for native. Frozen once the swapchain exists,
+// since its extents and the copy boxes are already sized from them.
 void ResolveTextureDims(GarrysMod::Lua::ILuaBase *LUA, int scalePercent) {
 	if(g_Swapchain != XR_NULL_HANDLE)
 		return;
 
-	std::vector<XrViewConfigurationView> viewConfigs(2, {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr});
+	XrViewConfigurationView vc[2] = { {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr}, {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr} };
 	uint32_t viewCount = 2;
-	if(XR_FAILED(xrEnumerateViewConfigurationViews(g_Instance,g_SystemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,viewCount,&viewCount,viewConfigs.data())) || viewCount < 2)
+	if(XR_FAILED(xrEnumerateViewConfigurationViews(g_Instance,g_SystemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,2,&viewCount,vc)) || viewCount < 2)
 		return;
 
-	uint32_t recW = viewConfigs[0].recommendedImageRectWidth;
-	uint32_t recH = viewConfigs[0].recommendedImageRectHeight;
+	uint32_t recW = vc[0].recommendedImageRectWidth;
+	uint32_t recH = vc[0].recommendedImageRectHeight;
 	uint32_t w = recW, h = recH;
 
 	// Cap proportionally: shrinking height alone would leave non-square pixels
@@ -1552,10 +1435,8 @@ void ResolveTextureDims(GarrysMod::Lua::ILuaBase *LUA, int scalePercent) {
 	}
 
 	// Even dimensions keep the stereo half-split exact.
-	g_TextureWidth = w & ~1u;
-	g_TextureHeight = h & ~1u;
-	g_ScaledWidth = g_TextureWidth;
-	g_ScaledHeight = g_TextureHeight;
+	g_ScaledWidth = g_TextureWidth = w & ~1u;
+	g_ScaledHeight = g_TextureHeight = h & ~1u;
 
 	if(g_TextureWidth != recW || g_TextureHeight != recH) {
 		char str[MAX_STR_LEN];
@@ -1563,8 +1444,6 @@ void ResolveTextureDims(GarrysMod::Lua::ILuaBase *LUA, int scalePercent) {
 		PrintConsoleText(str, LUA);
 	}
 }
-
-// Done
 LUA_FUNCTION(GetRecommendedDims) {
 	ResolveTextureDims(LUA, 100);
 	LUA->PushNumber(g_TextureWidth);
@@ -1573,156 +1452,108 @@ LUA_FUNCTION(GetRecommendedDims) {
 }
 
 LUA_FUNCTION(GetDisplayInfo) {
-	std::vector<XrViewConfigurationView> viewConfigs;
-	viewConfigs.resize(2);
-	// We'll get an XR validation error if we don't initialize these
-	viewConfigs[0] = {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr};
-	viewConfigs[1] = {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr};
-
+	XrViewConfigurationView vc[2] = { {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr}, {XR_TYPE_VIEW_CONFIGURATION_VIEW,nullptr} };
 	uint32_t viewCount = 2;
-
-	XrResult result = xrEnumerateViewConfigurationViews(g_Instance,g_SystemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,viewCount,&viewCount,viewConfigs.data());
+	XrResult result = xrEnumerateViewConfigurationViews(g_Instance,g_SystemId,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,2,&viewCount,vc);
 	if(XR_FAILED(result))
 		LUA->ThrowError(GetResultString("XRMod Error: Failed to enumerate view configurations (%s)",result));
-	
-	if(viewCount != 2 /*|| viewConfigs[0].recommendedImageRectWidth != viewConfigs[1].recommendedImageRectWidth || viewConfigs[0].recommendedImageRectHeight != viewConfigs[1].recommendedImageRectHeight*/)
+	if(viewCount != 2)
 		LUA->ThrowError("XRMod Error: View count is not 2");
 
 	// Same resolved dims ShareTextureBegin and the swapchain use; a no-op once
 	// the swapchain exists, so the per-frame calls can't reset a render scale.
 	ResolveTextureDims(LUA, 100);
 
-	float fNearZ = LUA->IsType(1, GarrysMod::Lua::Type::NUMBER) ? (float)LUA->GetNumber(1) : 0.01f;
-	float fFarZ = LUA->IsType(2, GarrysMod::Lua::Type::NUMBER) ? (float)LUA->GetNumber(2) : 10000.0f;
-
-	XrViewLocateInfo viewLocateInfo{XR_TYPE_VIEW_LOCATE_INFO,nullptr};
-	viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	viewLocateInfo.space = g_SpaceView;
-	viewLocateInfo.displayTime = g_FrameState.predictedDisplayTime > 0 ? g_FrameState.predictedDisplayTime : 11000000;
-
-	XrViewState viewState{XR_TYPE_VIEW_STATE,nullptr,0};
-
-	uint32_t viewCountOutput = 0;
+	XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO,nullptr};
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = g_FrameState.predictedDisplayTime > 0 ? g_FrameState.predictedDisplayTime : 11000000;
+	locateInfo.space = g_SpaceView;
+	XrViewState viewState{XR_TYPE_VIEW_STATE,nullptr};
 	XrView views[2] = { {XR_TYPE_VIEW,nullptr},{XR_TYPE_VIEW,nullptr} };
-	result = xrLocateViews(g_Session,&viewLocateInfo,&viewState,viewCount,&viewCountOutput,(XrView *) &views);
-	if(XR_FAILED(result)) { views[0].fov = {-0.82f,0.82f,0.82f,-0.82f}; views[1].fov = views[0].fov; views[0].pose = XR_IDENTITYPOSE; views[1].pose = XR_IDENTITYPOSE; views[0].pose.position.x = -0.032f; views[1].pose.position.x = 0.032f; } if(false)
-		LUA->ThrowError(GetResultString("XRMod Error: Failed to locate views (%s)",result));
-	if(views[0].fov.angleLeft == 0 && views[0].fov.angleRight == 0) { views[0].fov = {-0.82f,0.82f,0.82f,-0.82f}; views[1].fov = views[0].fov; }
+	uint32_t located = 0;
+	// Not locatable yet: head-centred eyes 64 mm apart and the default FOV
+	if(XR_FAILED(xrLocateViews(g_Session,&locateInfo,&viewState,2,&located,views)))
+	{
+		views[0].pose = views[1].pose = XR_IDENTITYPOSE;
+		views[0].pose.position.x = -0.032f;
+		views[1].pose.position.x = 0.032f;
+		views[0].fov.angleLeft = views[0].fov.angleRight = 0;
+	}
+	if(views[0].fov.angleLeft == 0 && views[0].fov.angleRight == 0)
+		views[0].fov = views[1].fov = XrFovf{-0.82f,0.82f,0.82f,-0.82f};
 
 	LUA->CreateTable();
-
 	LUA->PushNumber(g_TextureWidth);
 	LUA->SetField(-2, "RecommendedWidth");
 	LUA->PushNumber(g_TextureHeight);
 	LUA->SetField(-2, "RecommendedHeight");
 
-	VMatrix* transformLeft = PushNewMatrix(LUA);
-	ComposeTransform(views[0].pose, transformLeft);
-	LUA->SetField(-2, "TransformLeft");
-
-	VMatrix* transformRight = PushNewMatrix(LUA);
-	ComposeTransform(views[1].pose, transformRight);
-	LUA->SetField(-2, "TransformRight");
-
-	double fLeft = tan(views[0].fov.angleLeft);
-	double fRight = tan(views[0].fov.angleRight);
-	double fTop = tan(views[0].fov.angleUp);
-	double fBottom = tan(views[0].fov.angleDown);
-
-	double tanHalfW = (fRight - fLeft) * 0.5;
-	double tanHalfH = (fTop - fBottom) * 0.5;
-
-	LUA->PushNumber(tanHalfW / tanHalfH);
-	LUA->SetField(-2, "AspectLeft");
-	LUA->PushNumber(2.0 * atan(tanHalfW) * RAD2DEG);
-	LUA->SetField(-2, "FovLeft");
-	LUA->PushNumber((fLeft + fRight) / (fRight - fLeft));
-	LUA->SetField(-2, "OffsetXLeft");
-	LUA->PushNumber((fBottom + fTop) / (fTop - fBottom));
-	LUA->SetField(-2, "OffsetYLeft");
-
-	fLeft = tan(views[1].fov.angleLeft);
-	fRight = tan(views[1].fov.angleRight);
-	fTop = tan(views[1].fov.angleUp);
-	fBottom = tan(views[1].fov.angleDown);
-
-	tanHalfW = (fRight - fLeft) * 0.5;
-	tanHalfH = (fTop - fBottom) * 0.5;
-
-	LUA->PushNumber(tanHalfW / tanHalfH);
-	LUA->SetField(-2, "AspectRight");
-	LUA->PushNumber(2.0 * atan(tanHalfW) * RAD2DEG);
-	LUA->SetField(-2, "FovRight");
-	LUA->PushNumber((fLeft + fRight) / (fRight - fLeft));
-	LUA->SetField(-2, "OffsetXRight");
-	LUA->PushNumber((fBottom + fTop) / (fTop - fBottom));
-	LUA->SetField(-2, "OffsetYRight");
-
-	// Symmetric FOV for Linux path: max of both eyes horizontal tangent, convert to degrees
+	static const char* const keys[2][9] = {
+		{ "TransformLeft",  "AspectLeft",  "FovLeft",  "OffsetXLeft",  "OffsetYLeft",  "U0Left",  "U1Left",  "V0Left",  "V1Left" },
+		{ "TransformRight", "AspectRight", "FovRight", "OffsetXRight", "OffsetYRight", "U0Right", "U1Right", "V0Right", "V1Right" },
+	};
+	double tn[2][4]; // per eye: tangent of the left, right, up and down angles
+	for(int e = 0; e < 2; e++)
 	{
-		double lL = fabs(tan(views[0].fov.angleLeft));
-		double lR = fabs(tan(views[0].fov.angleRight));
-		double rL = fabs(tan(views[1].fov.angleLeft));
-		double rR = fabs(tan(views[1].fov.angleRight));
-		double maxTanH = lL > lR ? lL : lR;
-		if (rL > maxTanH) maxTanH = rL;
-		if (rR > maxTanH) maxTanH = rR;
-		double lU = fabs(tan(views[0].fov.angleUp));
-		double lD = fabs(tan(views[0].fov.angleDown));
-		double maxTanV = lU > lD ? lU : lD;
-		double symFov = 2.0 * atan(maxTanH) * RAD2DEG;
-		double symAspect = maxTanH / maxTanV;
-		LUA->PushNumber(symFov);
-		LUA->SetField(-2, "FovSymmetric");
-		LUA->PushNumber(symAspect);
-		LUA->SetField(-2, "AspectSymmetric");
+		const XrFovf& f = views[e].fov;
+		double* t = tn[e];
+		t[0] = tan(f.angleLeft);
+		t[1] = tan(f.angleRight);
+		t[2] = tan(f.angleUp);
+		t[3] = tan(f.angleDown);
 
-		// UV crop coordinates: map asymmetric frustum into symmetric render target
-		double symHW = maxTanH; // symmetric half-width (horizontal)
-		double symHH = maxTanV; // symmetric half-height (vertical)
-		// Left eye
-		{
-			double tL = fabs(tan(views[0].fov.angleLeft));
-			double tR = fabs(tan(views[0].fov.angleRight));
-			double tU = fabs(tan(views[0].fov.angleUp));
-			double tD = fabs(tan(views[0].fov.angleDown));
-			LUA->PushNumber(0.5 - tL / (2.0 * symHW));
-			LUA->SetField(-2, "U0Left");
-			LUA->PushNumber(0.5 + tR / (2.0 * symHW));
-			LUA->SetField(-2, "U1Left");
-			LUA->PushNumber(0.5 - tU / (2.0 * symHH));
-			LUA->SetField(-2, "V0Left");
-			LUA->PushNumber(0.5 + tD / (2.0 * symHH));
-			LUA->SetField(-2, "V1Left");
-		}
-		// Right eye
-		{
-			double tL = fabs(tan(views[1].fov.angleLeft));
-			double tR = fabs(tan(views[1].fov.angleRight));
-			double tU = fabs(tan(views[1].fov.angleUp));
-			double tD = fabs(tan(views[1].fov.angleDown));
-			LUA->PushNumber(0.5 - tL / (2.0 * symHW));
-			LUA->SetField(-2, "U0Right");
-			LUA->PushNumber(0.5 + tR / (2.0 * symHW));
-			LUA->SetField(-2, "U1Right");
-			LUA->PushNumber(0.5 - tU / (2.0 * symHH));
-			LUA->SetField(-2, "V0Right");
-			LUA->PushNumber(0.5 + tD / (2.0 * symHH));
-			LUA->SetField(-2, "V1Right");
-		}
+		ComposeTransform(views[e].pose, PushNewMatrix(LUA));
+		LUA->SetField(-2, keys[e][0]);
+
+		double halfW = (t[1] - t[0]) * 0.5, halfH = (t[2] - t[3]) * 0.5;
+		LUA->PushNumber(halfW / halfH);
+		LUA->SetField(-2, keys[e][1]);
+		LUA->PushNumber(2.0 * atan(halfW) * RAD2DEG);
+		LUA->SetField(-2, keys[e][2]);
+		LUA->PushNumber((t[0] + t[1]) / (t[1] - t[0]));
+		LUA->SetField(-2, keys[e][3]);
+		LUA->PushNumber((t[3] + t[2]) / (t[2] - t[3]));
+		LUA->SetField(-2, keys[e][4]);
+	}
+
+	// Symmetric FOV for the Linux path: the widest horizontal tangent of either
+	// eye, the vertical one from the left eye
+	double a = fabs(tn[0][0]), b = fabs(tn[0][1]);
+	double symHW = a > b ? a : b;
+	if(fabs(tn[1][0]) > symHW) symHW = fabs(tn[1][0]);
+	if(fabs(tn[1][1]) > symHW) symHW = fabs(tn[1][1]);
+	a = fabs(tn[0][2]);
+	b = fabs(tn[0][3]);
+	double symHH = a > b ? a : b;
+	LUA->PushNumber(2.0 * atan(symHW) * RAD2DEG);
+	LUA->SetField(-2, "FovSymmetric");
+	LUA->PushNumber(symHW / symHH);
+	LUA->SetField(-2, "AspectSymmetric");
+
+	// UV crop: each eye's asymmetric frustum inside the symmetric render target
+	for(int e = 0; e < 2; e++)
+	{
+		const double* t = tn[e];
+		LUA->PushNumber(0.5 - fabs(t[0]) / (2.0 * symHW));
+		LUA->SetField(-2, keys[e][5]);
+		LUA->PushNumber(0.5 + fabs(t[1]) / (2.0 * symHW));
+		LUA->SetField(-2, keys[e][6]);
+		LUA->PushNumber(0.5 - fabs(t[2]) / (2.0 * symHH));
+		LUA->SetField(-2, keys[e][7]);
+		LUA->PushNumber(0.5 + fabs(t[3]) / (2.0 * symHH));
+		LUA->SetField(-2, keys[e][8]);
 	}
 
 	return 1;
 }
 
-// Done
 LUA_FUNCTION(UpdatePosesAndActions) {
 	if(g_Session == XR_NULL_HANDLE)
 		return 0;
 
 	XrActionsSyncInfo syncInfo{XR_TYPE_ACTIONS_SYNC_INFO,nullptr};
-	syncInfo.activeActionSets = (XrActiveActionSet*) &g_activeActionSets;
 	syncInfo.countActiveActionSets = g_activeActionSetCount;
+	syncInfo.activeActionSets = g_activeActionSets;
 
 	XrResult result = xrSyncActions(g_Session,&syncInfo);
 	if(XR_FAILED(result))
@@ -1731,7 +1562,6 @@ LUA_FUNCTION(UpdatePosesAndActions) {
 	return 0;
 }
 
-// Done
 // Pose tables and their pose/vel/ang/angvel fields are created once (see
 // InitPoseTableFields); per frame this only mutates the Matrix userdata in
 // place and never allocates. TODO: Implement velocities later
@@ -1752,15 +1582,14 @@ LUA_FUNCTION(GetPoses) {
 		g_hmdLinked = true;
 	}
 
+	XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO,nullptr};
+	XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE,nullptr};
 	for(int i = 0; i < g_actionCount; i++)
 	{
 		action* act = &g_actions[i];
 		if(act->type != XR_ACTION_TYPE_POSE_INPUT) continue;
 
-		XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO,nullptr};
 		getInfo.action = act->handle;
-
-		XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE,nullptr};
 		result = xrGetActionStatePose(g_Session,&getInfo,&state);
 		if(XR_FAILED(result))
 			LUA->ThrowError(GetResultString("XRMod Error: Failed to retrieve pose state (%s)",result));
@@ -1785,167 +1614,152 @@ LUA_FUNCTION(GetPoses) {
 	return 1;
 }
 
-// Mostly done
 LUA_FUNCTION(GetActions) {
-	char* changedActionNames[MAX_ACTIONS];
-	bool changedActionStates[MAX_ACTIONS];
-	int changedActionCount = 0;
+	const char* changedNames[MAX_ACTIONS];
+	bool changedStates[MAX_ACTIONS];
+	int changedCount = 0;
 
 	LUA->ReferencePush(g_luaRefs[LuaRefIndex_ActionTable]);
 
-	for (int i = 0; i < g_actionCount; i++) {
+	// Every action is written every frame, changed or not: Lua writes back into
+	// this table (fire synthesis, left-hand trigger swap, stick deadzones), and
+	// a skipped write would leave last frame's edit in place of the raw state.
+	XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO,nullptr};
+	for(int i = 0; i < g_actionCount; i++)
+	{
 		action* act = &g_actions[i];
-
-		XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO,nullptr};
 		getInfo.action = act->handle;
 
 		switch(act->type) {
 			case XR_ACTION_TYPE_BOOLEAN_INPUT:
 			{
-				XrActionStateBoolean stateBool{XR_TYPE_ACTION_STATE_BOOLEAN,nullptr};
-				xrGetActionStateBoolean(g_Session,&getInfo,&stateBool);
-				LUA->PushBool(stateBool.currentState);
+				XrActionStateBoolean s{XR_TYPE_ACTION_STATE_BOOLEAN,nullptr};
+				xrGetActionStateBoolean(g_Session,&getInfo,&s);
+				LUA->PushBool(s.currentState);
 				LUA->SetField(-2, act->name);
-
-				if(stateBool.changedSinceLastSync){
-					changedActionNames[changedActionCount] = act->name;
-					changedActionStates[changedActionCount] = stateBool.currentState;
-					changedActionCount++;
+				if(s.changedSinceLastSync)
+				{
+					changedNames[changedCount] = act->name;
+					changedStates[changedCount++] = s.currentState;
 				}
 				break;
 			}
 			case XR_ACTION_TYPE_FLOAT_INPUT:
 			{
-				XrActionStateFloat stateFloat{XR_TYPE_ACTION_STATE_FLOAT,nullptr};
-				xrGetActionStateFloat(g_Session,&getInfo,&stateFloat);
-
-				LUA->PushNumber(stateFloat.currentState);
+				XrActionStateFloat s{XR_TYPE_ACTION_STATE_FLOAT,nullptr};
+				xrGetActionStateFloat(g_Session,&getInfo,&s);
+				LUA->PushNumber(s.currentState);
 				LUA->SetField(-2, act->name);
 				break;
 			}
 			case XR_ACTION_TYPE_VECTOR2F_INPUT:
 			{
-				XrActionStateVector2f stateVector2{XR_TYPE_ACTION_STATE_VECTOR2F,nullptr};
-				xrGetActionStateVector2f(g_Session,&getInfo,&stateVector2);
+				XrActionStateVector2f s{XR_TYPE_ACTION_STATE_VECTOR2F,nullptr};
+				xrGetActionStateVector2f(g_Session,&getInfo,&s);
 				LUA->ReferencePush(act->luaRefs[0]);
-
-				LUA->PushNumber(stateVector2.currentState.x);
+				LUA->PushNumber(s.currentState.x);
 				LUA->SetField(-2, "x");
-				LUA->PushNumber(stateVector2.currentState.y);
+				LUA->PushNumber(s.currentState.y);
 				LUA->SetField(-2, "y");
-				LUA->SetField(-2, act->name);
+				LUA->SetField(-2, act->name); // relinked every frame, which also pops it
 				break;
 			}
+			default:
+				break;
 		}
 	}
 
-	// ── XR_EXT_hand_tracking: push skeleton_lefthand / skeleton_righthand ──
+	// XR_EXT_hand_tracking: skeleton_{left,right}hand.fingerCurls
 	if(g_hasHandTracking && pfnLocateHandJointsEXT && g_FrameState.predictedDisplayTime != 0)
 	{
-		static const char* skeletonNames[2] = { "skeleton_lefthand", "skeleton_righthand" };
-		// Joint indices per finger: { start, count }
-		// Thumb:  metacarpal(2) proximal(3) distal(4) tip(5)        = 4 joints, 2 bend angles
-		// Index:  metacarpal(6) proximal(7) intermediate(8) distal(9) tip(10) = 5 joints, 3 bend angles
-		// Middle: 11-15, Ring: 16-20, Little: 21-25
+		static const char* const skeletonNames[2] = { "skeleton_lefthand", "skeleton_righthand" };
+		// Joints per finger: thumb metacarpal(2)..tip(5) = 4 joints, 2 bend
+		// angles; index 6-10, middle 11-15, ring 16-20, little 21-25 = 5, 3
 		static const int fingerStart[5] = { 2, 6, 11, 16, 21 };
 		static const int fingerCount[5] = { 4, 5,  5,  5,  5 };
 
+		XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
+		XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT, nullptr};
+		locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		locations.jointLocations = joints;
+		XrHandJointsLocateInfoEXT locateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, nullptr};
+		locateInfo.baseSpace = g_SpaceStage;
+		locateInfo.time = g_FrameState.predictedDisplayTime;
+
 		for(int hand = 0; hand < 2; hand++)
 		{
-			if(g_handTrackers[hand] == XR_NULL_HANDLE) continue;
-
-			XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
-			XrHandJointLocationsEXT locations{XR_TYPE_HAND_JOINT_LOCATIONS_EXT, nullptr};
-			locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
-			locations.jointLocations = joints;
-
-			XrHandJointsLocateInfoEXT locateInfo{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT, nullptr};
-			locateInfo.baseSpace = g_SpaceStage;
-			locateInfo.time = g_FrameState.predictedDisplayTime;
-
-			if(XR_FAILED(pfnLocateHandJointsEXT(g_handTrackers[hand], &locateInfo, &locations)))
-				continue;
-			if(!locations.isActive)
+			if(g_handTrackers[hand] == XR_NULL_HANDLE
+				|| XR_FAILED(pfnLocateHandJointsEXT(g_handTrackers[hand], &locateInfo, &locations))
+				|| !locations.isActive)
 				continue;
 
-			// Compute 5 finger curls from bone-segment dot products
-			float curls[5];
+			// 5 finger curls from bone-segment dot products, straight into the
+			// reused fingerCurls table
+			LUA->ReferencePush(g_luaRefFingerCurls[hand]);
 			for(int f = 0; f < 5; f++)
 			{
-				int start = fingerStart[f];
-				int count = fingerCount[f];
 				float total = 0.0f;
 				int angles = 0;
-
-				for(int j = start; j <= start + count - 3; j++)
+				for(int j = fingerStart[f]; j <= fingerStart[f] + fingerCount[f] - 3; j++)
 				{
-					// Validate both joints have tracked position
-					if(!(joints[j].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
-					   !(joints[j+1].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) ||
-					   !(joints[j+2].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+					const XrHandJointLocationEXT* jl = &joints[j];
+					// All three joints need a tracked position
+					if(!(jl[0].locationFlags & jl[1].locationFlags & jl[2].locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
 						continue;
 
-					float d1x = joints[j+1].pose.position.x - joints[j].pose.position.x;
-					float d1y = joints[j+1].pose.position.y - joints[j].pose.position.y;
-					float d1z = joints[j+1].pose.position.z - joints[j].pose.position.z;
-					float d2x = joints[j+2].pose.position.x - joints[j+1].pose.position.x;
-					float d2y = joints[j+2].pose.position.y - joints[j+1].pose.position.y;
-					float d2z = joints[j+2].pose.position.z - joints[j+1].pose.position.z;
-
+					const XrVector3f &p0 = jl[0].pose.position, &p1 = jl[1].pose.position, &p2 = jl[2].pose.position;
+					float d1x = p1.x - p0.x, d1y = p1.y - p0.y, d1z = p1.z - p0.z;
+					float d2x = p2.x - p1.x, d2y = p2.y - p1.y, d2z = p2.z - p1.z;
 					float lenSq1 = d1x*d1x + d1y*d1y + d1z*d1z;
 					float lenSq2 = d2x*d2x + d2y*d2y + d2z*d2z;
 					if(lenSq1 < 1e-12f || lenSq2 < 1e-12f) continue;
 
+					// dot 1 = straight (curl 0), dot <= 0 = bent 90+ degrees (curl 1)
 					float invLen = 1.0f / sqrtf(lenSq1 * lenSq2);
 					float dot = (d1x*d2x + d1y*d2y + d1z*d2z) * invLen;
-					if(dot >  1.0f) dot =  1.0f;
-
-					// dot=1 → straight (curl 0), dot≤0 → 90°+ bend (curl 1)
+					if(dot > 1.0f) dot = 1.0f;
 					float curl = 1.0f - dot;
-					if(curl > 1.0f) curl = 1.0f;
-					total += curl;
+					total += curl > 1.0f ? 1.0f : curl;
 					angles++;
 				}
-				curls[f] = angles > 0 ? total / angles : 0.0f;
-			}
-
-			// Push { fingerCurls = {c1,c2,c3,c4,c5} } into the actions table
-			LUA->ReferencePush(g_luaRefFingerCurls[hand]);
-			for(int f = 0; f < 5; f++)
-			{
 				LUA->PushNumber(f + 1);
-				LUA->PushNumber(curls[f]);
+				LUA->PushNumber(angles > 0 ? total / angles : 0.0f);
 				LUA->SetTable(-3);
 			}
+			LUA->Pop();
 
-			LUA->ReferencePush(g_luaRefSkeleton[hand]);
-			LUA->Push(-2);                          // push fingerCurls table
-			LUA->SetField(-2, "fingerCurls");       // Skeleton.fingerCurls = curls; pops copy
-			LUA->SetField(-3, skeletonNames[hand]); // ActionTable[name] = Skeleton; pops Skeleton
-			LUA->Pop();                             // pop fingerCurls ref
+			// Linked on the first active frame and left there: its presence is
+			// how Lua tells real curls from synthesized ones
+			if(!g_skelLinked[hand])
+			{
+				LUA->ReferencePush(g_luaRefSkeleton[hand]);
+				LUA->SetField(-2, skeletonNames[hand]);
+				g_skelLinked[hand] = true;
+			}
 		}
 	}
 
-	if (changedActionCount == 0){
+	if(changedCount == 0)
 		LUA->ReferencePush(g_luaRefs[LuaRefIndex_EmptyTable]);
-	}else{
+	else
+	{
 		LUA->CreateTable();
-
-		for(int i = 0; i < changedActionCount; i++){
-			LUA->PushBool(changedActionStates[i]);
-			LUA->SetField(-2,changedActionNames[i]);
+		for(int i = 0; i < changedCount; i++)
+		{
+			LUA->PushBool(changedStates[i]);
+			LUA->SetField(-2, changedNames[i]);
 		}
 	}
 
 	return 2;
 }
-
-// Done
 LUA_FUNCTION(ShareTextureBegin) {
 	// A previous attempt may have died with the hook still armed; restore before
 	// reading the original bytes back, or we would save the patch as "original".
 	UnpatchCreateTexture();
 	g_createTextureSkips = 0;
+	// An engine RT restore from here on would recreate the VR target unshared.
+	CancelEngineRTResize();
 
 	if (g_createTexture == NULL)
 		LUA->ThrowError("XRMod Error: CreateTexture address is null (Init did not complete)");
@@ -1988,7 +1802,6 @@ LUA_FUNCTION(ShareTextureBegin) {
 	return 2;
 }
 
-// TODO
 LUA_FUNCTION(ShareTextureFinish) {
 	// The render target exists by now, so any still-armed hook is stale whether
 	// it fired or not -- and every path below can throw.
@@ -2002,63 +1815,60 @@ LUA_FUNCTION(ShareTextureFinish) {
 		if (FAILED(g_d3d11Device->OpenSharedResource(g_sharedTexture, __uuidof(ID3D11Resource), (void**)&res)))
 			LUA->ThrowError("XRMod Error: OpenSharedResource failed");
 
-		if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&g_d3d11Texture)))
+		// The Texture2D interface holds its own reference; this one is done
+		HRESULT hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&g_d3d11Texture);
+		res->Release();
+		if (FAILED(hr))
 			LUA->ThrowError("XRMod Error: QueryInterface failed");
 	#else
 		if (g_sharedTexture == GL_INVALID_VALUE)
 			LUA->ThrowError("XRMod Error: g_sharedTexture is invalid");
-
-		//g_vrTexture.handle = (void*)(uintptr_t)g_sharedTexture;
 	#endif
 
-	// Create swapchain
 	XrSwapchainCreateInfo createInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO,nullptr};
-	createInfo.arraySize = 1;
-	createInfo.createFlags = 0;
 	createInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-	createInfo.faceCount = 1;
-	createInfo.mipCount = 1;
-	createInfo.sampleCount = 1;
-	createInfo.width = g_TextureWidth*2;
-	createInfo.height = g_TextureHeight;
-
 	#ifdef _WIN32
 		createInfo.format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 	#else
 		createInfo.format = GL_SRGB8_ALPHA8;
 	#endif
+	createInfo.sampleCount = 1;
+	createInfo.width = g_TextureWidth*2;
+	createInfo.height = g_TextureHeight;
+	createInfo.faceCount = 1;
+	createInfo.arraySize = 1;
+	createInfo.mipCount = 1;
 
 	XrResult result = xrCreateSwapchain(g_Session,&createInfo,&g_Swapchain);
 	if(XR_FAILED(result))
 		LUA->ThrowError(GetResultString("XRMod Error: Failed to create swapchain (%s)",result));
 
 	uint32_t imageCount;
-
 	result = xrEnumerateSwapchainImages(g_Swapchain,0,&imageCount,nullptr);
 	if(XR_FAILED(result))
 		LUA->ThrowError(GetResultString("XRMod Error: Failed to retreive number of required swapchain images (%s)",result));
 
-	g_SwapchainImages.resize(imageCount);
-	for(int i = 0; i < imageCount; i++)
-	{
-		#ifdef _WIN32
-			g_SwapchainImages[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
-			g_SwapchainImages[i].texture = NULL;
-		#else
-			g_SwapchainImages[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
-			g_SwapchainImages[i].image = nullptr;
-		#endif
-
-		g_SwapchainImages[i].next = nullptr;
-	}
-
+	#ifdef _WIN32
+		g_SwapchainImages.assign(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR,nullptr});
+	#else
+		g_SwapchainImages.assign(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR,nullptr});
+	#endif
 	result = xrEnumerateSwapchainImages(g_Swapchain,imageCount,&imageCount,(XrSwapchainImageBaseHeader*) g_SwapchainImages.data());
 	if(XR_FAILED(result))
 		LUA->ThrowError(GetResultString("XRMod Error: Failed to enumerate swapchain images (%s)",result));
 
+	// The layer's fixed half: each eye starts at its native half boundary of
+	// the one swapchain image. SubmitFrame writes the rest every frame.
+	for(int i = 0; i < 2; i++)
+	{
+		g_projectViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,nullptr};
+		g_projectViews[i].subImage.swapchain = g_Swapchain;
+		g_projectViews[i].subImage.imageRect.offset.x = i * g_TextureWidth;
+	}
+	g_layer.space = g_SpaceStage;
+
 	return 0;
 }
-
 void StartSession(GarrysMod::Lua::ILuaBase *LUA) {
 	XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO,nullptr,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO};
 
@@ -2069,93 +1879,43 @@ void StartSession(GarrysMod::Lua::ILuaBase *LUA) {
 	g_SessionStarted = true;
 }
 
+// 0: queue drained, 1: polling failed, 2: instance loss (shut down)
 uint8_t PollEvents(GarrysMod::Lua::ILuaBase *LUA) {
-	XrEventDataBuffer eventData{XR_TYPE_EVENT_DATA_BUFFER,nullptr};
-
-	XrResult result = xrPollEvent(g_Instance,&eventData);
-	while(result == XR_SUCCESS) {
-		// Iterates through all queued events until it runs out
-		switch(eventData.type) {
-			case XR_TYPE_EVENT_DATA_EVENTS_LOST: {
-				XrEventDataEventsLost *event = (XrEventDataEventsLost *) &eventData;
-
-				char str[MAX_STR_LEN];
-				snprintf(str,MAX_STR_LEN,"XRMod: %d events in queue were lost",event->lostEventCount);
-				PrintConsoleText(str,LUA);
-				break;
-			}
-
-			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
-				XrEventDataSessionStateChanged* event = (XrEventDataSessionStateChanged*) &eventData;
-
-				char str[MAX_STR_LEN];
-				snprintf(str, MAX_STR_LEN, "New XR State: %d", event->state);
-				PrintConsoleText(str,LUA);
-
-				switch(event->state) {
-					case XR_SESSION_STATE_READY: {
-						StartSession(LUA);
-						break;
-					}
-				}
-
-				break;
-			}
-
-			case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED: {
-				break;
-			}
-
-			case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
-				break;
-			}
-
-			case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING: {
-				return 2; // Signal to call shutdown
-			}
-		}
-
-		result = xrPollEvent(g_Instance,&eventData);
-	}
-	if(result != XR_EVENT_UNAVAILABLE)
-		return 1; // Actual failure result
-
-	// Successfully finished the event queue
-	return 0;
-}
-
-XrCompositionLayerProjectionView g_projectViews[2];
-
-const XrCompositionLayerProjection CreateLayer(XrView* viewInfo) {
-	for(int i = 0; i < 2; i++)
+	XrEventDataBuffer eventData; // only the header is input; reset before every poll
+	char str[MAX_STR_LEN];
+	for(;;)
 	{
-		g_projectViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-		g_projectViews[i].next = nullptr;
-		g_projectViews[i].fov = viewInfo[i].fov;
-		g_projectViews[i].pose = viewInfo[i].pose;
+		eventData.type = XR_TYPE_EVENT_DATA_BUFFER;
+		eventData.next = nullptr;
+		XrResult result = xrPollEvent(g_Instance,&eventData);
+		if(result != XR_SUCCESS)
+			return result == XR_EVENT_UNAVAILABLE ? 0 : 1;
 
-		g_projectViews[i].subImage.swapchain = g_Swapchain;
-		g_projectViews[i].subImage.imageArrayIndex = 0;
-		// Compositor samples only the rendered sub-viewport; each eye still
-		// starts at its native half boundary
-		g_projectViews[i].subImage.imageRect.extent.width = g_ScaledWidth;
-		g_projectViews[i].subImage.imageRect.extent.height = g_ScaledHeight;
-		g_projectViews[i].subImage.imageRect.offset.x = i * g_TextureWidth;
-		g_projectViews[i].subImage.imageRect.offset.y = 0;
+		switch(eventData.type)
+		{
+			case XR_TYPE_EVENT_DATA_EVENTS_LOST:
+				snprintf(str,MAX_STR_LEN,"XRMod: %d events in queue were lost",((XrEventDataEventsLost*) &eventData)->lostEventCount);
+				PrintConsoleText(str,LUA);
+				break;
+
+			case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
+			{
+				XrSessionState state = ((XrEventDataSessionStateChanged*) &eventData)->state;
+				snprintf(str, MAX_STR_LEN, "New XR State: %d", state);
+				PrintConsoleText(str,LUA);
+				if(state == XR_SESSION_STATE_READY)
+					StartSession(LUA);
+				break;
+			}
+
+			case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+				return 2;
+
+			default:
+				break;
+		}
 	}
-
-	const XrCompositionLayerProjection project{
-		XR_TYPE_COMPOSITION_LAYER_PROJECTION,
-		nullptr,
-		0,
-		g_SpaceStage,
-		2,
-		g_projectViews
-	};
-
-	return project;
 }
-
 #ifdef _WIN32
 // Signal end-of-frame on the persistent event query and kick a command buffer
 // submit without blocking; the query is polled to completion right before the
@@ -2184,34 +1944,34 @@ void EndFrameFail() {
 
 XrTime DampenPrediction(XrTime predictedTime)
 {
-	// Dampen frame time predictions
-	#ifdef _WIN32
-		LARGE_INTEGER time;
-		QueryPerformanceCounter(&time);
-	#else
-		timespec time;
-		clock_gettime(CLOCK_MONOTONIC,&time);
-	#endif
+	// Scales how far past now the runtime's prediction reaches. At 100 the
+	// result is the runtime's own, so the clock read and conversion are skipped.
+	if (predictionScale != 100) {
+		#ifdef _WIN32
+			LARGE_INTEGER time;
+			QueryPerformanceCounter(&time);
+		#else
+			timespec time;
+			clock_gettime(CLOCK_MONOTONIC,&time);
+		#endif
 
-	XrTime timeXr;
-	ConvertSysTimeToXrTime(g_Instance,&time,&timeXr);
+		XrTime timeXr;
+		ConvertSysTimeToXrTime(g_Instance,&time,&timeXr);
 
-	XrTime predictionAmount = predictedTime - timeXr;
-	if (predictionAmount > 0) {
-		predictedTime = timeXr + (predictionScale * predictionAmount) / 100;
+		XrTime predictionAmount = predictedTime - timeXr;
+		if (predictionAmount > 0)
+			predictedTime = timeXr + (predictionScale * predictionAmount) / 100;
 	}
-	predictedTime = (predictedTime > g_lastPredictedFrameTime + 1) ? predictedTime : (g_lastPredictedFrameTime + 1);
-	g_lastPredictedFrameTime = predictedTime;
-
-	return predictedTime;
+	// Strictly increasing
+	if (predictedTime <= g_lastPredictedFrameTime)
+		predictedTime = g_lastPredictedFrameTime + 1;
+	return g_lastPredictedFrameTime = predictedTime;
 }
 
 LUA_FUNCTION(SetPredictionScale) {
-	LUA->CheckType(-1,GarrysMod::Lua::Type::NUMBER);
-	predictionScale = LUA->GetNumber();
+	predictionScale = (int)LUA->CheckNumber(-1);
 	return 0;
 }
-
 // Shrinks the compositor-sampled region of each eye (composition layer
 // imageRect) and the copied region of the shared texture. Lua must render into
 // the matching top-left sub-viewport of each eye's half; the runtime's lens
@@ -2245,42 +2005,57 @@ LUA_FUNCTION(SetMulticoreMode) {
 	return 0;
 }
 
-bool CallInGameRenderFunc(XrPosef eyeLeft, XrPosef eyeRight, double bandY, GarrysMod::Lua::ILuaBase *LUA) {
+// VRMOD_ResizeEngineRTs(w, h) asks for the engine's frame-buffer render
+// targets at w x h (0, 0 = back to the real backbuffer), done at the next
+// Present on this thread; VRMOD_ResizeEngineRTs() only polls. Both return
+// whether it is still pending. Polls never re-ask: every request recreates
+// every render target, so never make one with the VR targets live.
+LUA_FUNCTION(ResizeEngineRTs) {
+	#ifdef _WIN32
+		if (LUA->IsType(1, GarrysMod::Lua::Type::NUMBER) && ShaderDevice() != NULL) {
+			g_rtsW = (int)LUA->GetNumber(1);
+			g_rtsH = (int)LUA->GetNumber(2);
+			g_luaThread = GetCurrentThreadId();
+			if (g_presentOrig == NULL)
+				g_presentOrig = DevVT()[SD_PRESENT];
+			g_rtsPending = true;
+			SetPresentSlot((void*)PresentHook);
+		}
+		LUA->PushBool(g_rtsPending);
+	#else
+		LUA->PushBool(false);
+	#endif
+	return 1;
+}
+
+// Calls VRUtilClientRender(eyeLeft, eyeRight, bandY). The stack is left as it
+// is afterwards (_G, the error handler, an error if one was raised): Lua only
+// receives DoRenderLoop's last pushed value, so popping them would only cost
+// calls.
+bool CallInGameRenderFunc(const XrView* views, double bandY, GarrysMod::Lua::ILuaBase *LUA) {
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1, "ErrorNoHaltWithStack");
 	LUA->GetField(-2, "VRUtilClientRender");
-	LUA->Remove(-3);
-
-	if(!LUA->IsType(-1,GarrysMod::Lua::Type::FUNCTION)) {
-		LUA->Pop(2);
+	if(!LUA->IsType(-1,GarrysMod::Lua::Type::FUNCTION))
 		return false;
-	}
 
 	// Eye matrices are created once and mutated in place each frame
 	if(g_luaRefEyeMatrix[0] == -1)
-	{
 		for(int i = 0; i < 2; i++)
 		{
 			g_eyeMatrix[i] = PushNewMatrix(LUA);
 			g_luaRefEyeMatrix[i] = LUA->ReferenceCreate();
 		}
-	}
-	ComposeTransform(eyeLeft, g_eyeMatrix[0]);
-	ComposeTransform(eyeRight, g_eyeMatrix[1]);
+	ComposeTransform(views[0].pose, g_eyeMatrix[0]);
+	ComposeTransform(views[1].pose, g_eyeMatrix[1]);
 	LUA->ReferencePush(g_luaRefEyeMatrix[0]);
 	LUA->ReferencePush(g_luaRefEyeMatrix[1]);
 	LUA->PushNumber(bandY); // Y offset of the shared-texture band to render into
-
 	LUA->PCall(3,0,-5);
-	/*if(errcode != 0)
-		PrintError(LUA);*/
 
-	LUA->Pop(); // Pops the error message
-
-	// Immediate mode only: the draws were just submitted, so the query fences
-	// real work and the GPU drains while DoRenderLoop waits on the swapchain.
-	// In multicore the copied frame is two frames old and provably finished, so
-	// no fence is needed at all.
+	// Immediate mode: the draws were just submitted, so the query fences real
+	// work and the GPU drains while DoRenderLoop waits on the swapchain.
+	// Multicore fences at the top of DoRenderLoop instead.
 	#ifdef _WIN32
 		if (!g_multicoreMode)
 			IssueEventQuery();
@@ -2294,7 +2069,7 @@ bool CallInGameRenderFunc(XrPosef eyeLeft, XrPosef eyeRight, double bandY, Garry
 // layer built from `views` -- the poses those pixels were rendered from. srcY is
 // the Y offset of the source band in the 3x-tall shared texture (0 in immediate
 // mode; the (M-2)%3 band in multicore).
-void SubmitFrame(XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lua::ILuaBase* LUA) {
+void SubmitFrame(const XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lua::ILuaBase* LUA) {
 	uint32_t imageIndex = 0;
 	XrResult result = xrAcquireSwapchainImage(g_Swapchain,nullptr,&imageIndex);
 	if(XR_FAILED(result))
@@ -2303,8 +2078,7 @@ void SubmitFrame(XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lu
 		LUA->ThrowError(GetResultString("XRMod: Failed to acquire swapchain image (%s)",result));
 	}
 
-	XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,nullptr};
-	waitInfo.timeout = XR_INFINITE_DURATION;
+	XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,nullptr,XR_INFINITE_DURATION};
 	result = xrWaitSwapchainImage(g_Swapchain,&waitInfo);
 	if(XR_FAILED(result))
 	{
@@ -2312,31 +2086,33 @@ void SubmitFrame(XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lu
 		LUA->ThrowError(GetResultString("XRMod: Failed to wait for swapchain image (%s)",result));
 	}
 
-	// Update swapchain with rendered image
 	#ifdef _WIN32
-		// Drain the pending event query (immediate mode only; the multicore path
-		// never issues it since the copied band is already finished).
+		// Drain the pending event query: the D3D11 copy below does not wait on
+		// D3D9, so without it the copy can read a band the GPU is still drawing.
+		// Only "pending" keeps waiting -- a lost or removed device never answers
+		// S_OK, and the old != S_OK test spun on it forever. The pauses keep the
+		// polls off the D3D9 lock the render thread needs for the next frame
+		// (multicore); full-resolution post-processing is what makes this wait
+		// long in the first place.
 		if (g_eventQueryIssued)
 		{
-			while (g_pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) != S_OK);
+			while (g_pEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE)
+				for (int i = 0; i < 64; i++)
+					YieldProcessor();
 			g_eventQueryIssued = false;
 		}
 
-		if (g_ScaledWidth == g_TextureWidth && g_ScaledHeight == g_TextureHeight)
+		// Full frame: both eyes in one copy. Render scale: each eye's rendered
+		// sub-viewport only; the compositor upscales it via the layer imageRect.
+		ID3D11Texture2D* dst = g_SwapchainImages[imageIndex].texture;
+		bool full = g_ScaledWidth == g_TextureWidth && g_ScaledHeight == g_TextureHeight;
+		D3D11_BOX box{ 0, srcY, 0, full ? g_TextureWidth * 2 : g_ScaledWidth, srcY + g_ScaledHeight, 1 };
+		g_d3d11DeviceContext->CopySubresourceRegion(dst,0,0,0,0,g_d3d11Texture,0,&box);
+		if (!full)
 		{
-			// Copy the full-frame band (both eyes) from its Y offset
-			D3D11_BOX box{ 0, srcY, 0, g_TextureWidth * 2, srcY + g_TextureHeight, 1 };
-			g_d3d11DeviceContext->CopySubresourceRegion(g_SwapchainImages[imageIndex].texture,0,0,0,0,g_d3d11Texture,0,&box);
-		}
-		else
-		{
-			// Copy only the rendered sub-viewport of each eye; the compositor
-			// upscales via the matching imageRect in CreateLayer
-			D3D11_BOX box{ 0, srcY, 0, g_ScaledWidth, srcY + g_ScaledHeight, 1 };
-			g_d3d11DeviceContext->CopySubresourceRegion(g_SwapchainImages[imageIndex].texture,0,0,0,0,g_d3d11Texture,0,&box);
 			box.left = g_TextureWidth;
 			box.right = g_TextureWidth + g_ScaledWidth;
-			g_d3d11DeviceContext->CopySubresourceRegion(g_SwapchainImages[imageIndex].texture,0,g_TextureWidth,0,0,g_d3d11Texture,0,&box);
+			g_d3d11DeviceContext->CopySubresourceRegion(dst,0,g_TextureWidth,0,0,g_d3d11Texture,0,&box);
 		}
 		g_d3d11DeviceContext->Flush();
 	#else
@@ -2350,15 +2126,21 @@ void SubmitFrame(XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lu
 		LUA->ThrowError(GetResultString("XRMod: Failed to release swapchain image (%s)",result));
 	}
 
-	// Set up composition layers
-	const XrCompositionLayerProjection project = CreateLayer(views);
-	const XrCompositionLayerBaseHeader* layers[1] = { (const XrCompositionLayerBaseHeader*) &project };
+	for(int i = 0; i < 2; i++)
+	{
+		XrCompositionLayerProjectionView& v = g_projectViews[i];
+		v.pose = views[i].pose;
+		v.fov = views[i].fov;
+		v.subImage.imageRect.extent.width = g_ScaledWidth;
+		v.subImage.imageRect.extent.height = g_ScaledHeight;
+	}
+	const XrCompositionLayerBaseHeader* layers[1] = { (const XrCompositionLayerBaseHeader*) &g_layer };
 
 	XrFrameEndInfo frameEndInfo{XR_TYPE_FRAME_END_INFO,nullptr};
 	frameEndInfo.displayTime = displayTime;
-	frameEndInfo.layers = layers;
-	frameEndInfo.layerCount = 1;
 	frameEndInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	frameEndInfo.layerCount = 1;
+	frameEndInfo.layers = layers;
 
 	result = xrEndFrame(g_Session,&frameEndInfo);
 	if(XR_FAILED(result))
@@ -2368,10 +2150,7 @@ void SubmitFrame(XrView* views, XrTime displayTime, uint32_t srcY, GarrysMod::Lu
 LUA_FUNCTION(DoRenderLoop) {
 	uint8_t pollResult = PollEvents(LUA);
 	if(pollResult > 0) {
-		if(pollResult == 2) {
-			LUA->PushBool(false); // Tell lua we need to shut down
-		} else LUA->PushBool(true);
-
+		LUA->PushBool(pollResult != 2); // false tells lua to shut down
 		return 1;
 	}
 
@@ -2380,10 +2159,19 @@ LUA_FUNCTION(DoRenderLoop) {
 		return 1;
 	}
 
-	XrFrameState frameState{XR_TYPE_FRAME_STATE,nullptr};
+	// Multicore copies band (M-2)%3 below. Its render job finished *submitting*
+	// before this frame began (EndFrame waits on it), so a query issued now is
+	// ordered after all of it -- but the GPU can still be drawing it, and the
+	// D3D11 copy never waits on D3D9. Unfenced, a GPU-heavy frame (full-res
+	// post-processing) copied a half-finished band: stale world, fresh head
+	// pose. Issued before xrWaitFrame so the drain in SubmitFrame is usually
+	// already satisfied by the time it runs.
+	#ifdef _WIN32
+		if (g_multicoreMode && g_frameCounter >= 2)
+			IssueEventQuery();
+	#endif
 
-	// xrWaitFrame -> xrBeginFrame -> xrEndFrame
-	//XrFrameWaitInfo frameWaitInfo{XR_TYPE_FRAME_WAIT_INFO,nullptr};
+	XrFrameState frameState{XR_TYPE_FRAME_STATE,nullptr};
 	XrResult result = xrWaitFrame(g_Session, nullptr, &frameState);
 	if(XR_FAILED(result))
 	{
@@ -2394,13 +2182,12 @@ LUA_FUNCTION(DoRenderLoop) {
 
 	// Submit time must be the runtime's predicted time -- xrEndFrame rejects
 	// anything else with XR_ERROR_TIME_INVALID. In multicore the pixels are
-	// submitted one frame late, so predict the *render* pose one display period
-	// ahead; next frame the stored pose lines up with that frame's submit time
-	// and the compositor reprojects to zero instead of ghosting a head-locked copy.
+	// submitted late, so the *render* pose is predicted two display periods
+	// ahead to line up with the frame it is finally submitted with, and the
+	// compositor reprojects to zero instead of ghosting a head-locked copy.
 	XrTime submitTime = frameState.predictedDisplayTime;
 	XrTime renderTime = DampenPrediction(g_multicoreMode ? submitTime + 2 * frameState.predictedDisplayPeriod : submitTime);
 
-	//XrFrameBeginInfo frameBeginInfo{XR_TYPE_FRAME_BEGIN_INFO,nullptr};
 	result = xrBeginFrame(g_Session, nullptr);
 	if(XR_FAILED(result))
 	{
@@ -2408,17 +2195,14 @@ LUA_FUNCTION(DoRenderLoop) {
 		LUA->ThrowError(GetResultString("XRMod Error: xrBeginFrame failed (%s)",result));
 	}
 
-	// Layer section
 	XrViewLocateInfo viewLocateInfo{XR_TYPE_VIEW_LOCATE_INFO,nullptr};
 	viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-	viewLocateInfo.space = g_SpaceStage;
 	viewLocateInfo.displayTime = renderTime;
-
+	viewLocateInfo.space = g_SpaceStage;
 	XrViewState viewState{XR_TYPE_VIEW_STATE,nullptr};
-
 	uint32_t viewCountOutput = 0;
 	XrView views[2] = { {XR_TYPE_VIEW,nullptr},{XR_TYPE_VIEW,nullptr} };
-	result = xrLocateViews(g_Session,&viewLocateInfo,&viewState,2,&viewCountOutput,(XrView *) &views);
+	result = xrLocateViews(g_Session,&viewLocateInfo,&viewState,2,&viewCountOutput,views);
 	if(XR_FAILED(result))
 	{
 		EndFrameFail();
@@ -2438,9 +2222,8 @@ LUA_FUNCTION(DoRenderLoop) {
 		uint32_t rband = g_frameCounter % 3;
 
 		// Submit the frame rendered two frames ago (band (M-2)%3). The render
-		// thread finished it a full frame back, so no fence and no stall are
-		// needed and the copy is never mid-write -- this is what keeps both the
-		// FPS and correctness.
+		// thread submitted it a full frame back; the GPU side is fenced at the
+		// top of DoRenderLoop, which rarely has to wait by the time we get here.
 		if(g_frameCounter >= 2)
 		{
 			uint32_t cband = (g_frameCounter - 2) % 3;
@@ -2450,7 +2233,7 @@ LUA_FUNCTION(DoRenderLoop) {
 			EndFrameFail(); // priming (first two frames)
 
 		// Render this frame into band M%3, in parallel, and remember its poses.
-		if(CallInGameRenderFunc(views[0].pose, views[1].pose, (double)(rband * g_TextureHeight), LUA))
+		if(CallInGameRenderFunc(views, (double)(rband * g_TextureHeight), LUA))
 		{
 			g_ringViews[rband][0] = views[0];
 			g_ringViews[rband][1] = views[1];
@@ -2459,21 +2242,14 @@ LUA_FUNCTION(DoRenderLoop) {
 		else
 			g_frameCounter = 0; // render unavailable; re-prime
 	}
-	else
-	{
-		if(!CallInGameRenderFunc(views[0].pose, views[1].pose, 0.0, LUA))
-		{
-			EndFrameFail();
-			LUA->PushBool(true);
-			return 1;
-		}
+	else if(CallInGameRenderFunc(views, 0.0, LUA))
 		SubmitFrame(views, submitTime, 0, LUA);
-	}
+	else
+		EndFrameFail();
 
 	LUA->PushBool(true);
 	return 1;
 }
-
 LUA_FUNCTION(AttachActionSets) {
 	// xrAttachSessionActionSets may only be called ONCE per session; attach
 	// every set in a single call so the runtime sees the complete action list
@@ -2481,12 +2257,20 @@ LUA_FUNCTION(AttachActionSets) {
 	if(g_actionSetCount == 0)
 		return 0;
 
-	XrActionSet handles[MAX_ACTIONSETS];
+	XrActionSet handles[MAX_ACTIONSETS + 1];
+	uint32_t count = 0;
 	for(int i = 0; i < g_actionSetCount; i++)
-		handles[i] = g_actionSets[i].handle;
+		handles[count++] = g_actionSets[i].handle;
+
+	EyeGaze_Create(LUA);
+	if(g_gazeSet != XR_NULL_HANDLE)
+	{
+		handles[count++] = g_gazeSet;
+		EyeGaze_Activate();
+	}
 
 	XrSessionActionSetsAttachInfo attachInfo{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO,nullptr};
-	attachInfo.countActionSets = (uint32_t) g_actionSetCount;
+	attachInfo.countActionSets = count;
 	attachInfo.actionSets = handles;
 
 	XrResult result = xrAttachSessionActionSets(g_Session,&attachInfo);
@@ -2496,7 +2280,40 @@ LUA_FUNCTION(AttachActionSets) {
 	return 0;
 }
 
-// Done
+// vrmod.GetEyeGaze() -> x, y | false, reason | nothing
+// The gaze ray's x/y in VIEW space (+x right, +y up) == the sine of its yaw
+// and pitch off the head's forward. nothing = no gaze action this session
+// (the console says why); false = action exists but no data this frame:
+// 1 binding inactive, 2 eyes untracked (blink / lost).
+LUA_FUNCTION(GetEyeGaze) {
+	if(g_gazeSpace == XR_NULL_HANDLE || !g_SessionStarted) return 0;
+
+	XrActionStateGetInfo getInfo{XR_TYPE_ACTION_STATE_GET_INFO,nullptr};
+	getInfo.action = g_gazeAction;
+	XrActionStatePose state{XR_TYPE_ACTION_STATE_POSE,nullptr};
+	if(XR_FAILED(xrGetActionStatePose(g_Session,&getInfo,&state)) || !state.isActive)
+	{
+		LUA->PushBool(false);
+		LUA->PushNumber(1);
+		return 2;
+	}
+
+	XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION,nullptr};
+	if(XR_FAILED(xrLocateSpace(g_gazeSpace,g_SpaceView,g_FrameState.predictedDisplayTime,&loc))
+		|| !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT))
+	{
+		LUA->PushBool(false);
+		LUA->PushNumber(2);
+		return 2;
+	}
+
+	// Gaze looks down -Z, so dir = -(third column of R(q)); only x and y are needed.
+	const XrQuaternionf& q = loc.pose.orientation;
+	LUA->PushNumber(-2.0 * (q.x * q.z + q.w * q.y));
+	LUA->PushNumber( 2.0 * (q.w * q.x - q.y * q.z));
+	return 2;
+}
+
 LUA_FUNCTION(Shutdown) {
 	if (g_Session != XR_NULL_HANDLE)
 		ClearSession(LUA);
@@ -2509,7 +2326,6 @@ LUA_FUNCTION(Shutdown) {
 	return 0;
 }
 
-// Done
 // VRMOD_TriggerHaptic(actionName, delay, durationMs, frequency, amplitude)
 // Returns: bool success, string result, number boundSources
 //
@@ -2521,27 +2337,19 @@ LUA_FUNCTION(TriggerHaptic) {
 	double freq = LUA->CheckNumber(4);
 	double amp  = LUA->CheckNumber(5);
 
-	if(g_Session == XR_NULL_HANDLE)
-	{
-		LUA->PushBool(false);
-		LUA->PushString("no session");
-		LUA->PushNumber(-1);
-		return 3;
-	}
+	// Names are only compared for vibration outputs (2 of ~60 actions); the
+	// full lookup runs only to word a failure.
+	action* act = nullptr;
+	if(g_Session != XR_NULL_HANDLE)
+		for(int i = 0; i < g_actionCount && act == nullptr; i++)
+			if(g_actions[i].type == XR_ACTION_TYPE_VIBRATION_OUTPUT && strcmp(g_actions[i].name, actionName) == 0)
+				act = &g_actions[i];
 
-	action* act = GetActionFromName(actionName);
 	if(act == nullptr)
 	{
 		LUA->PushBool(false);
-		LUA->PushString("no such action");
-		LUA->PushNumber(-1);
-		return 3;
-	}
-
-	if(act->type != XR_ACTION_TYPE_VIBRATION_OUTPUT)
-	{
-		LUA->PushBool(false);
-		LUA->PushString("action is not a vibration output");
+		LUA->PushString(g_Session == XR_NULL_HANDLE ? "no session"
+			: GetActionFromName(actionName) ? "action is not a vibration output" : "no such action");
 		LUA->PushNumber(-1);
 		return 3;
 	}
@@ -2552,16 +2360,13 @@ LUA_FUNCTION(TriggerHaptic) {
 	// non-zero so the steady state costs nothing; -1 means the query failed.
 	if(act->boundSources <= 0)
 	{
-		XrBoundSourcesForActionEnumerateInfo enumInfo{XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO,nullptr};
-		enumInfo.action = act->handle;
-
+		XrBoundSourcesForActionEnumerateInfo enumInfo{XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO,nullptr,act->handle};
 		uint32_t count = 0;
 		if(XR_SUCCEEDED(xrEnumerateBoundSourcesForAction(g_Session,&enumInfo,0,&count,nullptr)))
 			act->boundSources = (int) count;
 	}
 
-	XrHapticActionInfo actionInfo{XR_TYPE_HAPTIC_ACTION_INFO,nullptr};
-	actionInfo.action = act->handle;
+	XrHapticActionInfo actionInfo{XR_TYPE_HAPTIC_ACTION_INFO,nullptr,act->handle};
 
 	XrHapticVibration feedback{XR_TYPE_HAPTIC_VIBRATION,nullptr};
 	// Milliseconds in, nanoseconds out. Non-positive falls back to the runtime's
@@ -2577,7 +2382,8 @@ LUA_FUNCTION(TriggerHaptic) {
 	XrResult result = xrApplyHapticFeedback(g_Session,&actionInfo,(const XrHapticBaseHeader *)&feedback);
 
 	LUA->PushBool(XR_SUCCEEDED(result));
-	LUA->PushString(GetResultString("%s",result));
+	// The steady state is XR_SUCCESS: skip the runtime's string lookup for it
+	LUA->PushString(result == XR_SUCCESS ? "XR_SUCCESS" : GetResultString("%s",result));
 	LUA->PushNumber(act->boundSources);
 	return 3;
 }
@@ -2621,44 +2427,34 @@ LUA_FUNCTION(GetInteractionProfile) {
 }
 
 // ============================================================================
-// Face Tracking OSC Receiver
-// Receives OSC float parameters from VRCFaceTracking over UDP.
-// Independent of VR state -- works for desktop users too.
+// OSC receivers: face tracking and external trackers
+// Two independent non-blocking UDP sockets polled from the Lua thread. They
+// share the socket setup and the OSC message / bundle walker; neither depends
+// on VR state, so both work for desktop users too.
 // ============================================================================
 
-#define FT_MAX_PARAMS    256
-#define FT_RECV_BUF_SIZE 4096
-#define FT_TIMEOUT_MS    500.0
-
 #ifdef _WIN32
-  typedef SOCKET ft_socket_t;
-  #define FT_INVALID_SOCKET INVALID_SOCKET
-  #define FT_SOCKET_ERROR   SOCKET_ERROR
+	typedef SOCKET osc_socket_t;
+	#define OSC_INVALID_SOCKET INVALID_SOCKET
 #else
-  typedef int ft_socket_t;
-  #define FT_INVALID_SOCKET (-1)
-  #define FT_SOCKET_ERROR   (-1)
+	typedef int osc_socket_t;
+	#define OSC_INVALID_SOCKET (-1)
 #endif
 
-struct FTParam {
-	char  name[128];
-	float value;
-};
+static bool   g_wsaInit = false;
+static double g_oscNow  = 0.0; // stamped on every tracker message parsed in one poll
 
-static ft_socket_t g_ftSocket       = FT_INVALID_SOCKET;
-static FTParam     g_ftParams[FT_MAX_PARAMS];
-static int         g_ftParamCount   = 0;
-static uint8_t     g_ftRecvBuf[FT_RECV_BUF_SIZE];
-static double      g_ftLastRecvTime = 0.0;
-static bool        g_ftWsaInit      = false;
-static int         g_ftLuaRefTable  = -1;
-
-static double FT_GetTimeMs() {
+static double OSC_TimeMs() {
 #ifdef _WIN32
-	LARGE_INTEGER freq, now;
-	QueryPerformanceFrequency(&freq);
+	static double msPerTick = 0.0; // the counter frequency is fixed at boot
+	if (msPerTick == 0.0) {
+		LARGE_INTEGER freq;
+		QueryPerformanceFrequency(&freq);
+		msPerTick = 1000.0 / (double)freq.QuadPart;
+	}
+	LARGE_INTEGER now;
 	QueryPerformanceCounter(&now);
-	return (double)now.QuadPart / (double)freq.QuadPart * 1000.0;
+	return (double)now.QuadPart * msPerTick;
 #else
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2666,234 +2462,177 @@ static double FT_GetTimeMs() {
 #endif
 }
 
-static void FT_CloseSocket() {
-	if (g_ftSocket == FT_INVALID_SOCKET) return;
+static void OSC_Close(osc_socket_t& s) {
+	if (s == OSC_INVALID_SOCKET) return;
 #ifdef _WIN32
-	closesocket(g_ftSocket);
+	closesocket(s);
 #else
-	close(g_ftSocket);
+	close(s);
 #endif
-	g_ftSocket = FT_INVALID_SOCKET;
+	s = OSC_INVALID_SOCKET;
 }
 
-static inline uint32_t FT_AlignUp4(uint32_t v) { return (v + 3) & ~3u; }
+// Non-blocking UDP socket bound to port on addr (host byte order).
+static osc_socket_t OSC_Open(int port, uint32_t addr) {
+#ifdef _WIN32
+	if (!g_wsaInit) {
+		WSADATA wsaData;
+		if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return OSC_INVALID_SOCKET;
+		g_wsaInit = true;
+	}
+#endif
+	osc_socket_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (s == OSC_INVALID_SOCKET) return s;
+#ifdef _WIN32
+	u_long mode = 1;
+	ioctlsocket(s, FIONBIO, &mode);
+#else
+	fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#endif
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family      = AF_INET;
+	sa.sin_port        = htons((unsigned short)port);
+	sa.sin_addr.s_addr = htonl(addr);
+	if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) != 0)
+		OSC_Close(s);
+	return s;
+}
 
-static float FT_ReadBEFloat(const uint8_t* p) {
-	uint32_t bits = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
-	              | ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+static uint32_t OSC_U32(const uint8_t* p) {
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static float OSC_Float(const uint8_t* p) {
+	uint32_t bits = OSC_U32(p);
 	float f;
 	memcpy(&f, &bits, 4);
 	return f;
 }
 
-static uint32_t FT_ReadBEUint32(const uint8_t* p) {
-	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
-	     | ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
-}
-
-static int FT_FindOrAddParam(const char* name) {
-	for (int i = 0; i < g_ftParamCount; i++) {
-		if (strcmp(g_ftParams[i].name, name) == 0)
-			return i;
-	}
-	if (g_ftParamCount >= FT_MAX_PARAMS) return -1;
-	int idx = g_ftParamCount++;
-	strncpy(g_ftParams[idx].name, name, sizeof(g_ftParams[idx].name) - 1);
-	g_ftParams[idx].name[sizeof(g_ftParams[idx].name) - 1] = '\0';
-	g_ftParams[idx].value = 0.0f;
-	return idx;
-}
-
-static int FT_ParseOscMessage(const uint8_t* data, int len) {
-	if (len < 8 || data[0] != '/') return 0;
-
+// Splits a message into its type tag string and the offset of its arguments;
+// the address is the message start. False when the header is malformed.
+static bool OSC_Header(const uint8_t* data, int len, const char*& tags, int& tagLen, int& argOff) {
+	if (len < 8 || data[0] != '/') return false;
 	int addrLen = (int)strnlen((const char*)data, len);
-	if (addrLen >= len) return 0;
-	int addrPadded = (int)FT_AlignUp4(addrLen + 1);
-	if (addrPadded >= len) return 0;
-
-	const char* address = (const char*)data;
-
-	int tagOffset = addrPadded;
-	if (tagOffset >= len || data[tagOffset] != ',') return 0;
-
-	int tagLen = (int)strnlen((const char*)data + tagOffset, len - tagOffset);
-	int tagPadded = (int)FT_AlignUp4(tagLen + 1);
-	int valueOffset = tagOffset + tagPadded;
-
-	// Only store single-float messages
-	const char* tags = (const char*)data + tagOffset;
-	if (tagLen < 2 || tags[1] != 'f') return valueOffset;
-
-	if (valueOffset + 4 > len) return 0;
-
-	float value = FT_ReadBEFloat(data + valueOffset);
-
-	// Strip "/avatar/parameters/" prefix
-	const char* paramName = address;
-	static const char prefix[] = "/avatar/parameters/";
-	if (strncmp(address, prefix, sizeof(prefix) - 1) == 0)
-		paramName = address + sizeof(prefix) - 1;
-
-	int idx = FT_FindOrAddParam(paramName);
-	if (idx >= 0)
-		g_ftParams[idx].value = value;
-
-	return valueOffset + 4;
+	if (addrLen >= len) return false;
+	int tagOff = (addrLen + 4) & ~3; // past the NUL, 4-aligned
+	if (tagOff >= len || data[tagOff] != ',') return false;
+	tags   = (const char*)data + tagOff;
+	tagLen = (int)strnlen(tags, len - tagOff);
+	if (tagLen >= len - tagOff) return false; // unterminated
+	argOff = tagOff + ((tagLen + 4) & ~3);
+	return true;
 }
 
-static void FT_ParseOscPacket(const uint8_t* data, int len) {
+// A message, or a #bundle of size-prefixed elements (nested bundles too).
+// Element sizes are checked unsigned: the old signed test let a size with the
+// top bit set walk the offset backwards out of the buffer, and the tracker
+// socket listens on every interface.
+static void OSC_Packet(const uint8_t* data, int len, void (*onMessage)(const uint8_t*, int)) {
 	if (len < 4) return;
-
-	if (len >= 16 && memcmp(data, "#bundle\0", 8) == 0) {
-		int offset = 16;
-		while (offset + 4 <= len) {
-			uint32_t msgSize = FT_ReadBEUint32(data + offset);
-			offset += 4;
-			if (msgSize == 0 || offset + (int)msgSize > len) break;
-			FT_ParseOscPacket(data + offset, (int)msgSize);
-			offset += (int)msgSize;
-		}
-	} else {
-		FT_ParseOscMessage(data, len);
+	if (len < 16 || memcmp(data, "#bundle\0", 8) != 0) {
+		onMessage(data, len);
+		return;
+	}
+	for (int off = 16; off + 4 <= len; ) {
+		uint32_t size = OSC_U32(data + off);
+		off += 4;
+		if (size == 0 || size > (uint32_t)(len - off)) break;
+		OSC_Packet(data + off, (int)size, onMessage);
+		off += (int)size;
 	}
 }
 
-static void FaceTrackingCleanup() {
-	FT_CloseSocket();
-#ifdef _WIN32
-	if (g_ftWsaInit) {
-		WSACleanup();
-		g_ftWsaInit = false;
-	}
-#endif
-	g_ftParamCount = 0;
-	g_ftLastRecvTime = 0.0;
+// ---- Face tracking data: float parameters from VRCFaceTracking -------------
+
+#define FT_MAX_PARAMS    256
+#define FT_RECV_BUF_SIZE 4096
+#define FT_TIMEOUT_MS    500.0
+
+struct FTParam {
+	char     name[128];
+	uint32_t hash;  // FNV-1a of the name, compared before the string
+	float    value;
+	bool     dirty; // changed since FaceTrackingGetData last wrote it
+};
+
+static osc_socket_t g_ftSocket       = OSC_INVALID_SOCKET;
+static FTParam      g_ftParams[FT_MAX_PARAMS];
+static int          g_ftParamCount   = 0;
+static uint8_t      g_ftRecvBuf[FT_RECV_BUF_SIZE];
+static double       g_ftLastRecvTime = 0.0;
+static int          g_ftLuaRefTable  = -1;
+
+static uint32_t FT_Hash(const char* s) {
+	uint32_t h = 2166136261u;
+	while (*s) h = (h ^ (uint8_t)*s++) * 16777619u;
+	return h;
 }
 
-LUA_FUNCTION(FaceTrackingStart) {
-	int port = 9000;
-	if (LUA->IsType(1, GarrysMod::Lua::Type::NUMBER))
-		port = (int)LUA->GetNumber(1);
-
-	FT_CloseSocket();
-
-#ifdef _WIN32
-	if (!g_ftWsaInit) {
-		WSADATA wsaData;
-		if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-			LUA->PushBool(false);
-			return 1;
-		}
-		g_ftWsaInit = true;
+static void FT_Set(const char* name, float value) {
+	uint32_t h = FT_Hash(name);
+	FTParam* p = g_ftParams;
+	FTParam* end = g_ftParams + g_ftParamCount;
+	while (p < end && (p->hash != h || strcmp(p->name, name) != 0)) p++;
+	if (p == end) {
+		if (g_ftParamCount >= FT_MAX_PARAMS) return;
+		g_ftParamCount++;
+		strncpy(p->name, name, sizeof(p->name) - 1);
+		p->name[sizeof(p->name) - 1] = '\0';
+		p->hash = h;
 	}
-#endif
-
-	g_ftSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (g_ftSocket == FT_INVALID_SOCKET) {
-		LUA->PushBool(false);
-		return 1;
-	}
-
-#ifdef _WIN32
-	u_long mode = 1;
-	ioctlsocket(g_ftSocket, FIONBIO, &mode);
-#else
-	int flags = fcntl(g_ftSocket, F_GETFL, 0);
-	fcntl(g_ftSocket, F_SETFL, flags | O_NONBLOCK);
-#endif
-
-	struct sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family      = AF_INET;
-	addr.sin_port        = htons((unsigned short)port);
-	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-	if (bind(g_ftSocket, (struct sockaddr*)&addr, sizeof(addr)) == FT_SOCKET_ERROR) {
-		FT_CloseSocket();
-		LUA->PushBool(false);
-		return 1;
-	}
-
-	g_ftParamCount = 0;
-	g_ftLastRecvTime = 0.0;
-
-	if (g_ftLuaRefTable != -1)
-		LUA->ReferenceFree(g_ftLuaRefTable);
-	LUA->CreateTable();
-	g_ftLuaRefTable = LUA->ReferenceCreate();
-
-	LUA->PushBool(true);
-	return 1;
+	else if (p->value == value)
+		return;
+	p->value = value;
+	p->dirty = true;
 }
 
-LUA_FUNCTION(FaceTrackingStop) {
-	FT_CloseSocket();
-	g_ftParamCount = 0;
-	g_ftLastRecvTime = 0.0;
-	return 0;
+static void FT_Message(const uint8_t* data, int len) {
+	const char* tags;
+	int tagLen, off;
+	if (!OSC_Header(data, len, tags, tagLen, off)) return;
+
+	// Leading float args only. VRChat's native eye addresses send 2-6 floats in
+	// one message (/tracking/eye/LeftRightPitchYaw etc.); those are stored as
+	// <address>/0 .. /N-1, single floats under the bare name.
+	int n = 0;
+	while (n + 1 < tagLen && tags[n + 1] == 'f') n++;
+	if (n == 0 || off + n * 4 > len) return;
+
+	// Strip the "/avatar/parameters/" prefix
+	const char* name = (const char*)data;
+	static const char prefix[] = "/avatar/parameters/";
+	if (strncmp(name, prefix, sizeof(prefix) - 1) == 0)
+		name += sizeof(prefix) - 1;
+
+	if (n == 1) {
+		FT_Set(name, OSC_Float(data + off));
+		return;
+	}
+
+	char key[128];
+	size_t base = strnlen(name, sizeof(key) - 3);
+	memcpy(key, name, base);
+	key[base] = '/';
+	key[base + 2] = '\0';
+	for (int i = 0; i < n && i < 10; i++) {
+		key[base + 1] = (char)('0' + i);
+		FT_Set(key, OSC_Float(data + off + i * 4));
+	}
 }
 
-LUA_FUNCTION(FaceTrackingPoll) {
-	if (g_ftSocket == FT_INVALID_SOCKET) {
-		LUA->PushNumber(0);
-		return 1;
-	}
-
-	int packets = 0;
-	for (;;) {
-		int bytes = recv(g_ftSocket, (char*)g_ftRecvBuf, FT_RECV_BUF_SIZE, 0);
-		if (bytes <= 0) break;
-		FT_ParseOscPacket(g_ftRecvBuf, bytes);
-		g_ftLastRecvTime = FT_GetTimeMs();
-		packets++;
-	}
-
-	LUA->PushNumber(packets);
-	return 1;
-}
-
-LUA_FUNCTION(FaceTrackingGetData) {
-	if (g_ftParamCount == 0 || g_ftLuaRefTable == -1) {
-		LUA->CreateTable();
-		return 1;
-	}
-
-	LUA->ReferencePush(g_ftLuaRefTable);
-	for (int i = 0; i < g_ftParamCount; i++) {
-		LUA->PushNumber(g_ftParams[i].value);
-		LUA->SetField(-2, g_ftParams[i].name);
-	}
-
-	return 1;
-}
-
-LUA_FUNCTION(FaceTrackingActive) {
-	if (g_ftSocket == FT_INVALID_SOCKET || g_ftLastRecvTime == 0.0) {
-		LUA->PushBool(false);
-		return 1;
-	}
-	LUA->PushBool((FT_GetTimeMs() - g_ftLastRecvTime) < FT_TIMEOUT_MS);
-	return 1;
-}
-
-// ============================================================================
-// External Tracker OSC Receiver
-// Accepts SlimeVR (VRChat OSC tracker protocol) and VMC device transforms over
-// UDP, and presents each source as a pose table shaped exactly like the ones
-// GetPoses builds for XR actions. Downstream Lua cannot tell an OSC tracker
-// from a Vive tracker, which is the whole point -- FBT, attachment and
-// networking need no special cases.
-//
-// Reuses the face-tracking block's socket typedefs and OSC primitives; the two
-// receivers are independent sockets polled from the same thread.
+// ---- External tracker data ----------------------------------------------------
+// SlimeVR (VRChat OSC tracker protocol) and VMC device transforms, presented as
+// pose tables shaped exactly like GetPoses' -- downstream Lua cannot tell an OSC
+// tracker from a Vive tracker, so FBT, attachment and networking need no
+// special cases.
 //
 // Wire formats accepted:
 //   /tracking/trackers/<n>/position   ,fff   Unity metres
 //   /tracking/trackers/<n>/rotation   ,fff   Unity euler degrees, ZXY order
 //   /tracking/trackers/head/...       ,fff   (kept, labelled off by default)
 //   /VMC/Ext/Tra/Pos  ,sfffffff  name, pos xyz, quat xyzw
-// ============================================================================
 
 #define XT_MAX_TRACKERS   64
 #define XT_RECV_BUF_SIZE  8192
@@ -2904,12 +2643,12 @@ struct XTTracker {
 	char     key[XT_KEYLEN];
 	XrPosef  pose;
 	double   lastSeen;
-	int      tableRef;
+	int      tableRef;  // pose table; linked into our own table when created
 	int      matrixRef;
 	VMatrix* mtx;
 	bool     hasPos;
 	bool     hasRot;
-	bool     linked;    // present in our own table
+	bool     active;    // the table's .active as last written
 	bool     linkedXr;  // present in the main GetPoses table
 };
 
@@ -2917,65 +2656,47 @@ struct XTTracker {
 // its floor from its own height calibration -- neither is tied to the OpenXR
 // stage. Correcting the axes gets the trackers into the right frame; these get
 // them onto the right spot in it. Both default to zero and are inert.
-static float       g_xtOriginYawSin = 0.0f;   // full angle, for the position
-static float       g_xtOriginYawCos = 1.0f;
-static float       g_xtOriginHalfSin = 0.0f;  // half angle, for the quaternion
-static float       g_xtOriginHalfCos = 1.0f;
-static float       g_xtOriginHeight = 0.0f;
+static float g_xtOriginYawSin  = 0.0f;   // full angle, for the position
+static float g_xtOriginYawCos  = 1.0f;
+static float g_xtOriginHalfSin = 0.0f;   // half angle, for the quaternion
+static float g_xtOriginHalfCos = 1.0f;
+static float g_xtOriginHeight  = 0.0f;
 
-static ft_socket_t g_xtSocket   = FT_INVALID_SOCKET;
-static XTTracker   g_xtTrackers[XT_MAX_TRACKERS];
-static int         g_xtCount    = 0;
-static uint8_t     g_xtRecvBuf[XT_RECV_BUF_SIZE];
-static bool        g_xtWsaInit  = false;
-static int         g_xtLuaRefTable = -1;
+static osc_socket_t g_xtSocket      = OSC_INVALID_SOCKET;
+static XTTracker    g_xtTrackers[XT_MAX_TRACKERS];
+static int          g_xtCount       = 0;
+static uint8_t      g_xtRecvBuf[XT_RECV_BUF_SIZE];
+static int          g_xtLuaRefTable = -1;
 
 static void XT_UnlinkFromPoseTable() {
 	for (int i = 0; i < g_xtCount; i++)
 		g_xtTrackers[i].linkedXr = false;
 }
 
-static void XT_CloseSocket() {
-	if (g_xtSocket == FT_INVALID_SOCKET) return;
-#ifdef _WIN32
-	closesocket(g_xtSocket);
-#else
-	close(g_xtSocket);
-#endif
-	g_xtSocket = FT_INVALID_SOCKET;
-}
-
-static int XT_FindOrAdd(const char* key) {
-	for (int i = 0; i < g_xtCount; i++) {
+static XTTracker* XT_FindOrAdd(const char* key) {
+	for (int i = 0; i < g_xtCount; i++)
 		if (strcmp(g_xtTrackers[i].key, key) == 0)
-			return i;
-	}
-	if (g_xtCount >= XT_MAX_TRACKERS) return -1;
-	int idx = g_xtCount++;
-	XTTracker* t = &g_xtTrackers[idx];
+			return &g_xtTrackers[i];
+	if (g_xtCount >= XT_MAX_TRACKERS) return nullptr;
+	XTTracker* t = &g_xtTrackers[g_xtCount++];
+	memset(t, 0, sizeof(*t));
 	strncpy(t->key, key, XT_KEYLEN - 1);
-	t->key[XT_KEYLEN - 1] = '\0';
 	t->pose      = XR_IDENTITYPOSE;
-	t->lastSeen  = 0.0;
 	t->tableRef  = -1;
 	t->matrixRef = -1;
-	t->mtx       = nullptr;
-	t->hasPos = t->hasRot = t->linked = t->linkedXr = false;
-	return idx;
+	return t;
 }
 
 // Unity (SlimeVR and VMC both use it) is left-handed, +X right, +Y up, +Z
-// forward, metres.
-//
-// The target is NOT raw OpenXR. This module creates its stage reference space
+// forward, metres. The target is NOT raw OpenXR: the stage space is created
 // with poseInReferenceSpace {-0.5, 0.5, 0.5, 0.5}, which pre-rotates every
-// located pose into Source conventions -- +X forward, +Y left, +Z up. So
-// anything handed to ComposeTransform has to already be in that frame, or it
-// lands 90 degrees out from the HMD. Converting to OpenXR instead is exactly
-// the bug where trackers look right in SteamVR and wrong in game.
+// located pose into Source conventions (+X forward, +Y left, +Z up), so
+// anything handed to ComposeTransform must already be in that frame.
+// Converting to OpenXR instead is exactly the bug where trackers look right in
+// SteamVR and 90 degrees out in game.
 //
-// Basis map M: source = (uz, -ux, uy). det(M) = -1, which is the left-to-right
-// handedness flip. Conjugating a rotation by an orientation-reversing basis
+// Basis map M: source = (uz, -ux, uy). det(M) = -1, the left-to-right
+// handedness flip; conjugating a rotation by an orientation-reversing basis
 // change negates the quaternion's vector part, so q_src = (-(M*v), w), giving
 // (-vz, vx, -vy, w).
 static void XT_SetPosUnity(XTTracker* t, float x, float y, float z) {
@@ -3009,159 +2730,146 @@ static void XT_SetEulerUnity(XTTracker* t, float ex, float ey, float ez) {
 	XT_SetQuatUnity(t, qx, qy, qz, qw);
 }
 
-static int XT_ParseOscMessage(const uint8_t* data, int len) {
-	if (len < 8 || data[0] != '/') return 0;
-
-	int addrLen = (int)strnlen((const char*)data, len);
-	if (addrLen >= len) return 0;
-	int addrPadded = (int)FT_AlignUp4(addrLen + 1);
-	if (addrPadded >= len) return 0;
-
+static void XT_Message(const uint8_t* data, int len) {
+	const char* tags;
+	int tagLen, off;
+	if (!OSC_Header(data, len, tags, tagLen, off)) return;
 	const char* address = (const char*)data;
-
-	int tagOffset = addrPadded;
-	if (tagOffset >= len || data[tagOffset] != ',') return 0;
-	const char* tags = (const char*)data + tagOffset;
-	int tagLen    = (int)strnlen(tags, len - tagOffset);
-	int tagPadded = (int)FT_AlignUp4(tagLen + 1);
-	int off       = tagOffset + tagPadded;
 
 	// -- VRChat / SlimeVR tracker protocol ---------------------------------
 	static const char pfx[] = "/tracking/trackers/";
 	if (strncmp(address, pfx, sizeof(pfx) - 1) == 0) {
-		if (strcmp(tags, ",fff") != 0 || off + 12 > len) return 0;
+		if (strcmp(tags, ",fff") != 0 || off + 12 > len) return;
 		const char* rest = address + sizeof(pfx) - 1;
 		const char* slash = strchr(rest, '/');
-		if (!slash) return 0;
+		if (!slash) return;
 		int klen = (int)(slash - rest);
-		if (klen <= 0 || klen >= XT_KEYLEN) return 0;
+		if (klen <= 0 || klen >= XT_KEYLEN) return;
 
 		char key[XT_KEYLEN];
 		memcpy(key, rest, klen);
 		key[klen] = '\0';
 
-		int idx = XT_FindOrAdd(key);
-		if (idx < 0) return off + 12;
-		XTTracker* t = &g_xtTrackers[idx];
-
-		float a = FT_ReadBEFloat(data + off);
-		float b = FT_ReadBEFloat(data + off + 4);
-		float c = FT_ReadBEFloat(data + off + 8);
-
+		XTTracker* t = XT_FindOrAdd(key);
+		if (!t) return;
+		float a = OSC_Float(data + off), b = OSC_Float(data + off + 4), c = OSC_Float(data + off + 8);
 		if (strcmp(slash, "/position") == 0)      XT_SetPosUnity(t, a, b, c);
 		else if (strcmp(slash, "/rotation") == 0) XT_SetEulerUnity(t, a, b, c);
-		else return off + 12;
-
-		t->lastSeen = FT_GetTimeMs();
-		return off + 12;
+		else return;
+		t->lastSeen = g_oscNow;
+		return;
 	}
 
 	// -- VMC device transforms ---------------------------------------------
 	// One message carries name + position + quaternion, so a VMC source needs
 	// no euler conversion and is not capped at eight trackers.
-	if (strcmp(address, "/VMC/Ext/Tra/Pos") == 0) {
-		if (strcmp(tags, ",sfffffff") != 0) return 0;
+	if (strcmp(address, "/VMC/Ext/Tra/Pos") == 0 && strcmp(tags, ",sfffffff") == 0) {
 		int nameLen = (int)strnlen((const char*)data + off, len - off);
-		if (off + nameLen >= len) return 0;
+		if (off + nameLen >= len) return;
 
 		char key[XT_KEYLEN];
 		int klen = nameLen < XT_KEYLEN - 1 ? nameLen : XT_KEYLEN - 1;
 		memcpy(key, data + off, klen);
 		key[klen] = '\0';
 
-		off += (int)FT_AlignUp4(nameLen + 1);
-		if (off + 28 > len) return 0;
+		off += (nameLen + 4) & ~3;
+		if (off + 28 > len) return;
 
-		int idx = XT_FindOrAdd(key);
-		if (idx < 0) return off + 28;
-		XTTracker* t = &g_xtTrackers[idx];
-
-		XT_SetPosUnity(t,  FT_ReadBEFloat(data + off),
-		                   FT_ReadBEFloat(data + off + 4),
-		                   FT_ReadBEFloat(data + off + 8));
-		XT_SetQuatUnity(t, FT_ReadBEFloat(data + off + 12),
-		                   FT_ReadBEFloat(data + off + 16),
-		                   FT_ReadBEFloat(data + off + 20),
-		                   FT_ReadBEFloat(data + off + 24));
-		t->lastSeen = FT_GetTimeMs();
-		return off + 28;
-	}
-
-	return 0;
-}
-
-static void XT_ParseOscPacket(const uint8_t* data, int len) {
-	if (len < 4) return;
-	if (len >= 16 && memcmp(data, "#bundle\0", 8) == 0) {
-		int offset = 16;
-		while (offset + 4 <= len) {
-			uint32_t msgSize = FT_ReadBEUint32(data + offset);
-			offset += 4;
-			if (msgSize == 0 || offset + (int)msgSize > len) break;
-			XT_ParseOscPacket(data + offset, (int)msgSize);
-			offset += (int)msgSize;
-		}
-	} else {
-		XT_ParseOscMessage(data, len);
+		XTTracker* t = XT_FindOrAdd(key);
+		if (!t) return;
+		const uint8_t* v = data + off;
+		XT_SetPosUnity(t, OSC_Float(v), OSC_Float(v + 4), OSC_Float(v + 8));
+		XT_SetQuatUnity(t, OSC_Float(v + 12), OSC_Float(v + 16), OSC_Float(v + 20), OSC_Float(v + 24));
+		t->lastSeen = g_oscNow;
 	}
 }
 
-static void XT_FreeRefs(GarrysMod::Lua::ILuaBase* LUA) {
-	for (int i = 0; i < g_xtCount; i++) {
-		XTTracker* t = &g_xtTrackers[i];
-		if (t->tableRef  != -1) { LUA->ReferenceFree(t->tableRef);  t->tableRef  = -1; }
-		if (t->matrixRef != -1) { LUA->ReferenceFree(t->matrixRef); t->matrixRef = -1; }
-		t->mtx = nullptr;
-		t->linked = t->linkedXr = false;
-	}
-	g_xtCount = 0;
-	if (g_xtLuaRefTable != -1) {
-		LUA->ReferenceFree(g_xtLuaRefTable);
-		g_xtLuaRefTable = -1;
-	}
-}
+// ---- Lua entry points ------------------------------------------------------------
 
-LUA_FUNCTION(TrackerStart) {
-	int port = 9001;
-	if (LUA->IsType(1, GarrysMod::Lua::Type::NUMBER))
-		port = (int)LUA->GetNumber(1);
+LUA_FUNCTION(FaceTrackingStart) {
+	int port = LUA->IsType(1, GarrysMod::Lua::Type::NUMBER) ? (int)LUA->GetNumber(1) : 9000;
 
-	XT_CloseSocket();
-	XT_FreeRefs(LUA);
-
-#ifdef _WIN32
-	if (!g_xtWsaInit) {
-		WSADATA wsaData;
-		if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-			LUA->PushBool(false);
-			return 1;
-		}
-		g_xtWsaInit = true;
-	}
-#endif
-
-	g_xtSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (g_xtSocket == FT_INVALID_SOCKET) {
+	OSC_Close(g_ftSocket);
+	g_ftSocket = OSC_Open(port, INADDR_LOOPBACK);
+	if (g_ftSocket == OSC_INVALID_SOCKET) {
 		LUA->PushBool(false);
 		return 1;
 	}
 
-#ifdef _WIN32
-	u_long mode = 1;
-	ioctlsocket(g_xtSocket, FIONBIO, &mode);
-#else
-	int flags = fcntl(g_xtSocket, F_GETFL, 0);
-	fcntl(g_xtSocket, F_SETFL, flags | O_NONBLOCK);
-#endif
+	g_ftParamCount = 0;
+	g_ftLastRecvTime = 0.0;
+	Unref(LUA, g_ftLuaRefTable);
+	LUA->CreateTable();
+	g_ftLuaRefTable = LUA->ReferenceCreate();
 
-	struct sockaddr_in addr;
-	memset(&addr, 0, sizeof(addr));
-	addr.sin_family      = AF_INET;
-	addr.sin_addr.s_addr = htonl(INADDR_ANY);
-	addr.sin_port        = htons((unsigned short)port);
+	LUA->PushBool(true);
+	return 1;
+}
 
-	if (bind(g_xtSocket, (struct sockaddr*)&addr, sizeof(addr)) == FT_SOCKET_ERROR) {
-		XT_CloseSocket();
+LUA_FUNCTION(FaceTrackingStop) {
+	OSC_Close(g_ftSocket);
+	g_ftParamCount = 0;
+	g_ftLastRecvTime = 0.0;
+	return 0;
+}
+
+LUA_FUNCTION(FaceTrackingPoll) {
+	int packets = 0;
+	if (g_ftSocket != OSC_INVALID_SOCKET) {
+		int bytes;
+		while ((bytes = recv(g_ftSocket, (char*)g_ftRecvBuf, FT_RECV_BUF_SIZE, 0)) > 0) {
+			OSC_Packet(g_ftRecvBuf, bytes, FT_Message);
+			packets++;
+		}
+		if (packets > 0)
+			g_ftLastRecvTime = OSC_TimeMs();
+	}
+	LUA->PushNumber(packets);
+	return 1;
+}
+
+// Writes only the parameters that changed since the last call. Lua only reads
+// this table, so the result is the same as rewriting all of them every frame.
+LUA_FUNCTION(FaceTrackingGetData) {
+	if (g_ftParamCount == 0 || g_ftLuaRefTable == -1) {
+		LUA->CreateTable();
+		return 1;
+	}
+
+	LUA->ReferencePush(g_ftLuaRefTable);
+	for (int i = 0; i < g_ftParamCount; i++) {
+		FTParam& p = g_ftParams[i];
+		if (!p.dirty) continue;
+		p.dirty = false;
+		LUA->PushNumber(p.value);
+		LUA->SetField(-2, p.name);
+	}
+	return 1;
+}
+
+LUA_FUNCTION(FaceTrackingActive) {
+	LUA->PushBool(g_ftSocket != OSC_INVALID_SOCKET && g_ftLastRecvTime != 0.0
+		&& (OSC_TimeMs() - g_ftLastRecvTime) < FT_TIMEOUT_MS);
+	return 1;
+}
+
+static void XT_FreeRefs(GarrysMod::Lua::ILuaBase* LUA) {
+	for (int i = 0; i < g_xtCount; i++) {
+		Unref(LUA, g_xtTrackers[i].tableRef);
+		Unref(LUA, g_xtTrackers[i].matrixRef);
+	}
+	g_xtCount = 0;
+	Unref(LUA, g_xtLuaRefTable);
+}
+
+LUA_FUNCTION(TrackerStart) {
+	int port = LUA->IsType(1, GarrysMod::Lua::Type::NUMBER) ? (int)LUA->GetNumber(1) : 9001;
+
+	OSC_Close(g_xtSocket);
+	XT_FreeRefs(LUA);
+
+	g_xtSocket = OSC_Open(port, INADDR_ANY);
+	if (g_xtSocket == OSC_INVALID_SOCKET) {
 		LUA->PushBool(false);
 		return 1;
 	}
@@ -3174,44 +2882,59 @@ LUA_FUNCTION(TrackerStart) {
 }
 
 LUA_FUNCTION(TrackerStop) {
-	XT_CloseSocket();
+	OSC_Close(g_xtSocket);
 	XT_FreeRefs(LUA);
 	return 0;
 }
 
 // Drains the socket, refreshes every tracker's matrix and returns the live
-// count. Pose tables and their Matrix userdata are created once per tracker and
-// mutated in place afterwards, so a steady state frame allocates nothing.
+// count. Pose tables and their Matrix userdata are created once per tracker
+// and mutated in place afterwards, and .active is written only when it flips
+// (Lua only reads it), so a steady-state frame makes no Lua table writes.
 LUA_FUNCTION(TrackerPoll) {
-	if (g_xtSocket == FT_INVALID_SOCKET || g_xtLuaRefTable == -1) {
+	if (g_xtSocket == OSC_INVALID_SOCKET || g_xtLuaRefTable == -1) {
 		LUA->PushNumber(0);
 		return 1;
 	}
 
-	for (;;) {
-		int bytes = recv(g_xtSocket, (char*)g_xtRecvBuf, XT_RECV_BUF_SIZE, 0);
-		if (bytes <= 0) break;
-		XT_ParseOscPacket(g_xtRecvBuf, bytes);
-	}
+	double now = g_oscNow = OSC_TimeMs();
+	int bytes;
+	while ((bytes = recv(g_xtSocket, (char*)g_xtRecvBuf, XT_RECV_BUF_SIZE, 0)) > 0)
+		OSC_Packet(g_xtRecvBuf, bytes, XT_Message);
 
-	double now  = FT_GetTimeMs();
-	int    live = 0;
-	bool   xrUp = (g_luaRefCount > 0 && g_Session != XR_NULL_HANDLE);
+	int  live = 0;
+	bool xrUp = (g_luaRefCount > 0 && g_Session != XR_NULL_HANDLE);
 
 	for (int i = 0; i < g_xtCount; i++) {
 		XTTracker* t = &g_xtTrackers[i];
+		bool active = t->hasPos && t->hasRot && (now - t->lastSeen) < XT_TIMEOUT_MS;
 
 		if (t->tableRef == -1) {
+			// Shaped like GetPoses' tables plus key/source/active, and linked
+			// into our own table straight away
 			LUA->CreateTable();
 			t->mtx = InitPoseTableFields(LUA, &t->matrixRef);
 			LUA->PushString(t->key);
 			LUA->SetField(-2, "key");
 			LUA->PushString("osc");
 			LUA->SetField(-2, "source");
+			LUA->PushBool(active);
+			LUA->SetField(-2, "active");
+			LUA->ReferencePush(g_xtLuaRefTable);
+			LUA->Push(-2);
+			LUA->SetField(-2, t->key);
+			LUA->Pop();
 			t->tableRef = LUA->ReferenceCreate();
+			t->active = active;
+		}
+		else if (t->active != active) {
+			LUA->ReferencePush(t->tableRef);
+			LUA->PushBool(active);
+			LUA->SetField(-2, "active");
+			LUA->Pop();
+			t->active = active;
 		}
 
-		bool active = t->hasPos && t->hasRot && (now - t->lastSeen) < XT_TIMEOUT_MS;
 		if (active) {
 			// Yaw about Source up (+Z) and a height shift, applied on the left
 			// so they act in the stage frame rather than the tracker's own.
@@ -3238,19 +2961,6 @@ LUA_FUNCTION(TrackerPoll) {
 			live++;
 		}
 
-		LUA->ReferencePush(t->tableRef);
-		LUA->PushBool(active);
-		LUA->SetField(-2, "active");
-		LUA->Pop();
-
-		if (!t->linked) {
-			LUA->ReferencePush(g_xtLuaRefTable);
-			LUA->ReferencePush(t->tableRef);
-			LUA->SetField(-2, t->key);
-			LUA->Pop();
-			t->linked = true;
-		}
-
 		// Mirror into the table GetPoses returns so the existing tracking loop
 		// picks these up with no changes. Deliberately only once a tracker has
 		// been seen: Lua detects availability by entry presence.
@@ -3270,15 +2980,13 @@ LUA_FUNCTION(TrackerPoll) {
 }
 
 LUA_FUNCTION(TrackerGetPoses) {
-	// Deliberately not g_luaRefs[LuaRefIndex_EmptyTable]: that array is only
-	// populated once a session exists, and this is callable before VR starts
-	// so the menu can list trackers on the desktop. A fresh table costs one
-	// allocation on a path that only runs while the receiver is down.
-	if (g_xtLuaRefTable == -1) {
+	// Deliberately not g_luaRefs[LuaRefIndex_EmptyTable]: that only exists once
+	// a session does, and this is callable before VR starts so the menu can list
+	// trackers on the desktop.
+	if (g_xtLuaRefTable == -1)
 		LUA->CreateTable();
-		return 1;
-	}
-	LUA->ReferencePush(g_xtLuaRefTable);
+	else
+		LUA->ReferencePush(g_xtLuaRefTable);
 	return 1;
 }
 
@@ -3298,130 +3006,64 @@ LUA_FUNCTION(TrackerSetOrigin) {
 }
 
 LUA_FUNCTION(TrackerActive) {
-	LUA->PushBool(g_xtSocket != FT_INVALID_SOCKET);
+	LUA->PushBool(g_xtSocket != OSC_INVALID_SOCKET);
 	return 1;
 }
 
 
 GMOD_MODULE_OPEN(){
+	static const struct { const char* name; GarrysMod::Lua::CFunc fn; } funcs[] = {
+		{ "GetVersion", GetVersion },
+		{ "HasTrackerSupport", HasTrackerSupport },
+		{ "HasFrameControllerSupport", HasFrameControllerSupport },
+		{ "HasHandTracking", HasHandTracking },
+		{ "IsHMDPresent", IsHMDPresent },
+		{ "Init", Init },
+		{ "CreateActionSet", CreateActionSet },
+		{ "SuggestBindings", SuggestBindings },
+		{ "SetActiveActionSets", SetActiveActionSets },
+		{ "GetDisplayInfo", GetDisplayInfo },
+		{ "GetRecommendedDims", GetRecommendedDims },
+		{ "UpdatePosesAndActions", UpdatePosesAndActions },
+		{ "GetPoses", GetPoses },
+		{ "GetActions", GetActions },
+		{ "ShareTextureBegin", ShareTextureBegin },
+		{ "ShareTextureFinish", ShareTextureFinish },
+		{ "SetPredictionScale", SetPredictionScale },
+		{ "SetRenderScale", SetRenderScale },
+		{ "SetMulticoreMode", SetMulticoreMode },
+		{ "ResizeEngineRTs", ResizeEngineRTs },
+		{ "DoRenderLoop", DoRenderLoop },
+		{ "AttachActionSets", AttachActionSets },
+		{ "Shutdown", Shutdown },
+		{ "TriggerHaptic", TriggerHaptic },
+		{ "GetTrackedDeviceNames", GetTrackedDeviceNames },
+		{ "GetInteractionProfile", GetInteractionProfile },
+		{ "GetEyeGaze", GetEyeGaze },
+		{ "FaceTrackingStart", FaceTrackingStart },
+		{ "FaceTrackingStop", FaceTrackingStop },
+		{ "FaceTrackingPoll", FaceTrackingPoll },
+		{ "FaceTrackingGetData", FaceTrackingGetData },
+		{ "FaceTrackingActive", FaceTrackingActive },
+		{ "TrackerStart", TrackerStart },
+		{ "TrackerStop", TrackerStop },
+		{ "TrackerPoll", TrackerPoll },
+		{ "TrackerGetPoses", TrackerGetPoses },
+		{ "TrackerActive", TrackerActive },
+		{ "TrackerSetOrigin", TrackerSetOrigin },
+	};
+
 	LUA->PushSpecial(GarrysMod::Lua::SPECIAL_GLOB);
 	LUA->GetField(-1, "vrmod");
-
 	if (!LUA->IsType(-1, GarrysMod::Lua::Type::TABLE)) {
 		LUA->Pop();
 		LUA->CreateTable();
 	}
-
-		LUA->PushCFunction(GetVersion);
-		LUA->SetField(-2, "GetVersion");
-
-		LUA->PushCFunction(HasTrackerSupport);
-		LUA->SetField(-2, "HasTrackerSupport");
-
-		LUA->PushCFunction(HasFrameControllerSupport);
-		LUA->SetField(-2, "HasFrameControllerSupport");
-
-		LUA->PushCFunction(HasHandTracking);
-		LUA->SetField(-2, "HasHandTracking");
-
-		LUA->PushCFunction(IsHMDPresent);
-		LUA->SetField(-2, "IsHMDPresent");
-
-		LUA->PushCFunction(Init);
-		LUA->SetField(-2, "Init");
-
-		LUA->PushCFunction(CreateActionSet);
-		LUA->SetField(-2, "CreateActionSet");
-
-		LUA->PushCFunction(SuggestBindings);
-		LUA->SetField(-2, "SuggestBindings");
-
-		LUA->PushCFunction(SetActiveActionSets);
-		LUA->SetField(-2, "SetActiveActionSets");
-
-		LUA->PushCFunction(GetDisplayInfo);
-		LUA->SetField(-2, "GetDisplayInfo");
-
-		LUA->PushCFunction(GetRecommendedDims);
-		LUA->SetField(-2, "GetRecommendedDims");
-
-		LUA->PushCFunction(UpdatePosesAndActions);
-		LUA->SetField(-2, "UpdatePosesAndActions");
-
-		LUA->PushCFunction(GetPoses);
-		LUA->SetField(-2, "GetPoses");
-
-		LUA->PushCFunction(GetActions);
-		LUA->SetField(-2, "GetActions");
-
-		LUA->PushCFunction(ShareTextureBegin);
-		LUA->SetField(-2, "ShareTextureBegin");
-
-		LUA->PushCFunction(ShareTextureFinish);
-		LUA->SetField(-2, "ShareTextureFinish");
-
-		LUA->PushCFunction(SetPredictionScale);
-		LUA->SetField(-2, "SetPredictionScale");
-
-		LUA->PushCFunction(SetRenderScale);
-		LUA->SetField(-2, "SetRenderScale");
-
-		LUA->PushCFunction(SetMulticoreMode);
-		LUA->SetField(-2, "SetMulticoreMode");
-
-		LUA->PushCFunction(DoRenderLoop);
-		LUA->SetField(-2, "DoRenderLoop");
-
-		LUA->PushCFunction(AttachActionSets);
-		LUA->SetField(-2, "AttachActionSets");
-
-		LUA->PushCFunction(Shutdown);
-		LUA->SetField(-2, "Shutdown");
-
-		LUA->PushCFunction(TriggerHaptic);
-		LUA->SetField(-2, "TriggerHaptic");
-
-		LUA->PushCFunction(GetTrackedDeviceNames);
-		LUA->SetField(-2, "GetTrackedDeviceNames");
-
-		LUA->PushCFunction(GetInteractionProfile);
-		LUA->SetField(-2, "GetInteractionProfile");
-
-		LUA->PushCFunction(FaceTrackingStart);
-		LUA->SetField(-2, "FaceTrackingStart");
-
-		LUA->PushCFunction(FaceTrackingStop);
-		LUA->SetField(-2, "FaceTrackingStop");
-
-		LUA->PushCFunction(FaceTrackingPoll);
-		LUA->SetField(-2, "FaceTrackingPoll");
-
-		LUA->PushCFunction(FaceTrackingGetData);
-		LUA->SetField(-2, "FaceTrackingGetData");
-
-		LUA->PushCFunction(FaceTrackingActive);
-		LUA->SetField(-2, "FaceTrackingActive");
-
-		LUA->PushCFunction(TrackerStart);
-		LUA->SetField(-2, "TrackerStart");
-
-		LUA->PushCFunction(TrackerStop);
-		LUA->SetField(-2, "TrackerStop");
-
-		LUA->PushCFunction(TrackerPoll);
-		LUA->SetField(-2, "TrackerPoll");
-
-		LUA->PushCFunction(TrackerGetPoses);
-		LUA->SetField(-2, "TrackerGetPoses");
-
-		LUA->PushCFunction(TrackerActive);
-		LUA->SetField(-2, "TrackerActive");
-
-		LUA->PushCFunction(TrackerSetOrigin);
-		LUA->SetField(-2, "TrackerSetOrigin");
-
-		LUA->SetField(-2, "vrmod");
-
+	for (const auto& f : funcs) {
+		LUA->PushCFunction(f.fn);
+		LUA->SetField(-2, f.name);
+	}
+	LUA->SetField(-2, "vrmod");
 	LUA->Pop();
 
 	#ifdef DEBUG
@@ -3432,16 +3074,14 @@ GMOD_MODULE_OPEN(){
 }
 
 GMOD_MODULE_CLOSE(){
-	XT_CloseSocket();
+	OSC_Close(g_xtSocket);
 	XT_FreeRefs(LUA);
+	OSC_Close(g_ftSocket);
+	g_ftParamCount = 0;
+	Unref(LUA, g_ftLuaRefTable);
 #ifdef _WIN32
-	if (g_xtWsaInit) { WSACleanup(); g_xtWsaInit = false; }
+	if (g_wsaInit) { WSACleanup(); g_wsaInit = false; }
 #endif
-	FaceTrackingCleanup();
-	if (g_ftLuaRefTable != -1) {
-		LUA->ReferenceFree(g_ftLuaRefTable);
-		g_ftLuaRefTable = -1;
-	}
 	ClearSession(LUA);
 	DestroyInstance();
 
@@ -3451,5 +3091,3 @@ GMOD_MODULE_CLOSE(){
 
 	return 0;
 }
-
-// ?/16 functions done
